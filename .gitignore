@@ -1,0 +1,40 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.env
+.venv/
+venv/
+env/
+ENV/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Training/evaluation artifacts
+results/
+runs/
+wandb/
+tensorboard/
+tb_logs/
+logs/
+*.log
+
+# Large model/data artifacts
+*.ckpt
+*.pt
+*.pth
+*.pkl
+*.npy
+*.npz
