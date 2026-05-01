@@ -25,7 +25,8 @@ class VMRDETR(nn.Module):
     def __init__(self, transformer, position_embed, txt_position_embed, txt_dim, vid_dim,
                  num_queries, input_dropout, aux_loss=False,
                  contrastive_align_loss=False, contrastive_hdim=64,
-                 max_v_l=75, span_loss_type="l1", use_txt_pos=False, n_input_proj=2, aud_dim=0):
+                 max_v_l=75, span_loss_type="l1", use_txt_pos=False, n_input_proj=2, aud_dim=0,
+                 use_gated_video_fusion=False, slowfast_dim=2304, clip_dim=512, tef_dim=2):
         """ Initializes the model.
         Parameters:
             transformer: torch module of the transformer architecture. See transformer.py
@@ -73,6 +74,31 @@ class VMRDETR(nn.Module):
             LinearLayer(hidden_dim, hidden_dim, layer_norm=True, dropout=input_dropout, relu=relu_args[1]),
             LinearLayer(hidden_dim, hidden_dim, layer_norm=True, dropout=input_dropout, relu=relu_args[2])
         ][:n_input_proj])
+        self.use_gated_video_fusion = use_gated_video_fusion
+        self.slowfast_dim = slowfast_dim
+        self.clip_dim = clip_dim
+        self.tef_dim = tef_dim
+        if self.use_gated_video_fusion:
+            self.input_slowfast_proj = nn.Sequential(*[
+                LinearLayer(slowfast_dim, hidden_dim, layer_norm=True, dropout=input_dropout, relu=relu_args[0]),
+                LinearLayer(hidden_dim, hidden_dim, layer_norm=True, dropout=input_dropout, relu=relu_args[1]),
+                LinearLayer(hidden_dim, hidden_dim, layer_norm=True, dropout=input_dropout, relu=relu_args[2])
+            ][:n_input_proj])
+            self.input_clip_proj = nn.Sequential(*[
+                LinearLayer(clip_dim, hidden_dim, layer_norm=True, dropout=input_dropout, relu=relu_args[0]),
+                LinearLayer(hidden_dim, hidden_dim, layer_norm=True, dropout=input_dropout, relu=relu_args[1]),
+                LinearLayer(hidden_dim, hidden_dim, layer_norm=True, dropout=input_dropout, relu=relu_args[2])
+            ][:n_input_proj])
+            self.video_gate_mlp = nn.Sequential(
+                nn.Linear(hidden_dim * 4, hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(hidden_dim, hidden_dim)
+            )
+            self.input_tef_proj = nn.Sequential(*[
+                LinearLayer(tef_dim, hidden_dim, layer_norm=True, dropout=input_dropout, relu=relu_args[0]),
+                LinearLayer(hidden_dim, hidden_dim, layer_norm=True, dropout=input_dropout, relu=relu_args[1]),
+                LinearLayer(hidden_dim, hidden_dim, layer_norm=True, dropout=input_dropout, relu=relu_args[2])
+            ][:n_input_proj])
         self.contrastive_align_loss = contrastive_align_loss
         if contrastive_align_loss:
             self.contrastive_align_projection_query = nn.Linear(hidden_dim, contrastive_hdim)
@@ -104,11 +130,40 @@ class VMRDETR(nn.Module):
                - "aux_outputs": Optional, only returned when auxilary losses are activated. It is a list of
                                 dictionnaries containing the two above keys for each decoder layer.
         """
+        if src_aud is not None and self.use_gated_video_fusion:
+            raise ValueError("gated video fusion currently supports non-audio runs only.")
         if src_aud is not None:
             src_vid = torch.cat([src_vid, src_aud], dim=2)
-            
-        src_vid = self.input_vid_proj(src_vid)
+
         src_txt = self.input_txt_proj(src_txt)
+        if self.use_gated_video_fusion:
+            text_mask = src_txt_mask.float().unsqueeze(-1)
+            text_denom = text_mask.sum(dim=1).clamp(min=1.0)
+            text_global = (src_txt * text_mask).sum(dim=1) / text_denom  # (bsz, d)
+
+            expected_vid_dim = self.slowfast_dim + self.clip_dim + self.tef_dim
+            if src_vid.shape[-1] != expected_vid_dim:
+                raise ValueError(
+                    f"Expected src_vid dim={expected_vid_dim} "
+                    f"(slowfast={self.slowfast_dim}, clip={self.clip_dim}, tef={self.tef_dim}), "
+                    f"but got {src_vid.shape[-1]}."
+                )
+
+            slowfast = src_vid[..., :self.slowfast_dim]
+            clip = src_vid[..., self.slowfast_dim:self.slowfast_dim + self.clip_dim]
+            tef = src_vid[..., self.slowfast_dim + self.clip_dim:]
+
+            slowfast_h = self.input_slowfast_proj(slowfast)
+            clip_h = self.input_clip_proj(clip)
+            text_global_expanded = text_global.unsqueeze(1).expand(-1, slowfast_h.shape[1], -1)
+            gate_input = torch.cat(
+                [slowfast_h, clip_h, slowfast_h * clip_h, text_global_expanded], dim=-1)
+            gate = torch.sigmoid(self.video_gate_mlp(gate_input))
+            src_vid = gate * clip_h + (1.0 - gate) * slowfast_h
+            src_vid = src_vid + self.input_tef_proj(tef)
+        else:
+            src_vid = self.input_vid_proj(src_vid)
+
         src = torch.cat([src_vid, src_txt], dim=1)  # (bsz, L_vid+L_txt, d)
         mask = torch.cat([src_vid_mask, src_txt_mask], dim=1).bool()  # (bsz, L_vid+L_txt)
         # TODO should we remove or use different positional embeddings to the src_txt?
@@ -538,6 +593,10 @@ def build_model(args):
             span_loss_type=args.span_loss_type,
             use_txt_pos=args.use_txt_pos,
             n_input_proj=args.n_input_proj,
+            use_gated_video_fusion=args.use_gated_video_fusion,
+            slowfast_dim=args.slowfast_dim,
+            clip_dim=args.clip_dim,
+            tef_dim=args.tef_dim,
         )
     else:
         model = VMRDETR(
@@ -555,6 +614,10 @@ def build_model(args):
             span_loss_type=args.span_loss_type,
             use_txt_pos=args.use_txt_pos,
             n_input_proj=args.n_input_proj,
+            use_gated_video_fusion=args.use_gated_video_fusion,
+            slowfast_dim=args.slowfast_dim,
+            clip_dim=args.clip_dim,
+            tef_dim=args.tef_dim,
         )
 
     matcher = build_matcher(args)

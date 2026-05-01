@@ -3,11 +3,11 @@ ctx_mode=video_tef
 v_feat_types=slowfast_clip
 t_feat_types=clip
 results_root=results
-exp_id=exp_nepoch_100_slowfast_clip
+exp_id=exp_nepoch_100_slowfast_clip_gated
 
 ######## data paths
-train_path=/content/drive/MyDrive/Master/Thesis/vmr-detr-Old/data/charades-sta/train.jsonl
-eval_path=/content/drive/MyDrive/Master/Thesis/vmr-detr-Old/data/charades-sta/test.jsonl
+train_path=/content/drive/MyDrive/Master/Thesis/QD-DETR-Old/data/charades-sta/train.jsonl
+eval_path=/content/drive/MyDrive/Master/Thesis/QD-DETR-Old/data/charades-sta/test.jsonl
 eval_split_name=val
 
 ######## setup video+text features
@@ -84,4 +84,5 @@ PYTHONPATH=$PYTHONPATH:. python vmr_detr/cli/train.py \
 --num_workers ${num_workers} \
 --eval_every_epoch_after ${eval_every_epoch_after} \
 --ema_decay ${ema_decay} \
+--use_gated_video_fusion \
 ${@:1}

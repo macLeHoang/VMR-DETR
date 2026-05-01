@@ -127,6 +127,14 @@ class BaseOptions(object):
         parser.add_argument('--pre_norm', action='store_true')
         # other model configs
         parser.add_argument("--n_input_proj", type=int, default=2, help="#layers to encoder input")
+        parser.add_argument("--use_gated_video_fusion", action="store_true",
+                            help="Enable text-conditioned gated fusion for SlowFast/CLIP video features.")
+        parser.add_argument("--slowfast_dim", type=int, default=2304,
+                            help="SlowFast feature dim inside concatenated video features.")
+        parser.add_argument("--clip_dim", type=int, default=512,
+                            help="CLIP video feature dim inside concatenated video features.")
+        parser.add_argument("--tef_dim", type=int, default=2,
+                            help="TEF feature dim appended to video features when ctx_mode includes tef.")
         parser.add_argument("--contrastive_hdim", type=int, default=64, help="dim for contrastive embeddings")
         parser.add_argument("--temperature", type=float, default=0.07, help="temperature nce contrastive_align_loss")
         # Loss
