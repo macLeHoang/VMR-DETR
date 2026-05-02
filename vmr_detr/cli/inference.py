@@ -92,6 +92,8 @@ def compute_hl_results(model, eval_loader, opt, epoch_i=None, criterion=None, tb
     if criterion:
         assert eval_loader.dataset.load_labels
         criterion.eval()
+        if hasattr(criterion, "set_epoch"):
+            criterion.set_epoch(0 if epoch_i is None else epoch_i + 1)
 
     loss_meters = defaultdict(AverageMeter)
     write_tb = tb_writer is not None and epoch_i is not None
@@ -116,7 +118,8 @@ def compute_hl_results(model, eval_loader, opt, epoch_i=None, criterion=None, tb
             losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
             loss_dict["loss_overall"] = losses.detach().item()  # for logging only
             for k, v in loss_dict.items():
-                loss_meters[k].update(float(v) * weight_dict[k] if k in weight_dict else float(v))
+                val = v.detach().item() if isinstance(v, torch.Tensor) else float(v)
+                loss_meters[k].update(val * weight_dict[k] if k in weight_dict else val)
 
 
         preds = outputs['saliency_scores']
@@ -177,6 +180,8 @@ def compute_mr_results(model, eval_loader, opt, epoch_i=None, criterion=None, tb
     if criterion:
         assert eval_loader.dataset.load_labels
         criterion.eval()
+        if hasattr(criterion, "set_epoch"):
+            criterion.set_epoch(0 if epoch_i is None else epoch_i + 1)
 
     loss_meters = defaultdict(AverageMeter)
     write_tb = tb_writer is not None and epoch_i is not None
@@ -231,7 +236,8 @@ def compute_mr_results(model, eval_loader, opt, epoch_i=None, criterion=None, tb
             losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
             loss_dict["loss_overall"] = losses.detach().item()  # for logging only
             for k, v in loss_dict.items():
-                loss_meters[k].update(float(v) * weight_dict[k] if k in weight_dict else float(v))
+                val = v.detach().item() if isinstance(v, torch.Tensor) else float(v)
+                loss_meters[k].update(val * weight_dict[k] if k in weight_dict else val)
 
         if opt.debug:
             break

@@ -62,6 +62,7 @@ class VMRDETR(nn.Module):
         # self.foreground_thd = foreground_thd
         # self.background_thd = background_thd
         self.query_embed = nn.Embedding(num_queries, 2)
+        
         relu_args = [True] * 3
         relu_args[n_input_proj-1] = False
         self.input_txt_proj = nn.Sequential(*[
@@ -74,6 +75,7 @@ class VMRDETR(nn.Module):
             LinearLayer(hidden_dim, hidden_dim, layer_norm=True, dropout=input_dropout, relu=relu_args[1]),
             LinearLayer(hidden_dim, hidden_dim, layer_norm=True, dropout=input_dropout, relu=relu_args[2])
         ][:n_input_proj])
+
         self.use_gated_video_fusion = use_gated_video_fusion
         self.slowfast_dim = slowfast_dim
         self.clip_dim = clip_dim
@@ -99,6 +101,7 @@ class VMRDETR(nn.Module):
                 LinearLayer(hidden_dim, hidden_dim, layer_norm=True, dropout=input_dropout, relu=relu_args[1]),
                 LinearLayer(hidden_dim, hidden_dim, layer_norm=True, dropout=input_dropout, relu=relu_args[2])
             ][:n_input_proj])
+
         self.contrastive_align_loss = contrastive_align_loss
         if contrastive_align_loss:
             self.contrastive_align_projection_query = nn.Linear(hidden_dim, contrastive_hdim)
@@ -184,7 +187,8 @@ class VMRDETR(nn.Module):
 
         video_length = src_vid.shape[1]
         
-        hs, reference, memory, memory_global = self.transformer(src, ~mask, self.query_embed.weight, pos, video_length=video_length)
+        hs, reference, vid_mem, memory_global, txt_mem = self.transformer(
+            src, ~mask, self.query_embed.weight, pos, video_length=video_length)
         outputs_class = self.class_embed(hs)  # (#layers, batch_size, #queries, #classes)
         reference_before_sigmoid = inverse_sigmoid(reference)
         tmp = self.span_embed(hs)
@@ -193,8 +197,6 @@ class VMRDETR(nn.Module):
             outputs_coord = outputs_coord.sigmoid()
         out = {'pred_logits': outputs_class[-1], 'pred_spans': outputs_coord[-1]}
 
-        txt_mem = memory[:, src_vid.shape[1]:]  # (bsz, L_txt, d)
-        vid_mem = memory[:, :src_vid.shape[1]]  # (bsz, L_vid, d)
         if self.contrastive_align_loss:
             proj_queries = F.normalize(self.contrastive_align_projection_query(hs), p=2, dim=-1)
             proj_txt_mem = F.normalize(self.contrastive_align_projection_txt(txt_mem), p=2, dim=-1)
@@ -202,7 +204,8 @@ class VMRDETR(nn.Module):
             out.update(dict(
                 proj_queries=proj_queries[-1],
                 proj_txt_mem=proj_txt_mem,
-                proj_vid_mem=proj_vid_mem
+                proj_vid_mem=proj_vid_mem,
+                proj_txt_mask=src_txt_mask.bool(),
             ))
             
             
@@ -221,8 +224,8 @@ class VMRDETR(nn.Module):
         src_neg = torch.cat([src_, src_neg], dim=1)
         pos_neg = pos.clone()  # since it does not use actual content
 
-        _, _, memory_neg, memory_global_neg = self.transformer(src_neg, ~mask_neg, self.query_embed.weight, pos_neg, video_length=video_length)
-        vid_mem_neg = memory_neg[:, :src_vid.shape[1]]
+        _, _, vid_mem_neg, memory_global_neg, _ = self.transformer(
+            src_neg, ~mask_neg, self.query_embed.weight, pos_neg, video_length=video_length)
 
 
         out["saliency_scores"] = (torch.sum(self.saliency_proj1(vid_mem) * self.saliency_proj2(memory_global).unsqueeze(1), dim=-1) / np.sqrt(self.hidden_dim))
@@ -232,13 +235,8 @@ class VMRDETR(nn.Module):
         # print(src_vid_mask.shape, src_vid.shape, vid_mem_neg.shape, vid_mem.shape)
         out["video_mask"] = src_vid_mask
         if self.aux_loss:
-            # assert proj_queries and proj_txt_mem
             out['aux_outputs'] = [
                 {'pred_logits': a, 'pred_spans': b} for a, b in zip(outputs_class[:-1], outputs_coord[:-1])]
-            if self.contrastive_align_loss:
-                assert proj_queries is not None
-                for idx, d in enumerate(proj_queries[:-1]):
-                    out['aux_outputs'][idx].update(dict(proj_queries=d, proj_txt_mem=proj_txt_mem))
         return out
 
     # @torch.jit.unused
@@ -258,7 +256,7 @@ class SetCriterion(nn.Module):
     """
 
     def __init__(self, matcher, weight_dict, eos_coef, losses, temperature, span_loss_type, max_v_l,
-                 saliency_margin=1, use_matcher=True):
+                 saliency_margin=1, use_matcher=True, contrastive_start_epoch=0):
         """ Create the criterion.
         Parameters:
             matcher: module able to compute a matching between targets and proposals
@@ -289,6 +287,11 @@ class SetCriterion(nn.Module):
         
         # for tvsum,
         self.use_matcher = use_matcher
+        self.contrastive_start_epoch = contrastive_start_epoch
+        self.current_epoch = 0
+
+    def set_epoch(self, epoch):
+        self.current_epoch = int(epoch)
 
     def loss_spans(self, outputs, targets, indices):
         """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
@@ -417,21 +420,34 @@ class SetCriterion(nn.Module):
 
     def loss_contrastive_align(self, outputs, targets, indices, log=True):
         """encourage higher scores between matched query span and input text"""
-        normalized_text_embed = outputs["proj_txt_mem"]  # (bsz, #tokens, d)  text tokens
+        normalized_text_embed = outputs["proj_txt_mem"]  # (bsz, #tokens, d) text tokens
         normalized_img_embed = outputs["proj_queries"]  # (bsz, #queries, d)
-        logits = torch.einsum(
-            "bmd,bnd->bmn", normalized_img_embed, normalized_text_embed)  # (bsz, #queries, #tokens)
-        logits = logits.sum(2) / self.temperature  # (bsz, #queries)
+        if self.current_epoch < self.contrastive_start_epoch:
+            return {"loss_contrastive_align": normalized_img_embed.new_zeros(())}
+
+        txt_mask = outputs.get("proj_txt_mask")
+        if txt_mask is None:
+            txt_mask = torch.ones(
+                normalized_text_embed.shape[:2], dtype=torch.bool, device=normalized_text_embed.device)
+        txt_mask = txt_mask.float()
+        txt_global = (normalized_text_embed * txt_mask.unsqueeze(-1)).sum(1)
+        txt_global = txt_global / txt_mask.sum(1, keepdim=True).clamp(min=1.0)
+        txt_global = F.normalize(txt_global, p=2, dim=-1)  # (bsz, d)
+        normalized_img_embed = F.normalize(normalized_img_embed, p=2, dim=-1)
+        logits = torch.einsum("bqd,bd->bq", normalized_img_embed, txt_global) / self.temperature  # (bsz, #queries)
+
         idx = self._get_src_permutation_idx(indices)
         positive_map = torch.zeros_like(logits, dtype=torch.bool)
         positive_map[idx] = True
-        positive_logits = logits.masked_fill(~positive_map, 0)
+        valid_rows = positive_map.sum(1) > 0
+        if not valid_rows.any():
+            return {"loss_contrastive_align": logits.new_zeros(())}
 
-        pos_term = positive_logits.sum(1)  # (bsz, )
-        num_pos = positive_map.sum(1)  # (bsz, )
-        neg_term = logits.logsumexp(1)  # (bsz, )
-        loss_nce = - pos_term / num_pos + neg_term  # (bsz, )
-        losses = {"loss_contrastive_align": loss_nce.mean()}
+        pos_term = (logits * positive_map.float()).sum(1)  # (bsz,)
+        num_pos = positive_map.sum(1).clamp(min=1)  # (bsz,)
+        neg_term = logits.logsumexp(1)  # (bsz,)
+        loss_nce = -pos_term / num_pos + neg_term  # (bsz,)
+        losses = {"loss_contrastive_align": loss_nce[valid_rows].mean()}
         return losses
 
     def loss_contrastive_align_vid_txt(self, outputs, targets, indices, log=True):
@@ -515,7 +531,7 @@ class SetCriterion(nn.Module):
                     losses_target = ["saliency"]    
                 # for loss in self.losses:
                 for loss in losses_target:
-                    if "saliency" == loss:  # skip as it is only in the top layer
+                    if loss in ("saliency", "contrastive_align"):  # final layer only
                         continue
                     kwargs = {}
                     l_dict = self.get_loss(loss, aux_outputs, targets, indices, **kwargs)
@@ -631,7 +647,10 @@ def build_model(args):
     if args.aux_loss:
         aux_weight_dict = {}
         for i in range(args.dec_layers - 1):
-            aux_weight_dict.update({k + f'_{i}': v for k, v in weight_dict.items() if k != "loss_saliency"})
+            aux_weight_dict.update(
+                {k + f'_{i}': v for k, v in weight_dict.items()
+                 if k not in ("loss_saliency", "loss_contrastive_align")}
+            )
         weight_dict.update(aux_weight_dict)
 
     losses = ['spans', 'labels', 'saliency']
@@ -646,6 +665,7 @@ def build_model(args):
         eos_coef=args.eos_coef, temperature=args.temperature,
         span_loss_type=args.span_loss_type, max_v_l=args.max_v_l,
         saliency_margin=args.saliency_margin, use_matcher=use_matcher,
+        contrastive_start_epoch=args.contrastive_start_epoch,
     )
     criterion.to(device)
     return model, criterion

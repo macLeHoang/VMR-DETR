@@ -122,6 +122,8 @@ class Transformer(nn.Module):
         refpoint_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)  # (#queries, batch_size, d)
 
         src = self.t2v_encoder(src, src_key_padding_mask=mask, pos=pos_embed, video_length=video_length)  # (L, batch_size, d)
+        # Keep encoded text memory for contrastive alignment before slicing to video-only stream.
+        txt_memory = src[video_length + 1:]
         # print('after encoder : ',src.shape)
         src = src[:video_length + 1]
         mask = mask[:, :video_length + 1]
@@ -139,7 +141,8 @@ class Transformer(nn.Module):
         # hs = hs.transpose(1, 2)  # (#layers, batch_size, #qeries, d)
         # memory = memory.permute(1, 2, 0)  # (batch_size, d, L)
         memory_local = memory_local.transpose(0, 1)  # (batch_size, L, d)
-        return hs, references, memory_local, memory_global
+        txt_memory = txt_memory.transpose(0, 1)  # (batch_size, L_txt, d)
+        return hs, references, memory_local, memory_global, txt_memory
 
 
 class TransformerEncoder(nn.Module):

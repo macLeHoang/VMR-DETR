@@ -10,7 +10,6 @@ import torch
 import torch.nn as nn
 import torch.backends.cudnn as cudnn
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
 
 from vmr_detr.config.options import BaseOptions
 from vmr_detr.data.start_end_dataset import \
@@ -18,7 +17,7 @@ from vmr_detr.data.start_end_dataset import \
 from vmr_detr.data.start_end_dataset_audio import \
     start_end_collate_audio, prepare_batch_inputs_audio
 from vmr_detr.cli.inference import eval_epoch, start_inference, setup_model
-from utils.basic_utils import AverageMeter, dict_to_markdown
+from utils.basic_utils import AverageMeter
 from utils.model_utils import count_parameters
 from vmr_detr.cli.train_utils import (
     ModelEMA,
@@ -34,10 +33,12 @@ logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s",
                     level=logging.INFO)
 
 
-def train_epoch(model, criterion, train_loader, optimizer, opt, epoch_i, tb_writer, ema=None):
+def train_epoch(model, criterion, train_loader, optimizer, opt, epoch_i, ema=None):
     logger.info(f"[Epoch {epoch_i+1}]")
     model.train()
     criterion.train()
+    if hasattr(criterion, "set_epoch"):
+        criterion.set_epoch(epoch_i + 1)
 
     # init meters
     time_meters = defaultdict(AverageMeter)
@@ -75,7 +76,8 @@ def train_epoch(model, criterion, train_loader, optimizer, opt, epoch_i, tb_writ
 
         loss_dict["loss_overall"] = losses.detach().item()  # for logging only
         for k, v in loss_dict.items():
-            loss_meters[k].update(float(v) * weight_dict[k] if k in weight_dict else float(v))
+            val = v.detach().item() if isinstance(v, torch.Tensor) else float(v)
+            loss_meters[k].update(val * weight_dict[k] if k in weight_dict else val)
 
         timer_dataloading = time.time()
         if opt.debug and batch_idx == 3:
@@ -84,11 +86,6 @@ def train_epoch(model, criterion, train_loader, optimizer, opt, epoch_i, tb_writ
         display_stats = {k: v.item() if isinstance(v, torch.Tensor) else v 
                  for k, v in loss_dict.items()}
         pbar.set_postfix(display_stats)
-
-    # print/add logs
-    tb_writer.add_scalar("Train/lr", float(optimizer.param_groups[0]["lr"]), epoch_i+1)
-    for k, v in loss_meters.items():
-        tb_writer.add_scalar("Train/{}".format(k), v.avg, epoch_i+1)
 
     to_write = opt.train_log_txt_formatter.format(
         time_str=time.strftime("%Y_%m_%d_%H_%M_%S"),
@@ -108,8 +105,6 @@ def train(model, criterion, optimizer, lr_scheduler, train_dataset, val_dataset,
         logger.info("CUDA enabled.")
         model.to(opt.device)
 
-    tb_writer = SummaryWriter(opt.tensorboard_log_dir)
-    tb_writer.add_text("hyperparameters", dict_to_markdown(vars(opt), max_str_len=None))
     opt.train_log_txt_formatter = "{time_str} [Epoch] {epoch:03d} [Loss] {loss_str}\n"
     opt.eval_log_txt_formatter = "{time_str} [Epoch] {epoch:03d} [Loss] {loss_str} [Metrics] {eval_metrics_str}\n"
 
@@ -150,7 +145,7 @@ def train(model, criterion, optimizer, lr_scheduler, train_dataset, val_dataset,
 
     for epoch_i in range(start_epoch, opt.n_epoch):
         if epoch_i > -1:
-            train_epoch(model, criterion, train_loader, optimizer, opt, epoch_i, tb_writer, ema=ema)
+            train_epoch(model, criterion, train_loader, optimizer, opt, epoch_i, ema=ema)
             lr_scheduler.step()
 
         if opt.eval_path is not None and should_run_eval(opt, epoch_i):
@@ -161,7 +156,7 @@ def train(model, criterion, optimizer, lr_scheduler, train_dataset, val_dataset,
                 ema.copy_to(model)
             with torch.no_grad():
                 metrics_no_nms, metrics_nms, eval_loss_meters, latest_file_paths = \
-                    eval_epoch(model, val_dataset, opt, save_submission_filename, epoch_i, criterion, tb_writer)
+                    eval_epoch(model, val_dataset, opt, save_submission_filename, epoch_i, criterion, None)
             eval_model_state = copy.deepcopy(model.state_dict())
             if using_ema_eval:
                 ema.restore(model)
@@ -180,8 +175,6 @@ def train(model, criterion, optimizer, lr_scheduler, train_dataset, val_dataset,
                 log_validation_summary(logger, epoch_i + 1, eval_loss_meters, metrics_nms["brief"], title="nms validation summary")
 
             metrics = metrics_no_nms
-            for k, v in metrics["brief"].items():
-                tb_writer.add_scalar(f"Eval/{k}", float(v), epoch_i+1)
 
             stop_score = metrics["brief"]["MR-full-mAP"]
                 
@@ -250,17 +243,11 @@ def train(model, criterion, optimizer, lr_scheduler, train_dataset, val_dataset,
         if opt.debug:
             break
 
-    tb_writer.close()
-
-
-
 def train_hl(model, criterion, optimizer, lr_scheduler, train_dataset, val_dataset, opt):
     if opt.device.type == "cuda":
         logger.info("CUDA enabled.")
         model.to(opt.device)
 
-    tb_writer = SummaryWriter(opt.tensorboard_log_dir)
-    tb_writer.add_text("hyperparameters", dict_to_markdown(vars(opt), max_str_len=None))
     opt.train_log_txt_formatter = "{time_str} [Epoch] {epoch:03d} [Loss] {loss_str}\n"
     opt.eval_log_txt_formatter = "{time_str} [Epoch] {epoch:03d} [Loss] {loss_str} [Metrics] {eval_metrics_str}\n"
 
@@ -290,7 +277,7 @@ def train_hl(model, criterion, optimizer, lr_scheduler, train_dataset, val_datas
     save_submission_filename = "latest_{}_{}_preds.jsonl".format(opt.dset_name, opt.eval_split_name)
     for epoch_i in trange(start_epoch, opt.n_epoch, desc="Epoch"):
         if epoch_i > -1:
-            train_epoch(model, criterion, train_loader, optimizer, opt, epoch_i, tb_writer, ema=ema)
+            train_epoch(model, criterion, train_loader, optimizer, opt, epoch_i, ema=ema)
             lr_scheduler.step()
         if opt.eval_path is not None and should_run_eval(opt, epoch_i):
             using_ema_eval = ema is not None and (epoch_i + 1) >= opt.ema_start_epoch
@@ -300,7 +287,7 @@ def train_hl(model, criterion, optimizer, lr_scheduler, train_dataset, val_datas
                 ema.copy_to(model)
             with torch.no_grad():
                 metrics_no_nms, metrics_nms, eval_loss_meters, latest_file_paths = \
-                    eval_epoch(model, val_dataset, opt, save_submission_filename, epoch_i, criterion, tb_writer)
+                    eval_epoch(model, val_dataset, opt, save_submission_filename, epoch_i, criterion, None)
             eval_model_state = copy.deepcopy(model.state_dict())
             if using_ema_eval:
                 ema.restore(model)
@@ -319,8 +306,6 @@ def train_hl(model, criterion, optimizer, lr_scheduler, train_dataset, val_datas
                 log_validation_summary(logger, epoch_i + 1, eval_loss_meters, metrics_nms["brief"], title="nms validation summary")
 
             metrics = metrics_no_nms
-            for k, v in metrics["brief"].items():
-                tb_writer.add_scalar(f"Eval/{k}", float(v), epoch_i+1)
 
             # stop_score = metrics["brief"]["MR-full-mAP"]
             stop_score = metrics["brief"]["mAP"]
@@ -374,9 +359,6 @@ def train_hl(model, criterion, optimizer, lr_scheduler, train_dataset, val_datas
 
         if opt.debug:
             break
-
-    tb_writer.close()
-
 
 def start_training():
     logger.info("Setup config, data and model...")

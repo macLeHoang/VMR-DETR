@@ -146,7 +146,9 @@ class BaseOptions(object):
         parser.add_argument("--span_loss_type", default="l1", type=str, choices=['l1', 'ce'],
                             help="l1: (center-x, width) regression. ce: (st_idx, ed_idx) classification.")
         parser.add_argument("--contrastive_align_loss", action="store_true",
-                            help="Disable contrastive_align_loss between matched query spans and the text.")
+                            help="Enable contrastive_align_loss between matched query spans and text.")
+        parser.add_argument("--contrastive_start_epoch", default=0, type=int,
+                            help="1-based epoch to start contrastive loss. 0 enables it from the beginning.")
         # * Matcher
         parser.add_argument('--set_cost_span', default=10, type=float,
                             help="L1 span coefficient in the matching cost")

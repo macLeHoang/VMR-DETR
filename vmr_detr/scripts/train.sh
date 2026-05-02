@@ -3,7 +3,7 @@ ctx_mode=video_tef
 v_feat_types=slowfast_clip
 t_feat_types=clip
 results_root=results
-exp_id=exp_nepoch_100_slowfast_clip_gated
+exp_id=exp_nepoch_100_slowfast_clip_gated_contrastive
 
 ######## data paths
 train_path=/content/drive/MyDrive/Master/Thesis/QD-DETR-Old/data/charades-sta/train.jsonl
@@ -47,6 +47,7 @@ eval_bsz=32
 n_epoch=100
 clip_length=1
 contrastive_align_loss_coef=0.3
+contrastive_start_epoch=10
 dec_layers=3
 enc_layers=3
 lr=1.5e-04
@@ -56,6 +57,7 @@ num_workers=2
 
 eval_every_epoch_after=40
 ema_decay=0.999
+max_es_cnt=10
 
 
 PYTHONPATH=$PYTHONPATH:. python vmr_detr/cli/train.py \
@@ -74,6 +76,7 @@ PYTHONPATH=$PYTHONPATH:. python vmr_detr/cli/train.py \
 --eval_bsz ${eval_bsz} \
 --contrastive_align_loss \
 --contrastive_align_loss_coef ${contrastive_align_loss_coef} \
+--contrastive_start_epoch ${contrastive_start_epoch} \
 --dec_layers ${dec_layers} \
 --enc_layers ${enc_layers} \
 --clip_length ${clip_length} \
@@ -85,4 +88,5 @@ PYTHONPATH=$PYTHONPATH:. python vmr_detr/cli/train.py \
 --eval_every_epoch_after ${eval_every_epoch_after} \
 --ema_decay ${ema_decay} \
 --use_gated_video_fusion \
+--max_es_cnt ${max_es_cnt} \
 ${@:1}
