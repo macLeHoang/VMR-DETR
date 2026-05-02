@@ -128,7 +128,9 @@ class BaseOptions(object):
         # other model configs
         parser.add_argument("--n_input_proj", type=int, default=2, help="#layers to encoder input")
         parser.add_argument("--use_gated_video_fusion", action="store_true",
-                            help="Enable text-conditioned gated fusion for SlowFast/CLIP video features.")
+                            help="Enable early text-conditioned gated fusion for SlowFast/CLIP video features.")
+        parser.add_argument("--use_late_gated_video_fusion", action="store_true",
+                            help="Enable late stream-aware gated fusion for SlowFast/CLIP video features.")
         parser.add_argument("--slowfast_dim", type=int, default=2304,
                             help="SlowFast feature dim inside concatenated video features.")
         parser.add_argument("--clip_dim", type=int, default=512,
@@ -149,6 +151,10 @@ class BaseOptions(object):
                             help="Enable contrastive_align_loss between matched query spans and text.")
         parser.add_argument("--contrastive_start_epoch", default=0, type=int,
                             help="1-based epoch to start contrastive loss. 0 enables it from the beginning.")
+        parser.add_argument("--contrastive_decay_epoch", default=-1, type=int,
+                            help="1-based epoch to switch contrastive loss to contrastive_decay_coef. <=0 disables decay.")
+        parser.add_argument("--contrastive_decay_coef", default=0.0, type=float,
+                            help="contrastive_align_loss weight after contrastive_decay_epoch.")
         # * Matcher
         parser.add_argument('--set_cost_span', default=10, type=float,
                             help="L1 span coefficient in the matching cost")

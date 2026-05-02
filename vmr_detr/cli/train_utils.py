@@ -199,6 +199,7 @@ def build_datasets(opt):
             span_loss_type=opt.span_loss_type,
             txt_drop_ratio=opt.txt_drop_ratio,
             dset_domain=opt.dset_domain,
+            v_feat_len_mode=opt.v_feat_len_mode,
         )
         train_dataset = StartEndDataset(**dataset_config)
     else:

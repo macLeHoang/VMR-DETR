@@ -13,11 +13,45 @@ from vmr_detr.modeling.transformer import build_transformer
 from vmr_detr.modeling.position_encoding import build_position_encoding
 from vmr_detr.ops.misc import accuracy
 import numpy as np
+
 def inverse_sigmoid(x, eps=1e-3):
     x = x.clamp(min=0, max=1)
     x1 = x.clamp(min=eps)
     x2 = (1 - x).clamp(min=eps)
     return torch.log(x1/x2)
+
+
+class StreamTextConditionedEncoder(nn.Module):
+    """Lightweight cross-attention block that conditions a video stream on text."""
+
+    def __init__(self, hidden_dim, nhead, dim_feedforward=None, dropout=0.1):
+        super().__init__()
+        if dim_feedforward is None:
+            dim_feedforward = hidden_dim * 4
+        self.cross_attn = nn.MultiheadAttention(hidden_dim, nhead, dropout=dropout)
+        self.linear1 = nn.Linear(hidden_dim, dim_feedforward)
+        self.linear2 = nn.Linear(dim_feedforward, hidden_dim)
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.norm2 = nn.LayerNorm(hidden_dim)
+        self.dropout = nn.Dropout(dropout)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+
+    def forward(self, stream_feat, stream_mask, txt_feat, txt_mask, stream_pos=None, txt_pos=None):
+        # stream_feat/txt_feat: (bsz, L, d), masks: 1 for valid, 0 for pad
+        stream_query = stream_feat if stream_pos is None else stream_feat + stream_pos
+        txt_key = txt_feat if txt_pos is None else txt_feat + txt_pos
+        q = stream_query.transpose(0, 1)
+        k = txt_key.transpose(0, 1)
+        v = txt_feat.transpose(0, 1)
+        txt_key_padding_mask = ~txt_mask.bool()
+        attn_out = self.cross_attn(
+            q, k, value=v, key_padding_mask=txt_key_padding_mask
+        )[0].transpose(0, 1)
+        stream_feat = self.norm1(stream_feat + self.dropout1(attn_out))
+        ff = self.linear2(self.dropout(F.relu(self.linear1(stream_feat), inplace=True)))
+        stream_feat = self.norm2(stream_feat + self.dropout2(ff))
+        return stream_feat * stream_mask.float().unsqueeze(-1)
 
 class VMRDETR(nn.Module):
     """ VMR DETR. """
@@ -26,7 +60,8 @@ class VMRDETR(nn.Module):
                  num_queries, input_dropout, aux_loss=False,
                  contrastive_align_loss=False, contrastive_hdim=64,
                  max_v_l=75, span_loss_type="l1", use_txt_pos=False, n_input_proj=2, aud_dim=0,
-                 use_gated_video_fusion=False, slowfast_dim=2304, clip_dim=512, tef_dim=2):
+                 use_gated_video_fusion=False, use_late_gated_video_fusion=False,
+                 slowfast_dim=2304, clip_dim=512, tef_dim=2, dropout=0.1, dim_feedforward=None):
         """ Initializes the model.
         Parameters:
             transformer: torch module of the transformer architecture. See transformer.py
@@ -76,11 +111,16 @@ class VMRDETR(nn.Module):
             LinearLayer(hidden_dim, hidden_dim, layer_norm=True, dropout=input_dropout, relu=relu_args[2])
         ][:n_input_proj])
 
+        if use_gated_video_fusion and use_late_gated_video_fusion:
+            raise ValueError("Use only one of use_gated_video_fusion or use_late_gated_video_fusion.")
+
         self.use_gated_video_fusion = use_gated_video_fusion
+        self.use_late_gated_video_fusion = use_late_gated_video_fusion
         self.slowfast_dim = slowfast_dim
         self.clip_dim = clip_dim
         self.tef_dim = tef_dim
-        if self.use_gated_video_fusion:
+
+        if self.use_gated_video_fusion or self.use_late_gated_video_fusion:
             self.input_slowfast_proj = nn.Sequential(*[
                 LinearLayer(slowfast_dim, hidden_dim, layer_norm=True, dropout=input_dropout, relu=relu_args[0]),
                 LinearLayer(hidden_dim, hidden_dim, layer_norm=True, dropout=input_dropout, relu=relu_args[1]),
@@ -102,6 +142,16 @@ class VMRDETR(nn.Module):
                 LinearLayer(hidden_dim, hidden_dim, layer_norm=True, dropout=input_dropout, relu=relu_args[2])
             ][:n_input_proj])
 
+        if self.use_late_gated_video_fusion:
+            self.slowfast_txt_encoder = StreamTextConditionedEncoder(
+                hidden_dim=hidden_dim, nhead=transformer.nhead,
+                dim_feedforward=dim_feedforward, dropout=dropout
+            )
+            self.clip_txt_encoder = StreamTextConditionedEncoder(
+                hidden_dim=hidden_dim, nhead=transformer.nhead,
+                dim_feedforward=dim_feedforward, dropout=dropout
+            )
+
         self.contrastive_align_loss = contrastive_align_loss
         if contrastive_align_loss:
             self.contrastive_align_projection_query = nn.Linear(hidden_dim, contrastive_hdim)
@@ -115,6 +165,87 @@ class VMRDETR(nn.Module):
         self.hidden_dim = hidden_dim
         self.global_rep_token = torch.nn.Parameter(torch.randn(hidden_dim))
         self.global_rep_pos = torch.nn.Parameter(torch.randn(hidden_dim))
+
+    def _masked_text_global(self, src_txt, src_txt_mask):
+        text_mask = src_txt_mask.float().unsqueeze(-1)
+        text_denom = text_mask.sum(dim=1).clamp(min=1.0)
+        return (src_txt * text_mask).sum(dim=1) / text_denom
+
+    def _validate_text_mask(self, src_txt, src_txt_mask):
+        if src_txt.shape[1] == 0 or not src_txt_mask.bool().any(dim=1).all():
+            raise ValueError("Each sample must contain at least one valid text token.")
+
+    def _split_video_streams(self, src_vid):
+        expected_vid_dim = self.slowfast_dim + self.clip_dim + self.tef_dim
+        if src_vid.shape[-1] != expected_vid_dim:
+            raise ValueError(
+                f"Expected src_vid dim={expected_vid_dim} "
+                f"(slowfast={self.slowfast_dim}, clip={self.clip_dim}, tef={self.tef_dim}), "
+                f"but got {src_vid.shape[-1]}."
+            )
+
+        slowfast = src_vid[..., :self.slowfast_dim]
+        clip = src_vid[..., self.slowfast_dim:self.slowfast_dim + self.clip_dim]
+        tef = src_vid[..., self.slowfast_dim + self.clip_dim:]
+        return slowfast, clip, tef
+
+    def _early_fuse_streams_with_text(self, src_vid, src_txt, src_txt_mask):
+        slowfast, clip, tef = self._split_video_streams(src_vid)
+
+        slowfast_h = self.input_slowfast_proj(slowfast)
+        clip_h = self.input_clip_proj(clip)
+
+        text_global = self._masked_text_global(src_txt, src_txt_mask)
+        text_global_expanded = text_global.unsqueeze(1).expand(-1, slowfast_h.shape[1], -1)
+        gate_input = torch.cat(
+            [slowfast_h, clip_h, slowfast_h * clip_h, text_global_expanded], dim=-1
+        )
+        gate = torch.sigmoid(self.video_gate_mlp(gate_input))
+        fused_mem = gate * clip_h + (1.0 - gate) * slowfast_h
+        return fused_mem + self.input_tef_proj(tef)
+
+    def _late_fuse_streams_with_text(self, src_vid, src_vid_mask, src_txt, src_txt_mask):
+        slowfast, clip, tef = self._split_video_streams(src_vid)
+
+        slowfast_h = self.input_slowfast_proj(slowfast)
+        clip_h = self.input_clip_proj(clip)
+
+        # Shared temporal positions: both streams are already aligned to the same video grid.
+        stream_pos = self.position_embed(slowfast_h, src_vid_mask)
+        txt_pos = self.txt_position_embed(src_txt) if self.use_txt_pos else torch.zeros_like(src_txt)
+        slowfast_mem = self.slowfast_txt_encoder(
+            slowfast_h, src_vid_mask, src_txt, src_txt_mask, stream_pos=stream_pos, txt_pos=txt_pos
+        )
+        clip_mem = self.clip_txt_encoder(
+            clip_h, src_vid_mask, src_txt, src_txt_mask, stream_pos=stream_pos, txt_pos=txt_pos
+        )
+
+        text_global = self._masked_text_global(src_txt, src_txt_mask)
+        text_global_expanded = text_global.unsqueeze(1).expand(-1, slowfast_mem.shape[1], -1)
+        gate_input = torch.cat(
+            [slowfast_mem, clip_mem, slowfast_mem * clip_mem, text_global_expanded], dim=-1
+        )
+        gate = torch.sigmoid(self.video_gate_mlp(gate_input))
+        fused_mem = gate * clip_mem + (1.0 - gate) * slowfast_mem
+        return fused_mem + self.input_tef_proj(tef)
+
+    def _run_text_video_transformer(self, src_vid, src_vid_mask, src_txt, src_txt_mask):
+        src = torch.cat([src_vid, src_txt], dim=1)  # (bsz, L_vid+L_txt, d)
+        mask = torch.cat([src_vid_mask, src_txt_mask], dim=1).bool()  # (bsz, L_vid+L_txt)
+        pos_vid = self.position_embed(src_vid, src_vid_mask)  # (bsz, L_vid, d)
+        pos_txt = self.txt_position_embed(src_txt) if self.use_txt_pos else torch.zeros_like(src_txt)
+        pos = torch.cat([pos_vid, pos_txt], dim=1)
+
+        mask_global = torch.ones((mask.shape[0], 1), dtype=torch.bool, device=mask.device)
+        mask = torch.cat([mask_global, mask], dim=1)
+        src_global = self.global_rep_token.reshape([1, 1, self.hidden_dim]).repeat(src.shape[0], 1, 1)
+        src = torch.cat([src_global, src], dim=1)
+        pos_global = self.global_rep_pos.reshape([1, 1, self.hidden_dim]).repeat(pos.shape[0], 1, 1)
+        pos = torch.cat([pos_global, pos], dim=1)
+
+        return self.transformer(
+            src, ~mask, self.query_embed.weight, pos, video_length=src_vid.shape[1]
+        )
 
     def forward(self, src_txt, src_txt_mask, src_vid, src_vid_mask, src_aud=None, src_aud_mask=None):
         """The forward expects two tensors:
@@ -133,62 +264,26 @@ class VMRDETR(nn.Module):
                - "aux_outputs": Optional, only returned when auxilary losses are activated. It is a list of
                                 dictionnaries containing the two above keys for each decoder layer.
         """
-        if src_aud is not None and self.use_gated_video_fusion:
+        if src_aud is not None and (self.use_gated_video_fusion or self.use_late_gated_video_fusion):
             raise ValueError("gated video fusion currently supports non-audio runs only.")
         if src_aud is not None:
             src_vid = torch.cat([src_vid, src_aud], dim=2)
 
+        self._validate_text_mask(src_txt, src_txt_mask)
+        src_vid_input = src_vid
         src_txt = self.input_txt_proj(src_txt)
-        if self.use_gated_video_fusion:
-            text_mask = src_txt_mask.float().unsqueeze(-1)
-            text_denom = text_mask.sum(dim=1).clamp(min=1.0)
-            text_global = (src_txt * text_mask).sum(dim=1) / text_denom  # (bsz, d)
 
-            expected_vid_dim = self.slowfast_dim + self.clip_dim + self.tef_dim
-            if src_vid.shape[-1] != expected_vid_dim:
-                raise ValueError(
-                    f"Expected src_vid dim={expected_vid_dim} "
-                    f"(slowfast={self.slowfast_dim}, clip={self.clip_dim}, tef={self.tef_dim}), "
-                    f"but got {src_vid.shape[-1]}."
-                )
-
-            slowfast = src_vid[..., :self.slowfast_dim]
-            clip = src_vid[..., self.slowfast_dim:self.slowfast_dim + self.clip_dim]
-            tef = src_vid[..., self.slowfast_dim + self.clip_dim:]
-
-            slowfast_h = self.input_slowfast_proj(slowfast)
-            clip_h = self.input_clip_proj(clip)
-            text_global_expanded = text_global.unsqueeze(1).expand(-1, slowfast_h.shape[1], -1)
-            gate_input = torch.cat(
-                [slowfast_h, clip_h, slowfast_h * clip_h, text_global_expanded], dim=-1)
-            gate = torch.sigmoid(self.video_gate_mlp(gate_input))
-            src_vid = gate * clip_h + (1.0 - gate) * slowfast_h
-            src_vid = src_vid + self.input_tef_proj(tef)
+        if self.use_late_gated_video_fusion:
+            src_vid = self._late_fuse_streams_with_text(src_vid_input, src_vid_mask, src_txt, src_txt_mask)
+        elif self.use_gated_video_fusion:
+            src_vid = self._early_fuse_streams_with_text(src_vid, src_txt, src_txt_mask)
         else:
             src_vid = self.input_vid_proj(src_vid)
 
-        src = torch.cat([src_vid, src_txt], dim=1)  # (bsz, L_vid+L_txt, d)
-        mask = torch.cat([src_vid_mask, src_txt_mask], dim=1).bool()  # (bsz, L_vid+L_txt)
-        # TODO should we remove or use different positional embeddings to the src_txt?
-        pos_vid = self.position_embed(src_vid, src_vid_mask)  # (bsz, L_vid, d)
-        pos_txt = self.txt_position_embed(src_txt) if self.use_txt_pos else torch.zeros_like(src_txt)  # (bsz, L_txt, d)
-        # pos_txt = torch.zeros_like(src_txt)
-        # pad zeros for txt positions
-        pos = torch.cat([pos_vid, pos_txt], dim=1)
-        # (#layers, bsz, #queries, d), (bsz, L_vid+L_txt, d)
+        hs, reference, vid_mem, memory_global, txt_mem = self._run_text_video_transformer(
+            src_vid, src_vid_mask, src_txt, src_txt_mask
+        )
 
-        # for global token
-        mask_ = torch.tensor([[True]]).to(mask.device).repeat(mask.shape[0], 1)
-        mask = torch.cat([mask_, mask], dim=1)
-        src_ = self.global_rep_token.reshape([1, 1, self.hidden_dim]).repeat(src.shape[0], 1, 1)
-        src = torch.cat([src_, src], dim=1)
-        pos_ = self.global_rep_pos.reshape([1, 1, self.hidden_dim]).repeat(pos.shape[0], 1, 1)
-        pos = torch.cat([pos_, pos], dim=1)
-
-        video_length = src_vid.shape[1]
-        
-        hs, reference, vid_mem, memory_global, txt_mem = self.transformer(
-            src, ~mask, self.query_embed.weight, pos, video_length=video_length)
         outputs_class = self.class_embed(hs)  # (#layers, batch_size, #queries, #classes)
         reference_before_sigmoid = inverse_sigmoid(reference)
         tmp = self.span_embed(hs)
@@ -208,24 +303,17 @@ class VMRDETR(nn.Module):
                 proj_txt_mask=src_txt_mask.bool(),
             ))
             
-            
-        # !!! this is code for test
-        if src_txt.shape[1] == 0:
-            print("There is zero text query. You should change codes properly")
-            exit(-1)
-
         ### Neg Pairs ###
         src_txt_neg = torch.cat([src_txt[1:], src_txt[0:1]], dim=0)
         src_txt_mask_neg = torch.cat([src_txt_mask[1:], src_txt_mask[0:1]], dim=0)
-        src_neg = torch.cat([src_vid, src_txt_neg], dim=1)
-        mask_neg = torch.cat([src_vid_mask, src_txt_mask_neg], dim=1).bool()
+        if self.use_late_gated_video_fusion:
+            src_vid_neg = self._late_fuse_streams_with_text(src_vid_input, src_vid_mask, src_txt_neg, src_txt_mask_neg)
+        else:
+            src_vid_neg = src_vid
 
-        mask_neg = torch.cat([mask_, mask_neg], dim=1)
-        src_neg = torch.cat([src_, src_neg], dim=1)
-        pos_neg = pos.clone()  # since it does not use actual content
-
-        _, _, vid_mem_neg, memory_global_neg, _ = self.transformer(
-            src_neg, ~mask_neg, self.query_embed.weight, pos_neg, video_length=video_length)
+        _, _, vid_mem_neg, memory_global_neg, _ = self._run_text_video_transformer(
+            src_vid_neg, src_vid_mask, src_txt_neg, src_txt_mask_neg
+        )
 
 
         out["saliency_scores"] = (torch.sum(self.saliency_proj1(vid_mem) * self.saliency_proj2(memory_global).unsqueeze(1), dim=-1) / np.sqrt(self.hidden_dim))
@@ -256,7 +344,8 @@ class SetCriterion(nn.Module):
     """
 
     def __init__(self, matcher, weight_dict, eos_coef, losses, temperature, span_loss_type, max_v_l,
-                 saliency_margin=1, use_matcher=True, contrastive_start_epoch=0):
+                 saliency_margin=1, use_matcher=True, contrastive_start_epoch=0,
+                 contrastive_decay_epoch=-1, contrastive_decay_coef=0.0):
         """ Create the criterion.
         Parameters:
             matcher: module able to compute a matching between targets and proposals
@@ -288,10 +377,26 @@ class SetCriterion(nn.Module):
         # for tvsum,
         self.use_matcher = use_matcher
         self.contrastive_start_epoch = contrastive_start_epoch
+        self.contrastive_decay_epoch = contrastive_decay_epoch
+        self.contrastive_decay_coef = contrastive_decay_coef
+        self.contrastive_base_coef = self.weight_dict.get("loss_contrastive_align", 0.0)
         self.current_epoch = 0
+        self._update_contrastive_weight()
 
     def set_epoch(self, epoch):
         self.current_epoch = int(epoch)
+        self._update_contrastive_weight()
+
+    def _update_contrastive_weight(self):
+        if "loss_contrastive_align" not in self.weight_dict:
+            return
+        if self.current_epoch < self.contrastive_start_epoch:
+            coef = 0.0
+        elif self.contrastive_decay_epoch > 0 and self.current_epoch >= self.contrastive_decay_epoch:
+            coef = self.contrastive_decay_coef
+        else:
+            coef = self.contrastive_base_coef
+        self.weight_dict["loss_contrastive_align"] = coef
 
     def loss_spans(self, outputs, targets, indices):
         """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
@@ -606,13 +711,17 @@ def build_model(args):
             aux_loss=args.aux_loss,
             contrastive_align_loss=args.contrastive_align_loss,
             contrastive_hdim=args.contrastive_hdim,
+            max_v_l=args.max_v_l,
             span_loss_type=args.span_loss_type,
             use_txt_pos=args.use_txt_pos,
             n_input_proj=args.n_input_proj,
             use_gated_video_fusion=args.use_gated_video_fusion,
+            use_late_gated_video_fusion=args.use_late_gated_video_fusion,
             slowfast_dim=args.slowfast_dim,
             clip_dim=args.clip_dim,
             tef_dim=args.tef_dim,
+            dropout=args.dropout,
+            dim_feedforward=args.dim_feedforward,
         )
     else:
         model = VMRDETR(
@@ -627,13 +736,17 @@ def build_model(args):
             aux_loss=args.aux_loss,
             contrastive_align_loss=args.contrastive_align_loss,
             contrastive_hdim=args.contrastive_hdim,
+            max_v_l=args.max_v_l,
             span_loss_type=args.span_loss_type,
             use_txt_pos=args.use_txt_pos,
             n_input_proj=args.n_input_proj,
             use_gated_video_fusion=args.use_gated_video_fusion,
+            use_late_gated_video_fusion=args.use_late_gated_video_fusion,
             slowfast_dim=args.slowfast_dim,
             clip_dim=args.clip_dim,
             tef_dim=args.tef_dim,
+            dropout=args.dropout,
+            dim_feedforward=args.dim_feedforward,
         )
 
     matcher = build_matcher(args)
@@ -666,6 +779,8 @@ def build_model(args):
         span_loss_type=args.span_loss_type, max_v_l=args.max_v_l,
         saliency_margin=args.saliency_margin, use_matcher=use_matcher,
         contrastive_start_epoch=args.contrastive_start_epoch,
+        contrastive_decay_epoch=args.contrastive_decay_epoch,
+        contrastive_decay_coef=args.contrastive_decay_coef,
     )
     criterion.to(device)
     return model, criterion
