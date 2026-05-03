@@ -55,9 +55,9 @@ class StreamTextConditionedEncoder(nn.Module):
 
 
 class ResidualMultiScaleTemporalAdapter(nn.Module):
-    """Weak parallel temporal adapter that starts as an identity residual."""
+    """Weak parallel temporal adapter with bounded residual strength."""
 
-    def __init__(self, hidden_dim, dropout=0.1):
+    def __init__(self, hidden_dim, dropout=0.1, max_residual_scale=0.1, max_residual_ratio=-1.0):
         super().__init__()
         self.branch_k3 = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1, groups=hidden_dim)
         self.branch_k5 = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=5, padding=2, groups=hidden_dim)
@@ -69,6 +69,8 @@ class ResidualMultiScaleTemporalAdapter(nn.Module):
         )
         self.dropout = nn.Dropout(dropout)
         self.residual_scale = nn.Parameter(torch.zeros(hidden_dim))
+        self.max_residual_scale = float(max_residual_scale)
+        self.max_residual_ratio = float(max_residual_ratio)
 
     def forward(self, x, x_mask):
         mask = x_mask.float().unsqueeze(-1)
@@ -81,7 +83,18 @@ class ResidualMultiScaleTemporalAdapter(nn.Module):
         gate_input = torch.cat([x_masked, b3, b5], dim=-1)
         gate = torch.sigmoid(self.gate_mlp(gate_input)).view(x.shape[0], x.shape[1], 2, x.shape[2])
         fused = gate[:, :, 0] * b3 + gate[:, :, 1] * b5
-        residual = self.dropout(fused) * self.residual_scale.view(1, 1, -1)
+        if self.max_residual_scale <= 0:
+            scale = torch.zeros_like(self.residual_scale)
+        else:
+            # Preserve near-zero learning speed while bounding the learned residual.
+            scale = self.max_residual_scale * torch.tanh(self.residual_scale / self.max_residual_scale)
+        residual = self.dropout(fused) * scale.view(1, 1, -1)
+
+        if self.max_residual_ratio > 0:
+            residual_norm = residual.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+            input_norm = x_masked.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+            max_residual_norm = self.max_residual_ratio * input_norm
+            residual = residual * torch.clamp(max_residual_norm / residual_norm, max=1.0)
         return (x + residual) * mask
 
 
@@ -94,7 +107,8 @@ class VMRDETR(nn.Module):
                  max_v_l=75, span_loss_type="l1", use_txt_pos=False, n_input_proj=2, aud_dim=0,
                  use_gated_video_fusion=False, use_late_gated_video_fusion=False,
                  slowfast_dim=2304, clip_dim=512, tef_dim=2, dropout=0.1, dim_feedforward=None,
-                 use_multiscale_stream_adapter=False, multiscale_adapter_dropout=0.1):
+                 use_multiscale_stream_adapter=False, multiscale_adapter_dropout=0.1,
+                 multiscale_adapter_max_residual_scale=0.1, multiscale_adapter_max_residual_ratio=-1.0):
         """ Initializes the model.
         Parameters:
             transformer: torch module of the transformer architecture. See transformer.py
@@ -187,7 +201,10 @@ class VMRDETR(nn.Module):
             )
             if self.use_multiscale_stream_adapter:
                 self.clip_multiscale_adapter = ResidualMultiScaleTemporalAdapter(
-                    hidden_dim=hidden_dim, dropout=multiscale_adapter_dropout
+                    hidden_dim=hidden_dim,
+                    dropout=multiscale_adapter_dropout,
+                    max_residual_scale=multiscale_adapter_max_residual_scale,
+                    max_residual_ratio=multiscale_adapter_max_residual_ratio,
                 )
 
         self.contrastive_align_loss = contrastive_align_loss
@@ -765,6 +782,8 @@ def build_model(args):
             dim_feedforward=args.dim_feedforward,
             use_multiscale_stream_adapter=args.use_multiscale_stream_adapter,
             multiscale_adapter_dropout=args.multiscale_adapter_dropout,
+            multiscale_adapter_max_residual_scale=args.multiscale_adapter_max_residual_scale,
+            multiscale_adapter_max_residual_ratio=args.multiscale_adapter_max_residual_ratio,
         )
     else:
         model = VMRDETR(
@@ -792,6 +811,8 @@ def build_model(args):
             dim_feedforward=args.dim_feedforward,
             use_multiscale_stream_adapter=args.use_multiscale_stream_adapter,
             multiscale_adapter_dropout=args.multiscale_adapter_dropout,
+            multiscale_adapter_max_residual_scale=args.multiscale_adapter_max_residual_scale,
+            multiscale_adapter_max_residual_ratio=args.multiscale_adapter_max_residual_ratio,
         )
 
     matcher = build_matcher(args)
