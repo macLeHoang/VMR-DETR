@@ -53,6 +53,38 @@ class StreamTextConditionedEncoder(nn.Module):
         stream_feat = self.norm2(stream_feat + self.dropout2(ff))
         return stream_feat * stream_mask.float().unsqueeze(-1)
 
+
+class ResidualMultiScaleTemporalAdapter(nn.Module):
+    """Weak parallel temporal adapter that starts as an identity residual."""
+
+    def __init__(self, hidden_dim, dropout=0.1):
+        super().__init__()
+        self.branch_k3 = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1, groups=hidden_dim)
+        self.branch_k5 = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=5, padding=2, groups=hidden_dim)
+
+        self.gate_mlp = nn.Sequential(
+            nn.Linear(hidden_dim * 3, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim * 2)
+        )
+        self.dropout = nn.Dropout(dropout)
+        self.residual_scale = nn.Parameter(torch.zeros(hidden_dim))
+
+    def forward(self, x, x_mask):
+        mask = x_mask.float().unsqueeze(-1)
+        x_masked = x * mask
+        x_t = x_masked.transpose(1, 2)
+
+        b3 = self.branch_k3(x_t).transpose(1, 2)
+        b5 = self.branch_k5(x_t).transpose(1, 2)
+
+        gate_input = torch.cat([x_masked, b3, b5], dim=-1)
+        gate = torch.sigmoid(self.gate_mlp(gate_input)).view(x.shape[0], x.shape[1], 2, x.shape[2])
+        fused = gate[:, :, 0] * b3 + gate[:, :, 1] * b5
+        residual = self.dropout(fused) * self.residual_scale.view(1, 1, -1)
+        return (x + residual) * mask
+
+
 class VMRDETR(nn.Module):
     """ VMR DETR. """
 
@@ -61,7 +93,8 @@ class VMRDETR(nn.Module):
                  contrastive_align_loss=False, contrastive_hdim=64,
                  max_v_l=75, span_loss_type="l1", use_txt_pos=False, n_input_proj=2, aud_dim=0,
                  use_gated_video_fusion=False, use_late_gated_video_fusion=False,
-                 slowfast_dim=2304, clip_dim=512, tef_dim=2, dropout=0.1, dim_feedforward=None):
+                 slowfast_dim=2304, clip_dim=512, tef_dim=2, dropout=0.1, dim_feedforward=None,
+                 use_multiscale_stream_adapter=False, multiscale_adapter_dropout=0.1):
         """ Initializes the model.
         Parameters:
             transformer: torch module of the transformer architecture. See transformer.py
@@ -116,6 +149,7 @@ class VMRDETR(nn.Module):
 
         self.use_gated_video_fusion = use_gated_video_fusion
         self.use_late_gated_video_fusion = use_late_gated_video_fusion
+        self.use_multiscale_stream_adapter = use_multiscale_stream_adapter
         self.slowfast_dim = slowfast_dim
         self.clip_dim = clip_dim
         self.tef_dim = tef_dim
@@ -151,6 +185,10 @@ class VMRDETR(nn.Module):
                 hidden_dim=hidden_dim, nhead=transformer.nhead,
                 dim_feedforward=dim_feedforward, dropout=dropout
             )
+            if self.use_multiscale_stream_adapter:
+                self.clip_multiscale_adapter = ResidualMultiScaleTemporalAdapter(
+                    hidden_dim=hidden_dim, dropout=multiscale_adapter_dropout
+                )
 
         self.contrastive_align_loss = contrastive_align_loss
         if contrastive_align_loss:
@@ -209,6 +247,10 @@ class VMRDETR(nn.Module):
 
         slowfast_h = self.input_slowfast_proj(slowfast)
         clip_h = self.input_clip_proj(clip)
+        text_global = self._masked_text_global(src_txt, src_txt_mask)
+
+        if self.use_multiscale_stream_adapter:
+            clip_h = self.clip_multiscale_adapter(clip_h, src_vid_mask)
 
         # Shared temporal positions: both streams are already aligned to the same video grid.
         stream_pos = self.position_embed(slowfast_h, src_vid_mask)
@@ -220,7 +262,6 @@ class VMRDETR(nn.Module):
             clip_h, src_vid_mask, src_txt, src_txt_mask, stream_pos=stream_pos, txt_pos=txt_pos
         )
 
-        text_global = self._masked_text_global(src_txt, src_txt_mask)
         text_global_expanded = text_global.unsqueeze(1).expand(-1, slowfast_mem.shape[1], -1)
         gate_input = torch.cat(
             [slowfast_mem, clip_mem, slowfast_mem * clip_mem, text_global_expanded], dim=-1
@@ -722,6 +763,8 @@ def build_model(args):
             tef_dim=args.tef_dim,
             dropout=args.dropout,
             dim_feedforward=args.dim_feedforward,
+            use_multiscale_stream_adapter=args.use_multiscale_stream_adapter,
+            multiscale_adapter_dropout=args.multiscale_adapter_dropout,
         )
     else:
         model = VMRDETR(
@@ -747,6 +790,8 @@ def build_model(args):
             tef_dim=args.tef_dim,
             dropout=args.dropout,
             dim_feedforward=args.dim_feedforward,
+            use_multiscale_stream_adapter=args.use_multiscale_stream_adapter,
+            multiscale_adapter_dropout=args.multiscale_adapter_dropout,
         )
 
     matcher = build_matcher(args)

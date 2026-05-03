@@ -3,7 +3,7 @@ ctx_mode=video_tef
 v_feat_types=slowfast_clip
 t_feat_types=clip
 results_root=results
-exp_id=exp_nepoch_100_slowfast_clip_late_gated_contrastive_decay
+exp_id=exp_nepoch_100_slowfast_clip_late_gated_clip_parallel_multiscale_contrastive_decay
 
 ######## data paths
 train_path=/content/drive/MyDrive/Master/Thesis/QD-DETR-Old/data/charades-sta/train.jsonl
@@ -92,5 +92,6 @@ PYTHONPATH=$PYTHONPATH:. python vmr_detr/cli/train.py \
 --eval_every_epoch_after ${eval_every_epoch_after} \
 --ema_decay ${ema_decay} \
 --use_late_gated_video_fusion \
+--use_multiscale_stream_adapter \
 --max_es_cnt ${max_es_cnt} \
 ${@:1}
