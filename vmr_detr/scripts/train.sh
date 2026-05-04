@@ -3,7 +3,7 @@ ctx_mode=video_tef
 v_feat_types=slowfast_clip
 t_feat_types=clip
 results_root=results
-exp_id=exp_nepoch_100_slowfast_clip_late_gated_clip_norm_ratio_multiscale_contrastive_decay
+exp_id=exp_nepoch_100_slowfast_clip_late_gated_clip_scale03_multiscale_contrastive_decay
 
 ######## data paths
 train_path=/content/drive/MyDrive/Master/Thesis/QD-DETR-Old/data/charades-sta/train.jsonl
@@ -94,7 +94,7 @@ PYTHONPATH=$PYTHONPATH:. python vmr_detr/cli/train.py \
 --use_late_gated_video_fusion \
 --use_multiscale_stream_adapter \
 --multiscale_adapter_dropout 0.1 \
---multiscale_adapter_max_residual_scale 1.0 \
---multiscale_adapter_max_residual_ratio 0.3 \
+--multiscale_adapter_max_residual_scale 0.3 \
+--multiscale_adapter_max_residual_ratio -1 \
 --max_es_cnt ${max_es_cnt} \
 ${@:1}
