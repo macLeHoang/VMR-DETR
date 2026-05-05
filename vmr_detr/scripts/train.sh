@@ -94,7 +94,5 @@ PYTHONPATH=$PYTHONPATH:. python vmr_detr/cli/train.py \
 --use_late_gated_video_fusion \
 --use_multiscale_stream_adapter \
 --multiscale_adapter_dropout 0.1 \
---multiscale_adapter_max_residual_scale 0.3 \
---multiscale_adapter_max_residual_ratio -1 \
 --max_es_cnt ${max_es_cnt} \
 ${@:1}
