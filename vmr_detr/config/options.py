@@ -133,7 +133,7 @@ class BaseOptions(object):
                             help="Enable late stream-aware gated fusion for SlowFast/CLIP video features.")
         parser.add_argument("--use_multiscale_stream_adapter", action="store_true",
                             help="Enable a same-length residual multi-scale temporal adapter on CLIP before late fusion.")
-        parser.add_argument("--multiscale_adapter_dropout", type=float, default=0.1,
+        parser.add_argument("--multiscale_adapter_dropout", type=float, default=0.05,
                             help="Dropout used inside the residual multi-scale temporal adapter.")
         parser.add_argument("--slowfast_dim", type=int, default=2304,
                             help="SlowFast feature dim inside concatenated video features.")
@@ -273,4 +273,3 @@ class TestOptions(BaseOptions):
                                  help="dir to save results, if not set, fall back to training results_dir")
         self.parser.add_argument("--model_dir", type=str,
                                  help="dir contains the model file, will be converted to absolute path afterwards")
-
