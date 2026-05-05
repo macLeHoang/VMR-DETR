@@ -48,12 +48,12 @@ n_epoch=100
 clip_length=1
 contrastive_align_loss_coef=0.3
 contrastive_start_epoch=10
-contrastive_decay_epoch=40
+contrastive_decay_epoch=35
 contrastive_decay_coef=0.1
 dec_layers=3
 enc_layers=3
 lr=1.5e-04
-lr_drop=100
+lr_drop=40
 v_feat_len_mode=min
 num_workers=2
 

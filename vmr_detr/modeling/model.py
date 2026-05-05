@@ -57,31 +57,49 @@ class StreamTextConditionedEncoder(nn.Module):
 class ResidualMultiScaleTemporalAdapter(nn.Module):
     """Weak parallel temporal adapter that starts as an identity residual."""
 
-    def __init__(self, hidden_dim, dropout=0.1):
+    def __init__(self, hidden_dim, dropout=0.1, text_conditioned=True):
         super().__init__()
-        self.branch_k3 = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1, groups=hidden_dim)
-        self.branch_k5 = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=5, padding=2, groups=hidden_dim)
-
-        self.gate_mlp = nn.Sequential(
-            nn.Linear(hidden_dim * 3, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, hidden_dim * 2)
+        self.text_conditioned = text_conditioned
+        self.branch_k3 = nn.Conv1d(
+            hidden_dim, hidden_dim, kernel_size=3, padding=1, groups=hidden_dim, bias=False
         )
+        self.branch_k5 = nn.Conv1d(
+            hidden_dim, hidden_dim, kernel_size=5, padding=2, groups=hidden_dim, bias=False
+        )
+
+        gate_input_dim = hidden_dim * (4 if text_conditioned else 3)
+        self.gate_mlp = nn.Sequential(
+            nn.Linear(gate_input_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim * 3)
+        )
+        self.residual_norm = nn.LayerNorm(hidden_dim)
         self.dropout = nn.Dropout(dropout)
         self.residual_scale = nn.Parameter(torch.zeros(hidden_dim))
 
-    def forward(self, x, x_mask):
+    def forward(self, x, x_mask, text_global=None):
+        if self.text_conditioned and text_global is None:
+            raise ValueError("text_global is required when text_conditioned=True.")
+
         mask = x_mask.float().unsqueeze(-1)
         x_masked = x * mask
         x_t = x_masked.transpose(1, 2)
 
-        b3 = self.branch_k3(x_t).transpose(1, 2)
-        b5 = self.branch_k5(x_t).transpose(1, 2)
+        b3 = self.branch_k3(x_t).transpose(1, 2) * mask
+        b5 = self.branch_k5(x_t).transpose(1, 2) * mask
 
-        gate_input = torch.cat([x_masked, b3, b5], dim=-1)
-        gate = torch.sigmoid(self.gate_mlp(gate_input)).view(x.shape[0], x.shape[1], 2, x.shape[2])
-        fused = gate[:, :, 0] * b3 + gate[:, :, 1] * b5
-        residual = self.dropout(fused) * self.residual_scale.view(1, 1, -1)
+        gate_inputs = [x_masked, b3, b5]
+        if self.text_conditioned:
+            text_global_expanded = text_global.unsqueeze(1).expand(-1, x.shape[1], -1)
+            gate_inputs.append(text_global_expanded)
+        gate_input = torch.cat(gate_inputs, dim=-1)
+        gate = self.gate_mlp(gate_input).view(x.shape[0], x.shape[1], 3, x.shape[2])
+        gate = torch.softmax(gate, dim=2)
+
+        branches = torch.stack([x_masked, b3, b5], dim=2)
+        refined = (gate * branches).sum(dim=2)
+        residual = self.residual_norm(refined - x_masked)
+        residual = self.dropout(residual) * self.residual_scale.view(1, 1, -1)
         return (x + residual) * mask
 
 
@@ -250,7 +268,7 @@ class VMRDETR(nn.Module):
         text_global = self._masked_text_global(src_txt, src_txt_mask)
 
         if self.use_multiscale_stream_adapter:
-            clip_h = self.clip_multiscale_adapter(clip_h, src_vid_mask)
+            clip_h = self.clip_multiscale_adapter(clip_h, src_vid_mask, text_global=text_global)
 
         # Shared temporal positions: both streams are already aligned to the same video grid.
         stream_pos = self.position_embed(slowfast_h, src_vid_mask)
@@ -829,4 +847,3 @@ def build_model(args):
     )
     criterion.to(device)
     return model, criterion
-
