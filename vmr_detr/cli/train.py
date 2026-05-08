@@ -100,6 +100,17 @@ def train_epoch(model, criterion, train_loader, optimizer, opt, epoch_i, ema=Non
         logger.info(f"{name} ==> {d}")
 
 
+def get_stop_score(metrics, opt, fallback_metric):
+    brief = metrics["brief"]
+    metric_name = opt.best_metric
+    if metric_name not in brief and metric_name == "MR-full-mAP" and fallback_metric in brief:
+        metric_name = fallback_metric
+    if metric_name not in brief:
+        available = ", ".join(brief.keys())
+        raise KeyError(f"best metric '{opt.best_metric}' not found. Available metrics: {available}")
+    return brief[metric_name], metric_name
+
+
 def train(model, criterion, optimizer, lr_scheduler, train_dataset, val_dataset, opt):
     if opt.device.type == "cuda":
         logger.info("CUDA enabled.")
@@ -176,7 +187,7 @@ def train(model, criterion, optimizer, lr_scheduler, train_dataset, val_dataset,
 
             metrics = metrics_no_nms
 
-            stop_score = metrics["brief"]["MR-full-mAP"]
+            stop_score, stop_metric_name = get_stop_score(metrics, opt, "MR-full-mAP")
                 
             if stop_score > prev_best_score:
                 es_cnt = 0
@@ -197,7 +208,7 @@ def train(model, criterion, optimizer, lr_scheduler, train_dataset, val_dataset,
                 best_file_paths = [e.replace("latest", "best") for e in latest_file_paths]
                 for src, tgt in zip(latest_file_paths, best_file_paths):
                     os.renames(src, tgt)
-                logger.info("The checkpoint file has been updated.")
+                logger.info(f"The checkpoint file has been updated using {stop_metric_name}={stop_score:.4f}.")
             else:
                 es_cnt += 1
                 if opt.max_es_cnt != -1 and es_cnt > opt.max_es_cnt:  # early stop
@@ -308,7 +319,7 @@ def train_hl(model, criterion, optimizer, lr_scheduler, train_dataset, val_datas
             metrics = metrics_no_nms
 
             # stop_score = metrics["brief"]["MR-full-mAP"]
-            stop_score = metrics["brief"]["mAP"]
+            stop_score, stop_metric_name = get_stop_score(metrics, opt, "mAP")
             if stop_score > prev_best_score:
                 es_cnt = 0
                 prev_best_score = stop_score
@@ -328,7 +339,7 @@ def train_hl(model, criterion, optimizer, lr_scheduler, train_dataset, val_datas
                 best_file_paths = [e.replace("latest", "best") for e in latest_file_paths]
                 for src, tgt in zip(latest_file_paths, best_file_paths):
                     os.renames(src, tgt)
-                logger.info("The checkpoint file has been updated.")
+                logger.info(f"The checkpoint file has been updated using {stop_metric_name}={stop_score:.4f}.")
             else:
                 es_cnt += 1
                 if opt.max_es_cnt != -1 and es_cnt > opt.max_es_cnt:  # early stop
@@ -391,6 +402,8 @@ if __name__ == '__main__':
         input_args = ["--resume", best_ckpt_path,
                       "--eval_split_name", eval_split_name,
                       "--eval_path", eval_path]
+        if opt.use_quality_ranking:
+            input_args += ["--use_quality_ranking", "--quality_score_beta", str(opt.quality_score_beta)]
 
         import sys
         sys.argv[1:] = input_args

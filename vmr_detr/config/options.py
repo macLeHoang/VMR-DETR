@@ -159,6 +159,15 @@ class BaseOptions(object):
                             help="1-based epoch to switch contrastive loss to contrastive_decay_coef. <=0 disables decay.")
         parser.add_argument("--contrastive_decay_coef", default=0.0, type=float,
                             help="contrastive_align_loss weight after contrastive_decay_epoch.")
+        parser.add_argument("--quality_loss_coef", default=0.0, type=float,
+                            help="weight for decoder-query IoU quality loss. 0 disables quality head/loss.")
+        parser.add_argument("--quality_start_epoch", default=0, type=int,
+                            help="1-based epoch to start quality loss. 0 enables it from the beginning.")
+        parser.add_argument("--quality_loss_type", default="bce", choices=["bce", "smooth_l1"],
+                            help="Loss used for quality prediction targets in [0, 1].")
+        parser.add_argument("--quality_target_mode", default="matched", choices=["matched", "full"],
+                            help="Target assignment for quality loss: matched uses Hungarian-matched queries only; "
+                                 "full uses max IoU over all GT spans for every query.")
         # * Matcher
         parser.add_argument('--set_cost_span', default=10, type=float,
                             help="L1 span coefficient in the matching cost")
@@ -174,9 +183,15 @@ class BaseOptions(object):
         parser.add_argument('--eos_coef', default=0.1, type=float,
                             help="Relative classification weight of the no-object class")
         parser.add_argument("--contrastive_align_loss_coef", default=0.0, type=float)
+        parser.add_argument("--best_metric", default="MR-full-mAP",
+                            help="metric key from validation brief metrics used for best checkpoint/early stopping.")
 
         parser.add_argument("--no_sort_results", action="store_true",
                             help="do not sort results, use this for moment query visualization")
+        parser.add_argument("--use_quality_ranking", action="store_true",
+                            help="Rank inference windows by foreground probability and predicted quality.")
+        parser.add_argument("--quality_score_beta", default=1.0, type=float,
+                            help="Exponent applied to sigmoid(pred_quality) when --use_quality_ranking is enabled.")
         parser.add_argument("--max_before_nms", type=int, default=10)
         parser.add_argument("--max_after_nms", type=int, default=10)
         parser.add_argument("--conf_thd", type=float, default=0.0, help="only keep windows with conf >= conf_thd")
@@ -215,7 +230,8 @@ class BaseOptions(object):
             for arg in saved_options:  # use saved options to overwrite all BaseOptions args.
                 if arg not in ["results_root", "num_workers", "nms_thd", "debug",  # "max_before_nms", "max_after_nms"
                                "max_pred_l", "min_pred_l",
-                               "resume", "resume_all", "no_sort_results"]:
+                               "resume", "resume_all", "no_sort_results",
+                               "use_quality_ranking", "quality_score_beta"]:
                     setattr(opt, arg, saved_options[arg])
             # opt.no_core_driver = True
             if opt.eval_results_dir is not None:

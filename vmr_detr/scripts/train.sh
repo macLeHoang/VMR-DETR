@@ -3,7 +3,7 @@ ctx_mode=video_tef
 v_feat_types=slowfast_clip
 t_feat_types=clip
 results_root=results
-exp_id=exp_nepoch_100_slowfast_clip_late_gated_clip_scale03_multiscale_contrastive_decay
+exp_id=exp_nepoch_100_slowfast_clip_late_gated_clip_scale03_multiscale_contrastive_quality_fulltarget_smoothl1_coef01_start25_r1
 
 ######## data paths
 train_path=/content/drive/MyDrive/Master/Thesis/QD-DETR-Old/data/charades-sta/train.jsonl
@@ -48,12 +48,17 @@ n_epoch=100
 clip_length=1
 contrastive_align_loss_coef=0.3
 contrastive_start_epoch=10
-contrastive_decay_epoch=35
+contrastive_decay_epoch=40
 contrastive_decay_coef=0.1
+quality_loss_coef=0.1
+quality_start_epoch=25
+quality_loss_type=smooth_l1
+quality_target_mode=full
+best_metric=MR-full-R1@0.5
 dec_layers=3
 enc_layers=3
 lr=1.5e-04
-lr_drop=40
+lr_drop=100
 v_feat_len_mode=min
 num_workers=2
 
@@ -81,6 +86,11 @@ PYTHONPATH=$PYTHONPATH:. python vmr_detr/cli/train.py \
 --contrastive_start_epoch ${contrastive_start_epoch} \
 --contrastive_decay_epoch ${contrastive_decay_epoch} \
 --contrastive_decay_coef ${contrastive_decay_coef} \
+--quality_loss_coef ${quality_loss_coef} \
+--quality_start_epoch ${quality_start_epoch} \
+--quality_loss_type ${quality_loss_type} \
+--quality_target_mode ${quality_target_mode} \
+--best_metric ${best_metric} \
 --dec_layers ${dec_layers} \
 --enc_layers ${enc_layers} \
 --clip_length ${clip_length} \

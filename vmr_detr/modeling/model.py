@@ -112,7 +112,8 @@ class VMRDETR(nn.Module):
                  max_v_l=75, span_loss_type="l1", use_txt_pos=False, n_input_proj=2, aud_dim=0,
                  use_gated_video_fusion=False, use_late_gated_video_fusion=False,
                  slowfast_dim=2304, clip_dim=512, tef_dim=2, dropout=0.1, dim_feedforward=None,
-                 use_multiscale_stream_adapter=False, multiscale_adapter_dropout=0.1):
+                 use_multiscale_stream_adapter=False, multiscale_adapter_dropout=0.1,
+                 use_quality_head=False):
         """ Initializes the model.
         Parameters:
             transformer: torch module of the transformer architecture. See transformer.py
@@ -143,6 +144,9 @@ class VMRDETR(nn.Module):
         span_pred_dim = 2 if span_loss_type == "l1" else max_v_l * 2
         self.span_embed = MLP(hidden_dim, hidden_dim, span_pred_dim, 3)
         self.class_embed = nn.Linear(hidden_dim, 2)  # 0: background, 1: foreground
+        self.use_quality_head = use_quality_head
+        if self.use_quality_head:
+            self.quality_embed = MLP(hidden_dim, hidden_dim, 1, 3)
         self.use_txt_pos = use_txt_pos
         self.n_input_proj = n_input_proj
         # self.foreground_thd = foreground_thd
@@ -350,6 +354,8 @@ class VMRDETR(nn.Module):
         if self.span_loss_type == "l1":
             outputs_coord = outputs_coord.sigmoid()
         out = {'pred_logits': outputs_class[-1], 'pred_spans': outputs_coord[-1]}
+        if self.use_quality_head:
+            out["pred_quality"] = self.quality_embed(hs[-1]).squeeze(-1)
 
         if self.contrastive_align_loss:
             proj_queries = F.normalize(self.contrastive_align_projection_query(hs), p=2, dim=-1)
@@ -404,7 +410,8 @@ class SetCriterion(nn.Module):
 
     def __init__(self, matcher, weight_dict, eos_coef, losses, temperature, span_loss_type, max_v_l,
                  saliency_margin=1, use_matcher=True, contrastive_start_epoch=0,
-                 contrastive_decay_epoch=-1, contrastive_decay_coef=0.0):
+                 contrastive_decay_epoch=-1, contrastive_decay_coef=0.0,
+                 quality_start_epoch=0, quality_loss_type="bce", quality_target_mode="matched"):
         """ Create the criterion.
         Parameters:
             matcher: module able to compute a matching between targets and proposals
@@ -439,12 +446,19 @@ class SetCriterion(nn.Module):
         self.contrastive_decay_epoch = contrastive_decay_epoch
         self.contrastive_decay_coef = contrastive_decay_coef
         self.contrastive_base_coef = self.weight_dict.get("loss_contrastive_align", 0.0)
+        self.quality_start_epoch = quality_start_epoch
+        self.quality_loss_type = quality_loss_type
+        assert quality_target_mode in ("matched", "full")
+        self.quality_target_mode = quality_target_mode
+        self.quality_base_coef = self.weight_dict.get("loss_quality", 0.0)
         self.current_epoch = 0
         self._update_contrastive_weight()
+        self._update_quality_weight()
 
     def set_epoch(self, epoch):
         self.current_epoch = int(epoch)
         self._update_contrastive_weight()
+        self._update_quality_weight()
 
     def _update_contrastive_weight(self):
         if "loss_contrastive_align" not in self.weight_dict:
@@ -456,6 +470,37 @@ class SetCriterion(nn.Module):
         else:
             coef = self.contrastive_base_coef
         self.weight_dict["loss_contrastive_align"] = coef
+
+    def _update_quality_weight(self):
+        if "loss_quality" not in self.weight_dict:
+            return
+        if self.current_epoch < self.quality_start_epoch:
+            coef = 0.0
+        else:
+            coef = self.quality_base_coef
+        self.weight_dict["loss_quality"] = coef
+
+    @staticmethod
+    def _span_iou(src_spans, tgt_spans):
+        src_xx = span_cxw_to_xx(src_spans)
+        tgt_xx = span_cxw_to_xx(tgt_spans)
+        inter = (torch.min(src_xx[:, 1], tgt_xx[:, 1]) -
+                 torch.max(src_xx[:, 0], tgt_xx[:, 0])).clamp(min=0)
+        src_len = (src_xx[:, 1] - src_xx[:, 0]).clamp(min=0)
+        tgt_len = (tgt_xx[:, 1] - tgt_xx[:, 0]).clamp(min=0)
+        union = (src_len + tgt_len - inter).clamp(min=1e-6)
+        return inter / union
+
+    @staticmethod
+    def _span_iou_pairwise(src_spans, tgt_spans):
+        src_xx = span_cxw_to_xx(src_spans)[:, None, :]
+        tgt_xx = span_cxw_to_xx(tgt_spans)[None, :, :]
+        inter = (torch.min(src_xx[..., 1], tgt_xx[..., 1]) -
+                 torch.max(src_xx[..., 0], tgt_xx[..., 0])).clamp(min=0)
+        src_len = (src_xx[..., 1] - src_xx[..., 0]).clamp(min=0)
+        tgt_len = (tgt_xx[..., 1] - tgt_xx[..., 0]).clamp(min=0)
+        union = (src_len + tgt_len - inter).clamp(min=1e-6)
+        return inter / union
 
     def loss_spans(self, outputs, targets, indices):
         """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
@@ -509,6 +554,46 @@ class SetCriterion(nn.Module):
             # TODO this should probably be a separate loss, not hacked in this one here
             losses['class_error'] = 100 - accuracy(src_logits[idx], self.foreground_label)[0]
         return losses
+
+    def loss_quality(self, outputs, targets, indices, log=True):
+        """Supervise query quality logits with predicted-span IoU targets."""
+        if self.weight_dict.get("loss_quality", 0.0) == 0:
+            return {"loss_quality": outputs["pred_logits"].new_zeros(())}
+        if "pred_quality" not in outputs:
+            return {"loss_quality": outputs["pred_logits"].new_zeros(())}
+        if self.span_loss_type != "l1":
+            return {"loss_quality": outputs["pred_quality"].new_zeros(())}
+
+        quality_logits = outputs["pred_quality"]
+        quality_targets = torch.zeros_like(quality_logits)
+
+        span_targets = targets["span_labels"]
+        if self.quality_target_mode == "full":
+            pred_spans = outputs["pred_spans"].detach()
+            for batch_idx, target in enumerate(span_targets):
+                tgt_spans = target["spans"]
+                if tgt_spans.numel() == 0:
+                    continue
+                pairwise_iou = self._span_iou_pairwise(pred_spans[batch_idx], tgt_spans)
+                quality_targets[batch_idx] = pairwise_iou.max(dim=1).values.detach()
+        else:
+            idx = self._get_src_permutation_idx(indices)
+            if len(idx[0]) > 0:
+                src_spans = outputs["pred_spans"][idx].detach()
+                tgt_spans = torch.cat(
+                    [t["spans"][i] for t, (_, i) in zip(span_targets, indices)], dim=0
+                )
+                quality_targets[idx] = self._span_iou(src_spans, tgt_spans).detach()
+
+        if self.quality_loss_type == "smooth_l1":
+            loss_quality = F.smooth_l1_loss(
+                torch.sigmoid(quality_logits), quality_targets, reduction="mean"
+            )
+        else:
+            loss_quality = F.binary_cross_entropy_with_logits(
+                quality_logits, quality_targets, reduction="mean"
+            )
+        return {"loss_quality": loss_quality}
 
     def loss_saliency(self, outputs, targets, indices, log=True):
         """higher scores for positive clips"""
@@ -651,6 +736,7 @@ class SetCriterion(nn.Module):
         loss_map = {
             "spans": self.loss_spans,
             "labels": self.loss_labels,
+            "quality": self.loss_quality,
             "contrastive_align": self.loss_contrastive_align,
             "saliency": self.loss_saliency,
         }
@@ -695,7 +781,7 @@ class SetCriterion(nn.Module):
                     losses_target = ["saliency"]    
                 # for loss in self.losses:
                 for loss in losses_target:
-                    if loss in ("saliency", "contrastive_align"):  # final layer only
+                    if loss in ("saliency", "contrastive_align", "quality"):  # final layer only
                         continue
                     kwargs = {}
                     l_dict = self.get_loss(loss, aux_outputs, targets, indices, **kwargs)
@@ -757,6 +843,7 @@ def build_model(args):
 
     transformer = build_transformer(args)
     position_embedding, txt_position_embedding = build_position_encoding(args)
+    use_quality_head = getattr(args, "quality_loss_coef", 0.0) > 0
 
     if args.a_feat_dir is None:
         model = VMRDETR(
@@ -783,6 +870,7 @@ def build_model(args):
             dim_feedforward=args.dim_feedforward,
             use_multiscale_stream_adapter=args.use_multiscale_stream_adapter,
             multiscale_adapter_dropout=args.multiscale_adapter_dropout,
+            use_quality_head=use_quality_head,
         )
     else:
         model = VMRDETR(
@@ -810,6 +898,7 @@ def build_model(args):
             dim_feedforward=args.dim_feedforward,
             use_multiscale_stream_adapter=args.use_multiscale_stream_adapter,
             multiscale_adapter_dropout=args.multiscale_adapter_dropout,
+            use_quality_head=use_quality_head,
         )
 
     matcher = build_matcher(args)
@@ -819,17 +908,21 @@ def build_model(args):
                    "loss_saliency": args.lw_saliency}
     if args.contrastive_align_loss:
         weight_dict["loss_contrastive_align"] = args.contrastive_align_loss_coef
+    if args.quality_loss_coef > 0:
+        weight_dict["loss_quality"] = args.quality_loss_coef
     # TODO this is a hack
     if args.aux_loss:
         aux_weight_dict = {}
         for i in range(args.dec_layers - 1):
             aux_weight_dict.update(
                 {k + f'_{i}': v for k, v in weight_dict.items()
-                 if k not in ("loss_saliency", "loss_contrastive_align")}
+                 if k not in ("loss_saliency", "loss_contrastive_align", "loss_quality")}
             )
         weight_dict.update(aux_weight_dict)
 
     losses = ['spans', 'labels', 'saliency']
+    if args.quality_loss_coef > 0:
+        losses += ["quality"]
     if args.contrastive_align_loss:
         losses += ["contrastive_align"]
         
@@ -844,6 +937,9 @@ def build_model(args):
         contrastive_start_epoch=args.contrastive_start_epoch,
         contrastive_decay_epoch=args.contrastive_decay_epoch,
         contrastive_decay_coef=args.contrastive_decay_coef,
+        quality_start_epoch=args.quality_start_epoch,
+        quality_loss_type=args.quality_loss_type,
+        quality_target_mode=args.quality_target_mode,
     )
     criterion.to(device)
     return model, criterion

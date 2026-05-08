@@ -187,6 +187,7 @@ def compute_mr_results(model, eval_loader, opt, epoch_i=None, criterion=None, tb
     write_tb = tb_writer is not None and epoch_i is not None
 
     mr_res = []
+    warned_missing_quality = False
     for batch in tqdm(eval_loader, desc="compute st ed scores"):
         query_meta = batch[0]
         if opt.a_feat_dir is None:
@@ -197,6 +198,16 @@ def compute_mr_results(model, eval_loader, opt, epoch_i=None, criterion=None, tb
         prob = F.softmax(outputs["pred_logits"], -1)  # (batch_size, #queries, #classes=2)
         if opt.span_loss_type == "l1":
             scores = prob[..., 0]  # * (batch_size, #queries)  foreground label is 0, we directly take it
+            if opt.use_quality_ranking:
+                if "pred_quality" in outputs:
+                    quality_scores = torch.sigmoid(outputs["pred_quality"])
+                    scores = scores * quality_scores.pow(opt.quality_score_beta)
+                elif not warned_missing_quality:
+                    logger.warning(
+                        "--use_quality_ranking was set, but this model does not output pred_quality; "
+                        "falling back to foreground-probability ranking."
+                    )
+                    warned_missing_quality = True
             pred_spans = outputs["pred_spans"]  # (bsz, #queries, 2)
             _saliency_scores = outputs["saliency_scores"].half()  # (bsz, L)
             saliency_scores = []
@@ -357,10 +368,19 @@ def setup_model(opt):
         # PyTorch >= 2.6 defaults to weights_only=True, but our checkpoint also stores
         # non-tensor metadata (e.g., argparse Namespace in "opt"), so force full load.
         checkpoint = torch.load(opt.resume, map_location="cpu", weights_only=False)
-        if opt.resume_all and "model_raw" in checkpoint:
-            model.load_state_dict(checkpoint["model_raw"])
-        else:
-            model.load_state_dict(checkpoint["model"])
+        state_dict = checkpoint["model_raw"] if opt.resume_all and "model_raw" in checkpoint else checkpoint["model"]
+        try:
+            model.load_state_dict(state_dict)
+        except RuntimeError:
+            incompatible = model.load_state_dict(state_dict, strict=False)
+            allowed_missing = all(k.startswith("quality_embed.") for k in incompatible.missing_keys)
+            allowed_unexpected = all(k.startswith("quality_embed.") for k in incompatible.unexpected_keys)
+            if not (allowed_missing and allowed_unexpected):
+                raise
+            logger.warning(
+                "Loaded checkpoint with quality-head key differences "
+                f"(missing={incompatible.missing_keys}, unexpected={incompatible.unexpected_keys})."
+            )
         if "ema_state" in checkpoint:
             setattr(opt, "_ema_state_dict", checkpoint["ema_state"])
         if opt.resume_all:
