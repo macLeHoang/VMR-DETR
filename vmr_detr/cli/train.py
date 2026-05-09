@@ -32,6 +32,10 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s",
                     level=logging.INFO)
 
+COMPOSITE_BEST_METRICS = {
+    "MR-full-R1@0.5+0.7": ("MR-full-R1@0.5", "MR-full-R1@0.7"),
+}
+
 
 def train_epoch(model, criterion, train_loader, optimizer, opt, epoch_i, ema=None):
     logger.info(f"[Epoch {epoch_i+1}]")
@@ -103,6 +107,16 @@ def train_epoch(model, criterion, train_loader, optimizer, opt, epoch_i, ema=Non
 def get_stop_score(metrics, opt, fallback_metric):
     brief = metrics["brief"]
     metric_name = opt.best_metric
+    if metric_name in COMPOSITE_BEST_METRICS:
+        required_metrics = COMPOSITE_BEST_METRICS[metric_name]
+        missing = [name for name in required_metrics if name not in brief]
+        if missing:
+            available = ", ".join(brief.keys())
+            raise KeyError(
+                f"best metric '{metric_name}' requires {', '.join(required_metrics)}; "
+                f"missing {', '.join(missing)}. Available metrics: {available}"
+            )
+        return sum(brief[name] for name in required_metrics), metric_name
     if metric_name not in brief and metric_name == "MR-full-mAP" and fallback_metric in brief:
         metric_name = fallback_metric
     if metric_name not in brief:

@@ -168,6 +168,18 @@ class BaseOptions(object):
         parser.add_argument("--quality_target_mode", default="matched", choices=["matched", "full"],
                             help="Target assignment for quality loss: matched uses Hungarian-matched queries only; "
                                  "full uses max IoU over all GT spans for every query.")
+        parser.add_argument("--ranking_loss_coef", default=0.0, type=float,
+                            help="weight for pairwise decoder-query ranking loss. 0 disables ranking loss.")
+        parser.add_argument("--ranking_start_epoch", default=0, type=int,
+                            help="1-based epoch to start ranking loss. 0 enables it from the beginning.")
+        parser.add_argument("--ranking_pos_iou", default=0.7, type=float,
+                            help="IoU threshold for positive queries in pairwise ranking loss.")
+        parser.add_argument("--ranking_neg_iou", default=0.5, type=float,
+                            help="IoU threshold below which queries are negatives in pairwise ranking loss.")
+        parser.add_argument("--ranking_margin", default=0.2, type=float,
+                            help="margin for pairwise ranking loss.")
+        parser.add_argument("--ranking_score_beta", default=0.5, type=float,
+                            help="quality-logit weight used in the ranking loss score.")
         # * Matcher
         parser.add_argument('--set_cost_span', default=10, type=float,
                             help="L1 span coefficient in the matching cost")
@@ -184,7 +196,8 @@ class BaseOptions(object):
                             help="Relative classification weight of the no-object class")
         parser.add_argument("--contrastive_align_loss_coef", default=0.0, type=float)
         parser.add_argument("--best_metric", default="MR-full-mAP",
-                            help="metric key from validation brief metrics used for best checkpoint/early stopping.")
+                            help="metric key from validation brief metrics used for best checkpoint/early stopping. "
+                                 "Also supports MR-full-R1@0.5+0.7.")
 
         parser.add_argument("--no_sort_results", action="store_true",
                             help="do not sort results, use this for moment query visualization")

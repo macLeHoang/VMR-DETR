@@ -3,7 +3,7 @@ ctx_mode=video_tef
 v_feat_types=slowfast_clip
 t_feat_types=clip
 results_root=results
-exp_id=exp_nepoch_100_slowfast_clip_late_gated_clip_scale03_multiscale_contrastive_quality_fulltarget_smoothl1_coef01_start25_r1
+exp_id=exp_nepoch_100_slowfast_clip_late_gated_clip_scale03_multiscale_contrastive_quality_fulltarget_smoothl1_rank07_logit_r1
 
 ######## data paths
 train_path=/content/drive/MyDrive/Master/Thesis/QD-DETR-Old/data/charades-sta/train.jsonl
@@ -54,7 +54,13 @@ quality_loss_coef=0.1
 quality_start_epoch=25
 quality_loss_type=smooth_l1
 quality_target_mode=full
-best_metric=MR-full-R1@0.5
+ranking_loss_coef=0.05
+ranking_start_epoch=25
+ranking_pos_iou=0.7
+ranking_neg_iou=0.5
+ranking_margin=1.0
+ranking_score_beta=0.0
+best_metric=MR-full-R1@0.5+0.7
 dec_layers=3
 enc_layers=3
 lr=1.5e-04
@@ -90,6 +96,12 @@ PYTHONPATH=$PYTHONPATH:. python vmr_detr/cli/train.py \
 --quality_start_epoch ${quality_start_epoch} \
 --quality_loss_type ${quality_loss_type} \
 --quality_target_mode ${quality_target_mode} \
+--ranking_loss_coef ${ranking_loss_coef} \
+--ranking_start_epoch ${ranking_start_epoch} \
+--ranking_pos_iou ${ranking_pos_iou} \
+--ranking_neg_iou ${ranking_neg_iou} \
+--ranking_margin ${ranking_margin} \
+--ranking_score_beta ${ranking_score_beta} \
 --best_metric ${best_metric} \
 --dec_layers ${dec_layers} \
 --enc_layers ${enc_layers} \

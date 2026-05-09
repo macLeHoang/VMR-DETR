@@ -411,7 +411,9 @@ class SetCriterion(nn.Module):
     def __init__(self, matcher, weight_dict, eos_coef, losses, temperature, span_loss_type, max_v_l,
                  saliency_margin=1, use_matcher=True, contrastive_start_epoch=0,
                  contrastive_decay_epoch=-1, contrastive_decay_coef=0.0,
-                 quality_start_epoch=0, quality_loss_type="bce", quality_target_mode="matched"):
+                 quality_start_epoch=0, quality_loss_type="bce", quality_target_mode="matched",
+                 ranking_start_epoch=0, ranking_pos_iou=0.7, ranking_neg_iou=0.5,
+                 ranking_margin=0.2, ranking_score_beta=0.5):
         """ Create the criterion.
         Parameters:
             matcher: module able to compute a matching between targets and proposals
@@ -451,14 +453,23 @@ class SetCriterion(nn.Module):
         assert quality_target_mode in ("matched", "full")
         self.quality_target_mode = quality_target_mode
         self.quality_base_coef = self.weight_dict.get("loss_quality", 0.0)
+        assert 0 <= ranking_neg_iou < ranking_pos_iou <= 1
+        self.ranking_start_epoch = ranking_start_epoch
+        self.ranking_pos_iou = ranking_pos_iou
+        self.ranking_neg_iou = ranking_neg_iou
+        self.ranking_margin = ranking_margin
+        self.ranking_score_beta = ranking_score_beta
+        self.ranking_base_coef = self.weight_dict.get("loss_ranking", 0.0)
         self.current_epoch = 0
         self._update_contrastive_weight()
         self._update_quality_weight()
+        self._update_ranking_weight()
 
     def set_epoch(self, epoch):
         self.current_epoch = int(epoch)
         self._update_contrastive_weight()
         self._update_quality_weight()
+        self._update_ranking_weight()
 
     def _update_contrastive_weight(self):
         if "loss_contrastive_align" not in self.weight_dict:
@@ -479,6 +490,15 @@ class SetCriterion(nn.Module):
         else:
             coef = self.quality_base_coef
         self.weight_dict["loss_quality"] = coef
+
+    def _update_ranking_weight(self):
+        if "loss_ranking" not in self.weight_dict:
+            return
+        if self.current_epoch < self.ranking_start_epoch:
+            coef = 0.0
+        else:
+            coef = self.ranking_base_coef
+        self.weight_dict["loss_ranking"] = coef
 
     @staticmethod
     def _span_iou(src_spans, tgt_spans):
@@ -594,6 +614,45 @@ class SetCriterion(nn.Module):
                 quality_logits, quality_targets, reduction="mean"
             )
         return {"loss_quality": loss_quality}
+
+    def loss_ranking(self, outputs, targets, indices, log=True):
+        """Rank high-IoU decoder queries above low-IoU queries."""
+        zero = outputs["pred_logits"].new_zeros(())
+        if self.weight_dict.get("loss_ranking", 0.0) == 0:
+            return {"loss_ranking": zero}
+        if self.span_loss_type != "l1" or "pred_spans" not in outputs:
+            return {"loss_ranking": zero}
+
+        foreground_logits = outputs["pred_logits"][..., self.foreground_label]
+        if "pred_quality" in outputs:
+            rank_scores = foreground_logits + self.ranking_score_beta * outputs["pred_quality"]
+        else:
+            rank_scores = foreground_logits
+
+        loss_terms = []
+        pred_spans = outputs["pred_spans"].detach()
+        for batch_idx, target in enumerate(targets["span_labels"]):
+            tgt_spans = target["spans"]
+            if tgt_spans.numel() == 0:
+                continue
+            query_ious = self._span_iou_pairwise(pred_spans[batch_idx], tgt_spans).max(dim=1).values.detach()
+            pos_mask = query_ious >= self.ranking_pos_iou
+            neg_mask = query_ious < self.ranking_neg_iou
+            if not torch.any(pos_mask) or not torch.any(neg_mask):
+                continue
+
+            pos_scores = rank_scores[batch_idx][pos_mask]
+            neg_scores = rank_scores[batch_idx][neg_mask]
+            pos_ious = query_ious[pos_mask]
+            neg_ious = query_ious[neg_mask]
+
+            pair_losses = F.relu(self.ranking_margin - pos_scores[:, None] + neg_scores[None, :])
+            pair_weights = (pos_ious[:, None] - neg_ious[None, :]).clamp(min=0).detach()
+            loss_terms.append((pair_losses * pair_weights).sum() / pair_weights.sum().clamp(min=1e-6))
+
+        if not loss_terms:
+            return {"loss_ranking": zero}
+        return {"loss_ranking": torch.stack(loss_terms).mean()}
 
     def loss_saliency(self, outputs, targets, indices, log=True):
         """higher scores for positive clips"""
@@ -737,6 +796,7 @@ class SetCriterion(nn.Module):
             "spans": self.loss_spans,
             "labels": self.loss_labels,
             "quality": self.loss_quality,
+            "ranking": self.loss_ranking,
             "contrastive_align": self.loss_contrastive_align,
             "saliency": self.loss_saliency,
         }
@@ -781,7 +841,7 @@ class SetCriterion(nn.Module):
                     losses_target = ["saliency"]    
                 # for loss in self.losses:
                 for loss in losses_target:
-                    if loss in ("saliency", "contrastive_align", "quality"):  # final layer only
+                    if loss in ("saliency", "contrastive_align", "quality", "ranking"):  # final layer only
                         continue
                     kwargs = {}
                     l_dict = self.get_loss(loss, aux_outputs, targets, indices, **kwargs)
@@ -910,19 +970,23 @@ def build_model(args):
         weight_dict["loss_contrastive_align"] = args.contrastive_align_loss_coef
     if args.quality_loss_coef > 0:
         weight_dict["loss_quality"] = args.quality_loss_coef
+    if args.ranking_loss_coef > 0:
+        weight_dict["loss_ranking"] = args.ranking_loss_coef
     # TODO this is a hack
     if args.aux_loss:
         aux_weight_dict = {}
         for i in range(args.dec_layers - 1):
             aux_weight_dict.update(
                 {k + f'_{i}': v for k, v in weight_dict.items()
-                 if k not in ("loss_saliency", "loss_contrastive_align", "loss_quality")}
+                 if k not in ("loss_saliency", "loss_contrastive_align", "loss_quality", "loss_ranking")}
             )
         weight_dict.update(aux_weight_dict)
 
     losses = ['spans', 'labels', 'saliency']
     if args.quality_loss_coef > 0:
         losses += ["quality"]
+    if args.ranking_loss_coef > 0:
+        losses += ["ranking"]
     if args.contrastive_align_loss:
         losses += ["contrastive_align"]
         
@@ -940,6 +1004,11 @@ def build_model(args):
         quality_start_epoch=args.quality_start_epoch,
         quality_loss_type=args.quality_loss_type,
         quality_target_mode=args.quality_target_mode,
+        ranking_start_epoch=args.ranking_start_epoch,
+        ranking_pos_iou=args.ranking_pos_iou,
+        ranking_neg_iou=args.ranking_neg_iou,
+        ranking_margin=args.ranking_margin,
+        ranking_score_beta=args.ranking_score_beta,
     )
     criterion.to(device)
     return model, criterion
