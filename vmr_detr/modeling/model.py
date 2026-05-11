@@ -6,9 +6,9 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from vmr_detr.ops.span_utils import generalized_temporal_iou, span_cxw_to_xx, span_xx_to_cxw
+from vmr_detr.ops.span_utils import generalized_temporal_iou, span_cxw_to_xx, span_xx_to_cxw, temporal_iou
 
-from vmr_detr.modeling.matcher import build_matcher, build_one_to_many_matcher
+from vmr_detr.modeling.matcher import build_matcher, build_hungarian_matcher, build_one_to_many_matcher
 from vmr_detr.modeling.transformer import build_transformer
 from vmr_detr.modeling.position_encoding import build_position_encoding
 from vmr_detr.ops.misc import accuracy
@@ -183,7 +183,7 @@ class VMRDETR(nn.Module):
         else:
             span_pred_dim = max_v_l * 2
         self.span_embed = MLP(hidden_dim, hidden_dim, span_pred_dim, 3)
-        self.class_embed = nn.Linear(hidden_dim, 2)  # 0: background, 1: foreground
+        self.class_embed = nn.Linear(hidden_dim, 2)  # 0: foreground, 1: background
         self.use_txt_pos = use_txt_pos
         self.n_input_proj = n_input_proj
         # self.foreground_thd = foreground_thd
@@ -464,7 +464,8 @@ class SetCriterion(nn.Module):
                  dfl_num_bins=16,
                  saliency_margin=1, use_matcher=True, contrastive_start_epoch=0,
                  contrastive_decay_epoch=-1, contrastive_decay_coef=0.0,
-                 aux_matcher=None, aux_matching_type="hungarian"):
+                 aux_matcher=None, aux_matching_type="hungarian",
+                 matching_type="hungarian", tal_alpha=1.0, tal_beta=6.0):
         """ Create the criterion.
         Parameters:
             matcher: module able to compute a matching between targets and proposals
@@ -480,13 +481,21 @@ class SetCriterion(nn.Module):
         super().__init__()
         self.matcher = matcher
         assert aux_matching_type in ("hungarian", "one_to_many")
+        assert matching_type in ("hungarian", "tal")
         self.aux_matching_type = aux_matching_type
-        self.aux_matcher = matcher if aux_matching_type == "hungarian" else (aux_matcher or matcher)
+        self.aux_matcher = aux_matcher or matcher
+        self.matching_type = matching_type
         self.weight_dict = weight_dict
         self.losses = losses
         self.temperature = temperature
         self.span_loss_type = span_loss_type
         self.max_v_l = max_v_l
+        if self.matching_type == "tal" and self.span_loss_type not in ("l1", "dfl"):
+            raise ValueError("TAL matching requires span_loss_type to be 'l1' or 'dfl'.")
+        if tal_alpha < 0 or tal_beta < 0:
+            raise ValueError("tal_alpha and tal_beta must be non-negative.")
+        self.tal_alpha = tal_alpha
+        self.tal_beta = tal_beta
         if dfl_num_bins < 2:
             raise ValueError("dfl_num_bins must be >= 2.")
         self.dfl_num_bins = dfl_num_bins
@@ -589,12 +598,62 @@ class SetCriterion(nn.Module):
         losses['loss_giou'] = loss_giou.mean()
         return losses
 
-    def loss_labels(self, outputs, targets, indices, log=True):
+    def _tal_quality_targets(self, outputs, targets, indices):
+        src_logits = outputs['pred_logits']
+        target_quality = src_logits.new_zeros(src_logits.shape[:2])
+        targets = targets["span_labels"]
+        pred_scores = src_logits.softmax(-1)[..., self.foreground_label]
+        pred_spans_xx = span_cxw_to_xx(outputs["pred_spans"])
+
+        with torch.no_grad():
+            for batch_idx, (src_idx, tgt_idx) in enumerate(indices):
+                if len(src_idx) == 0:
+                    continue
+                src_idx = src_idx.to(src_logits.device)
+                tgt_idx = tgt_idx.to(src_logits.device)
+                tgt_spans = targets[batch_idx]["spans"]
+                tgt_spans_xx = span_cxw_to_xx(tgt_spans)
+                ious = temporal_iou(pred_spans_xx[batch_idx], tgt_spans_xx)[0].clamp(min=0)
+                alignment = pred_scores[batch_idx].unsqueeze(1).pow(self.tal_alpha) * ious.pow(self.tal_beta)
+
+                for tgt in tgt_idx.unique(sorted=True):
+                    pos_mask = tgt_idx == tgt
+                    pos_src = src_idx[pos_mask]
+                    pos_alignment = alignment[pos_src, tgt]
+                    pos_iou = ious[pos_src, tgt]
+                    max_alignment = pos_alignment.max().clamp(min=1e-9)
+                    max_iou = pos_iou.max()
+                    quality = (pos_alignment / max_alignment * max_iou).clamp(0, 1)
+                    target_quality[batch_idx, pos_src] = quality
+
+        return target_quality
+
+    def _loss_labels_tal(self, outputs, targets, indices, log=True):
+        src_logits = outputs['pred_logits']
+        target_quality = self._tal_quality_targets(outputs, targets, indices)
+        fg_logits = src_logits[..., self.foreground_label] - src_logits[..., self.background_label]
+        loss_bce = F.binary_cross_entropy_with_logits(fg_logits, target_quality, reduction="none")
+        loss_weight = torch.full_like(target_quality, self.eos_coef)
+        loss_weight = torch.where(target_quality > 0, torch.ones_like(loss_weight), loss_weight)
+        losses = {'loss_label': (loss_bce * loss_weight).mean()}
+
+        idx = self._get_src_permutation_idx(indices)
+        if log and len(idx[0]) > 0:
+            losses['class_error'] = 100 - accuracy(src_logits[idx], self.foreground_label)[0]
+        elif log:
+            losses['class_error'] = src_logits.new_tensor(100.)
+        return losses
+
+    def loss_labels(self, outputs, targets, indices, log=True, matching_type=None):
         """Classification loss (NLL)
         targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
         """
         # TODO add foreground and background classifier.  use all non-matched as background.
         assert 'pred_logits' in outputs
+        matching_type = self.matching_type if matching_type is None else matching_type
+        if matching_type == "tal":
+            return self._loss_labels_tal(outputs, targets, indices, log=log)
+
         src_logits = outputs['pred_logits']  # (batch_size, #queries, #classes=2)
         # idx is a tuple of two 1D tensors (batch_idx, src_idx), of the same length == #objects in batch
         idx = self._get_src_permutation_idx(indices)
@@ -806,6 +865,8 @@ class SetCriterion(nn.Module):
                     if loss in ("saliency", "contrastive_align"):  # final layer only
                         continue
                     kwargs = {}
+                    if loss == "labels":
+                        kwargs["matching_type"] = "hungarian"
                     l_dict = self.get_loss(loss, aux_outputs, targets, aux_indices, **kwargs)
                     l_dict = {k + f'_{i}': v for k, v in l_dict.items()}
                     losses.update(l_dict)
@@ -926,9 +987,10 @@ def build_model(args):
             multiscale_adapter_dropout=args.multiscale_adapter_dropout,
         )
 
+    matching_type = getattr(args, "matching_type", "hungarian")
     matcher = build_matcher(args)
     aux_matching_type = getattr(args, "aux_matching_type", "hungarian")
-    aux_matcher = build_one_to_many_matcher(args) if aux_matching_type == "one_to_many" else matcher
+    aux_matcher = build_one_to_many_matcher(args) if aux_matching_type == "one_to_many" else build_hungarian_matcher(args)
     weight_dict = {"loss_span": args.span_loss_coef,
                    "loss_giou": args.giou_loss_coef,
                    "loss_label": args.label_loss_coef,
@@ -963,6 +1025,9 @@ def build_model(args):
         contrastive_decay_coef=args.contrastive_decay_coef,
         aux_matcher=aux_matcher,
         aux_matching_type=aux_matching_type,
+        matching_type=matching_type,
+        tal_alpha=getattr(args, "tal_alpha", 1.0),
+        tal_beta=getattr(args, "tal_beta", 6.0),
     )
     criterion.to(device)
     return model, criterion

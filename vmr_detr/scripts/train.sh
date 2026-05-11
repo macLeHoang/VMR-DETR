@@ -3,7 +3,7 @@ ctx_mode=video_tef
 v_feat_types=slowfast_clip
 t_feat_types=clip
 results_root=results
-exp_id=exp_nepoch_100_slowfast_clip_late_gated_clip_scale03_multiscale_contrastive_dfl_one2one
+exp_id=exp_nepoch_100_slowfast_clip_late_gated_clip_scale03_multiscale_contrastive_dfl_tal
 
 ######## data paths
 train_path=/content/drive/MyDrive/Master/Thesis/QD-DETR-Old/data/charades-sta/train.jsonl
@@ -48,18 +48,24 @@ n_epoch=100
 clip_length=1
 span_loss_type=dfl
 dfl_num_bins=32
-dfl_ref_prior_sigma=3.0
+dfl_ref_prior_sigma=4.0
 span_loss_coef=1.0
 contrastive_align_loss_coef=0.3
 contrastive_start_epoch=10
 contrastive_decay_epoch=40
 contrastive_decay_coef=0.1
 aux_matching_type=hungarian
+matching_type=tal
+tal_topk=1
+tal_alpha=0.5
+tal_beta=6.0
 best_metric=MR-full-R1@0.5+0.7
 dec_layers=3
 enc_layers=3
-lr=1.5e-04
+lr=2e-04
 lr_drop=100
+lr_scheduler=linear
+lrf=0.01
 v_feat_len_mode=min
 num_workers=2
 
@@ -91,6 +97,10 @@ PYTHONPATH=$PYTHONPATH:. python vmr_detr/cli/train.py \
 --contrastive_start_epoch ${contrastive_start_epoch} \
 --contrastive_decay_epoch ${contrastive_decay_epoch} \
 --contrastive_decay_coef ${contrastive_decay_coef} \
+--matching_type ${matching_type} \
+--tal_topk ${tal_topk} \
+--tal_alpha ${tal_alpha} \
+--tal_beta ${tal_beta} \
 --aux_matching_type ${aux_matching_type} \
 --best_metric ${best_metric} \
 --dec_layers ${dec_layers} \
@@ -99,6 +109,8 @@ PYTHONPATH=$PYTHONPATH:. python vmr_detr/cli/train.py \
 --v_feat_len_mode ${v_feat_len_mode} \
 --lr ${lr} \
 --lr_drop ${lr_drop} \
+--lr_scheduler ${lr_scheduler} \
+--lrf ${lrf} \
 --exp_id ${exp_id} \
 --num_workers ${num_workers} \
 --eval_every_epoch_after ${eval_every_epoch_after} \

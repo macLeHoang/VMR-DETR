@@ -46,6 +46,10 @@ class BaseOptions(object):
         # training config
         parser.add_argument("--lr", type=float, default=1e-4, help="learning rate")
         parser.add_argument("--lr_drop", type=int, default=400, help="drop learning rate to 1/10 every lr_drop epochs")
+        parser.add_argument("--lr_scheduler", type=str, default="auto", choices=["auto", "step", "cosine", "linear"],
+                            help="LR scheduler. auto uses cosine when --cosine_T0 > 0, otherwise step.")
+        parser.add_argument("--lrf", type=float, default=None,
+                            help="Final LR ratio for cosine/linear LambdaLR. Defaults to --cosine_eta_min_ratio.")
         parser.add_argument("--warmup_epochs", type=int, default=0,
                             help="linear LR warmup epochs. 0 disables warmup")
         parser.add_argument("--cosine_T0", type=int, default=0,
@@ -171,6 +175,15 @@ class BaseOptions(object):
                             help="giou span coefficient in the matching cost")
         parser.add_argument('--set_cost_class', default=4, type=float,
                             help="Class coefficient in the matching cost")
+        parser.add_argument("--matching_type", default="hungarian",
+                            choices=["hungarian", "tal"],
+                            help="Matcher used for the final decoder layer.")
+        parser.add_argument("--tal_topk", default=2, type=int,
+                            help="Number of top task-aligned queries selected per target for --matching_type tal.")
+        parser.add_argument("--tal_alpha", default=1.0, type=float,
+                            help="Classification score exponent for task-aligned matching.")
+        parser.add_argument("--tal_beta", default=6.0, type=float,
+                            help="Temporal IoU exponent for task-aligned matching.")
         parser.add_argument("--aux_matching_type", default="hungarian",
                             choices=["hungarian", "one_to_many"],
                             help="Matcher used only for auxiliary decoder losses.")
@@ -238,11 +251,13 @@ class BaseOptions(object):
                 raise ValueError("--dfl_num_bins must be >= 2.")
             if opt.dfl_ref_prior_sigma <= 0:
                 raise ValueError("--dfl_ref_prior_sigma must be > 0.")
+            self._validate_tal_options(opt)
         else:
             if opt.dfl_num_bins < 2:
                 raise ValueError("--dfl_num_bins must be >= 2.")
             if opt.dfl_ref_prior_sigma <= 0:
                 raise ValueError("--dfl_ref_prior_sigma must be > 0.")
+            self._validate_tal_options(opt)
             if opt.exp_id is None:
                 raise ValueError("--exp_id is required for at a training option!")
 
@@ -282,6 +297,15 @@ class BaseOptions(object):
 
         self.opt = opt
         return opt
+
+    @staticmethod
+    def _validate_tal_options(opt):
+        if opt.tal_topk < 1:
+            raise ValueError("--tal_topk must be >= 1.")
+        if opt.tal_alpha < 0 or opt.tal_beta < 0:
+            raise ValueError("--tal_alpha and --tal_beta must be non-negative.")
+        if opt.matching_type == "tal" and opt.span_loss_type not in ("l1", "dfl"):
+            raise ValueError("--matching_type tal requires --span_loss_type l1 or dfl.")
 
 
 class TestOptions(BaseOptions):

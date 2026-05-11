@@ -3,10 +3,41 @@
 Modules to compute the matching cost and solve the corresponding LSAP.
 """
 import torch
-from scipy.optimize import linear_sum_assignment
 from torch import nn
 import torch.nn.functional as F
-from vmr_detr.ops.span_utils import generalized_temporal_iou, span_cxw_to_xx
+from vmr_detr.ops.span_utils import generalized_temporal_iou, span_cxw_to_xx, temporal_iou
+
+try:
+    from scipy.optimize import linear_sum_assignment
+except ImportError:
+    from itertools import permutations
+
+    def linear_sum_assignment(cost_matrix):
+        """Small fallback for environments without SciPy.
+
+        VMR-DETR defaults to 10 queries and <=5 GT windows, so exhaustive search is acceptable as a fallback.
+        """
+        cost = torch.as_tensor(cost_matrix)
+        num_rows, num_cols = cost.shape
+        if num_rows == 0 or num_cols == 0:
+            return [], []
+
+        if num_rows >= num_cols:
+            col_idx = tuple(range(num_cols))
+            best_rows, best_cost = None, None
+            for row_idx in permutations(range(num_rows), num_cols):
+                total = cost[list(row_idx), list(col_idx)].sum().item()
+                if best_cost is None or total < best_cost:
+                    best_rows, best_cost = row_idx, total
+            return list(best_rows), list(col_idx)
+
+        row_idx = tuple(range(num_rows))
+        best_cols, best_cost = None, None
+        for col_idx in permutations(range(num_cols), num_rows):
+            total = cost[list(row_idx), list(col_idx)].sum().item()
+            if best_cost is None or total < best_cost:
+                best_cols, best_cost = col_idx, total
+        return list(row_idx), list(best_cols)
 
 
 class HungarianMatcher(nn.Module):
@@ -168,11 +199,92 @@ class OneToManyMatcher(HungarianMatcher):
         return indices
 
 
-def build_matcher(args):
+class TaskAlignedMatcher(nn.Module):
+    """Select top-k queries for each target using TOOD-style task alignment."""
+
+    def __init__(self, span_loss_type: str = "l1", max_v_l: int = 75,
+                 topk: int = 2, alpha: float = 1.0, beta: float = 6.0):
+        super().__init__()
+        if span_loss_type not in ("l1", "dfl"):
+            raise ValueError("TaskAlignedMatcher requires span_loss_type to be 'l1' or 'dfl'.")
+        if topk < 1:
+            raise ValueError("topk must be >= 1 for task-aligned matching")
+        if alpha < 0 or beta < 0:
+            raise ValueError("alpha and beta must be non-negative for task-aligned matching")
+        self.span_loss_type = span_loss_type
+        self.max_v_l = max_v_l
+        self.topk = topk
+        self.alpha = alpha
+        self.beta = beta
+        self.foreground_label = 0
+
+    @torch.no_grad()
+    def forward(self, outputs, targets):
+        bs, num_queries = outputs["pred_spans"].shape[:2]
+        targets = targets["span_labels"]
+        empty = torch.empty(0, dtype=torch.int64)
+        indices = []
+
+        pred_scores = outputs["pred_logits"].softmax(-1)[..., self.foreground_label]
+        pred_spans_xx = span_cxw_to_xx(outputs["pred_spans"])
+
+        for batch_idx in range(bs):
+            tgt_spans = targets[batch_idx]["spans"]
+            if num_queries == 0 or len(tgt_spans) == 0:
+                indices.append((empty, empty))
+                continue
+
+            tgt_spans_xx = span_cxw_to_xx(tgt_spans)
+            ious = temporal_iou(pred_spans_xx[batch_idx], tgt_spans_xx)[0].clamp(min=0)
+            alignment = pred_scores[batch_idx].unsqueeze(1).pow(self.alpha) * ious.pow(self.beta)
+
+            k = min(self.topk, num_queries)
+            candidate_alignments, candidate_src = torch.topk(alignment, k=k, dim=0, largest=True)
+            candidate_tgt = torch.arange(
+                tgt_spans.shape[0], dtype=torch.int64, device=candidate_src.device
+            ).repeat(k)
+
+            best_by_src = {}
+            for src, tgt, match_score in zip(
+                    candidate_src.reshape(-1).tolist(),
+                    candidate_tgt.tolist(),
+                    candidate_alignments.reshape(-1).tolist()):
+                previous = best_by_src.get(src)
+                if previous is None or match_score > previous[0] or (
+                        match_score == previous[0] and tgt < previous[1]):
+                    best_by_src[src] = (match_score, tgt)
+
+            selected = sorted((src, tgt) for src, (_, tgt) in best_by_src.items())
+            src_idx = torch.as_tensor([src for src, _ in selected], dtype=torch.int64)
+            tgt_idx = torch.as_tensor([tgt for _, tgt in selected], dtype=torch.int64)
+            indices.append((src_idx, tgt_idx))
+
+        return indices
+
+
+def build_hungarian_matcher(args):
     return HungarianMatcher(
         cost_span=args.set_cost_span, cost_giou=args.set_cost_giou,
         cost_class=args.set_cost_class, span_loss_type=args.span_loss_type, max_v_l=args.max_v_l
     )
+
+
+def build_task_aligned_matcher(args):
+    return TaskAlignedMatcher(
+        span_loss_type=args.span_loss_type, max_v_l=args.max_v_l,
+        topk=getattr(args, "tal_topk", 2),
+        alpha=getattr(args, "tal_alpha", 1.0),
+        beta=getattr(args, "tal_beta", 6.0),
+    )
+
+
+def build_matcher(args):
+    matching_type = getattr(args, "matching_type", "hungarian")
+    if matching_type == "hungarian":
+        return build_hungarian_matcher(args)
+    if matching_type == "tal":
+        return build_task_aligned_matcher(args)
+    raise ValueError(f"Unsupported matching_type: {matching_type}")
 
 
 def build_one_to_many_matcher(args):

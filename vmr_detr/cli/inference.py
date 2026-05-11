@@ -29,6 +29,16 @@ logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s",
                     level=logging.INFO)
 
 
+def one_cycle(y1=0.0, y2=1.0, steps=100):
+    """Return a sinusoidal ramp lambda from y1 to y2."""
+    return lambda x: max((1 - math.cos(x * math.pi / steps)) / 2, 0) * (y2 - y1) + y1
+
+
+def linear_decay(lrf=0.01, steps=100):
+    """Return a linear decay lambda from 1.0 to lrf."""
+    return lambda x: max(1 - x / steps, 0) * (1.0 - lrf) + lrf
+
+
 def post_processing_mr_nms(mr_res, nms_thd, max_before_nms, max_after_nms):
     mr_res_after_nms = []
     for e in mr_res:
@@ -322,31 +332,26 @@ def setup_model(opt):
 
     param_dicts = [{"params": [p for n, p in model.named_parameters() if p.requires_grad]}]
     optimizer = torch.optim.AdamW(param_dicts, lr=opt.lr, weight_decay=opt.wd)
-    warmup_epochs = getattr(opt, "warmup_epochs", 0)
     cosine_T0 = getattr(opt, "cosine_T0", 0)
+    lr_scheduler_name = getattr(opt, "lr_scheduler", "auto")
+    if lr_scheduler_name == "auto":
+        lr_scheduler_name = "cosine" if cosine_T0 > 0 else "step"
 
-    if cosine_T0 > 0:
-        cosine_Tmult  = getattr(opt, "cosine_Tmult", 2)
-        eta_min_ratio = getattr(opt, "cosine_eta_min_ratio", 0.01)
-
-        def lr_lambda(epoch):
-            if epoch < warmup_epochs:
-                return (epoch + 1) / max(warmup_epochs, 1)
-
-            t = epoch - warmup_epochs
-            t_cur = cosine_T0
-            cycle_start = 0
-            while t >= cycle_start + t_cur:
-                cycle_start += t_cur
-                t_cur = int(t_cur * cosine_Tmult)
-            progress = (t - cycle_start) / max(t_cur, 1)
-            return eta_min_ratio + (1.0 - eta_min_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
-
+    if lr_scheduler_name in ("cosine", "linear"):
+        final_lr_ratio = getattr(opt, "lrf", None)
+        if final_lr_ratio is None:
+            final_lr_ratio = getattr(opt, "cosine_eta_min_ratio", 0.01)
+        if not 0 <= final_lr_ratio <= 1:
+            raise ValueError("--lrf must be between 0 and 1.")
+        scheduler_steps = max(getattr(opt, "n_epoch", cosine_T0), 1)
+        if lr_scheduler_name == "cosine":
+            lr_lambda = one_cycle(1.0, final_lr_ratio, scheduler_steps)
+        else:
+            lr_lambda = linear_decay(final_lr_ratio, scheduler_steps)
         lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
         logger.info(
-            "Using LambdaLR warmup+cosine restarts "
-            f"(warmup_epochs={warmup_epochs}, cosine_T0={cosine_T0}, "
-            f"cosine_Tmult={cosine_Tmult}, cosine_eta_min_ratio={eta_min_ratio})."
+            f"Using LambdaLR {lr_scheduler_name} schedule "
+            f"(steps={scheduler_steps}, lrf={final_lr_ratio})."
         )
     else:
         lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, opt.lr_drop)
