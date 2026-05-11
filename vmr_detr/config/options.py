@@ -149,8 +149,13 @@ class BaseOptions(object):
         parser.add_argument("--saliency_margin", type=float, default=0.2)
         parser.add_argument('--no_aux_loss', dest='aux_loss', action='store_false',
                             help="Disables auxiliary decoding losses (loss at each layer)")
-        parser.add_argument("--span_loss_type", default="l1", type=str, choices=['l1', 'ce'],
-                            help="l1: (center-x, width) regression. ce: (st_idx, ed_idx) classification.")
+        parser.add_argument("--span_loss_type", default="l1", type=str, choices=['l1', 'ce', 'dfl'],
+                            help="l1: (center-x, width) regression. ce: (st_idx, ed_idx) classification. "
+                                 "dfl: start/end boundary distributions with expectation decoding.")
+        parser.add_argument("--dfl_num_bins", default=16, type=int,
+                            help="Number of distribution bins for --span_loss_type dfl.")
+        parser.add_argument("--dfl_ref_prior_sigma", default=2.0, type=float,
+                            help="Gaussian prior sigma in DFL bins for decoder reference-conditioned logits.")
         parser.add_argument("--contrastive_align_loss", action="store_true",
                             help="Enable contrastive_align_loss between matched query spans and text.")
         parser.add_argument("--contrastive_start_epoch", default=0, type=int,
@@ -159,27 +164,6 @@ class BaseOptions(object):
                             help="1-based epoch to switch contrastive loss to contrastive_decay_coef. <=0 disables decay.")
         parser.add_argument("--contrastive_decay_coef", default=0.0, type=float,
                             help="contrastive_align_loss weight after contrastive_decay_epoch.")
-        parser.add_argument("--quality_loss_coef", default=0.0, type=float,
-                            help="weight for decoder-query IoU quality loss. 0 disables quality head/loss.")
-        parser.add_argument("--quality_start_epoch", default=0, type=int,
-                            help="1-based epoch to start quality loss. 0 enables it from the beginning.")
-        parser.add_argument("--quality_loss_type", default="bce", choices=["bce", "smooth_l1"],
-                            help="Loss used for quality prediction targets in [0, 1].")
-        parser.add_argument("--quality_target_mode", default="matched", choices=["matched", "full"],
-                            help="Target assignment for quality loss: matched uses Hungarian-matched queries only; "
-                                 "full uses max IoU over all GT spans for every query.")
-        parser.add_argument("--ranking_loss_coef", default=0.0, type=float,
-                            help="weight for pairwise decoder-query ranking loss. 0 disables ranking loss.")
-        parser.add_argument("--ranking_start_epoch", default=0, type=int,
-                            help="1-based epoch to start ranking loss. 0 enables it from the beginning.")
-        parser.add_argument("--ranking_pos_iou", default=0.7, type=float,
-                            help="IoU threshold for positive queries in pairwise ranking loss.")
-        parser.add_argument("--ranking_neg_iou", default=0.5, type=float,
-                            help="IoU threshold below which queries are negatives in pairwise ranking loss.")
-        parser.add_argument("--ranking_margin", default=0.2, type=float,
-                            help="margin for pairwise ranking loss.")
-        parser.add_argument("--ranking_score_beta", default=0.5, type=float,
-                            help="quality-logit weight used in the ranking loss score.")
         # * Matcher
         parser.add_argument('--set_cost_span', default=10, type=float,
                             help="L1 span coefficient in the matching cost")
@@ -187,6 +171,12 @@ class BaseOptions(object):
                             help="giou span coefficient in the matching cost")
         parser.add_argument('--set_cost_class', default=4, type=float,
                             help="Class coefficient in the matching cost")
+        parser.add_argument("--aux_matching_type", default="hungarian",
+                            choices=["hungarian", "one_to_many"],
+                            help="Matcher used only for auxiliary decoder losses.")
+        parser.add_argument("--aux_one_to_many_k", default=2, type=int,
+                            help="Number of lowest-cost auxiliary queries selected per target when "
+                                 "--aux_matching_type one_to_many is enabled.")
 
         # * Loss coefficients
         parser.add_argument('--span_loss_coef', default=10, type=float)
@@ -201,10 +191,6 @@ class BaseOptions(object):
 
         parser.add_argument("--no_sort_results", action="store_true",
                             help="do not sort results, use this for moment query visualization")
-        parser.add_argument("--use_quality_ranking", action="store_true",
-                            help="Rank inference windows by foreground probability and predicted quality.")
-        parser.add_argument("--quality_score_beta", default=1.0, type=float,
-                            help="Exponent applied to sigmoid(pred_quality) when --use_quality_ranking is enabled.")
         parser.add_argument("--max_before_nms", type=int, default=10)
         parser.add_argument("--max_after_nms", type=int, default=10)
         parser.add_argument("--conf_thd", type=float, default=0.0, help="only keep windows with conf >= conf_thd")
@@ -243,13 +229,20 @@ class BaseOptions(object):
             for arg in saved_options:  # use saved options to overwrite all BaseOptions args.
                 if arg not in ["results_root", "num_workers", "nms_thd", "debug",  # "max_before_nms", "max_after_nms"
                                "max_pred_l", "min_pred_l",
-                               "resume", "resume_all", "no_sort_results",
-                               "use_quality_ranking", "quality_score_beta"]:
+                               "resume", "resume_all", "no_sort_results"]:
                     setattr(opt, arg, saved_options[arg])
             # opt.no_core_driver = True
             if opt.eval_results_dir is not None:
                 opt.results_dir = opt.eval_results_dir
+            if opt.dfl_num_bins < 2:
+                raise ValueError("--dfl_num_bins must be >= 2.")
+            if opt.dfl_ref_prior_sigma <= 0:
+                raise ValueError("--dfl_ref_prior_sigma must be > 0.")
         else:
+            if opt.dfl_num_bins < 2:
+                raise ValueError("--dfl_num_bins must be >= 2.")
+            if opt.dfl_ref_prior_sigma <= 0:
+                raise ValueError("--dfl_ref_prior_sigma must be > 0.")
             if opt.exp_id is None:
                 raise ValueError("--exp_id is required for at a training option!")
 

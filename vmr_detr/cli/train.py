@@ -416,8 +416,6 @@ if __name__ == '__main__':
         input_args = ["--resume", best_ckpt_path,
                       "--eval_split_name", eval_split_name,
                       "--eval_path", eval_path]
-        if opt.use_quality_ranking:
-            input_args += ["--use_quality_ranking", "--quality_score_beta", str(opt.quality_score_beta)]
 
         import sys
         sys.argv[1:] = input_args

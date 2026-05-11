@@ -6,9 +6,9 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from vmr_detr.ops.span_utils import generalized_temporal_iou, span_cxw_to_xx
+from vmr_detr.ops.span_utils import generalized_temporal_iou, span_cxw_to_xx, span_xx_to_cxw
 
-from vmr_detr.modeling.matcher import build_matcher
+from vmr_detr.modeling.matcher import build_matcher, build_one_to_many_matcher
 from vmr_detr.modeling.transformer import build_transformer
 from vmr_detr.modeling.position_encoding import build_position_encoding
 from vmr_detr.ops.misc import accuracy
@@ -19,6 +19,32 @@ def inverse_sigmoid(x, eps=1e-3):
     x1 = x.clamp(min=eps)
     x2 = (1 - x).clamp(min=eps)
     return torch.log(x1/x2)
+
+
+def dfl_logits_to_spans(span_logits, dfl_num_bins):
+    """Decode DFL start/end distributions to normalized cxw spans."""
+    num_bins = dfl_num_bins
+    logits = span_logits.reshape(*span_logits.shape[:-1], 2, num_bins)
+    prob = F.softmax(logits, dim=-1)
+    bins = torch.arange(num_bins, dtype=prob.dtype, device=prob.device)
+    boundaries = (prob * bins).sum(dim=-1) / float(num_bins - 1)
+    start = torch.minimum(boundaries[..., 0], boundaries[..., 1])
+    end = torch.maximum(boundaries[..., 0], boundaries[..., 1])
+    spans_xx = torch.stack([start, end], dim=-1).clamp(0, 1)
+    return span_xx_to_cxw(spans_xx)
+
+
+def dfl_reference_prior_logits(reference_spans, dfl_num_bins, sigma):
+    """Create start/end DFL logit priors centered on decoder reference spans."""
+    if sigma <= 0:
+        raise ValueError("sigma must be > 0.")
+    ref_xx = span_cxw_to_xx(reference_spans).clamp(0, 1)
+    centers = ref_xx * float(dfl_num_bins - 1)
+    bins = torch.arange(dfl_num_bins, dtype=centers.dtype, device=centers.device)
+    bins = bins.view(*([1] * centers.dim()), dfl_num_bins)
+    prior = -0.5 * ((bins - centers.unsqueeze(-1)) / float(sigma)) ** 2
+    prior = prior - prior.max(dim=-1, keepdim=True).values
+    return prior.reshape(*reference_spans.shape[:-1], 2 * dfl_num_bins)
 
 
 class StreamTextConditionedEncoder(nn.Module):
@@ -113,7 +139,7 @@ class VMRDETR(nn.Module):
                  use_gated_video_fusion=False, use_late_gated_video_fusion=False,
                  slowfast_dim=2304, clip_dim=512, tef_dim=2, dropout=0.1, dim_feedforward=None,
                  use_multiscale_stream_adapter=False, multiscale_adapter_dropout=0.1,
-                 use_quality_head=False):
+                 dfl_num_bins=16, dfl_ref_prior_sigma=2.0):
         """ Initializes the model.
         Parameters:
             transformer: torch module of the transformer architecture. See transformer.py
@@ -127,9 +153,12 @@ class VMRDETR(nn.Module):
             contrastive_align_loss: If true, perform span - tokens contrastive learning
             contrastive_hdim: dimension used for projecting the embeddings before computing contrastive loss
             max_v_l: int, maximum #clips in videos
-            span_loss_type: str, one of [l1, ce]
+            dfl_num_bins: int, number of boundary distribution bins for dfl spans.
+            dfl_ref_prior_sigma: float, Gaussian prior sigma in DFL bins.
+            span_loss_type: str, one of [l1, ce, dfl]
                 l1: (center-x, width) regression.
                 ce: (st_idx, ed_idx) classification.
+                dfl: start/end boundary distributions with expectation decoding.
             # foreground_thd: float, intersection over prediction >= foreground_thd: labeled as foreground
             # background_thd: float, intersection over prediction <= background_thd: labeled background
         """
@@ -141,12 +170,20 @@ class VMRDETR(nn.Module):
         hidden_dim = transformer.d_model
         self.span_loss_type = span_loss_type
         self.max_v_l = max_v_l
-        span_pred_dim = 2 if span_loss_type == "l1" else max_v_l * 2
+        if dfl_num_bins < 2:
+            raise ValueError("dfl_num_bins must be >= 2.")
+        if dfl_ref_prior_sigma <= 0:
+            raise ValueError("dfl_ref_prior_sigma must be > 0.")
+        self.dfl_num_bins = dfl_num_bins
+        self.dfl_ref_prior_sigma = dfl_ref_prior_sigma
+        if span_loss_type == "l1":
+            span_pred_dim = 2
+        elif span_loss_type == "dfl":
+            span_pred_dim = 2 * dfl_num_bins
+        else:
+            span_pred_dim = max_v_l * 2
         self.span_embed = MLP(hidden_dim, hidden_dim, span_pred_dim, 3)
         self.class_embed = nn.Linear(hidden_dim, 2)  # 0: background, 1: foreground
-        self.use_quality_head = use_quality_head
-        if self.use_quality_head:
-            self.quality_embed = MLP(hidden_dim, hidden_dim, 1, 3)
         self.use_txt_pos = use_txt_pos
         self.n_input_proj = n_input_proj
         # self.foreground_thd = foreground_thd
@@ -350,12 +387,22 @@ class VMRDETR(nn.Module):
         outputs_class = self.class_embed(hs)  # (#layers, batch_size, #queries, #classes)
         reference_before_sigmoid = inverse_sigmoid(reference)
         tmp = self.span_embed(hs)
-        outputs_coord = tmp + reference_before_sigmoid
         if self.span_loss_type == "l1":
+            outputs_coord = tmp + reference_before_sigmoid
             outputs_coord = outputs_coord.sigmoid()
+            outputs_span_logits = None
+        elif self.span_loss_type == "dfl":
+            reference_prior_logits = dfl_reference_prior_logits(
+                reference, self.dfl_num_bins, self.dfl_ref_prior_sigma
+            )
+            outputs_span_logits = tmp + reference_prior_logits
+            outputs_coord = dfl_logits_to_spans(outputs_span_logits, self.dfl_num_bins)
+        else:
+            outputs_coord = tmp
+            outputs_span_logits = None
         out = {'pred_logits': outputs_class[-1], 'pred_spans': outputs_coord[-1]}
-        if self.use_quality_head:
-            out["pred_quality"] = self.quality_embed(hs[-1]).squeeze(-1)
+        if outputs_span_logits is not None:
+            out["pred_span_logits"] = outputs_span_logits[-1]
 
         if self.contrastive_align_loss:
             proj_queries = F.normalize(self.contrastive_align_projection_query(hs), p=2, dim=-1)
@@ -388,8 +435,13 @@ class VMRDETR(nn.Module):
         # print(src_vid_mask.shape, src_vid.shape, vid_mem_neg.shape, vid_mem.shape)
         out["video_mask"] = src_vid_mask
         if self.aux_loss:
-            out['aux_outputs'] = [
-                {'pred_logits': a, 'pred_spans': b} for a, b in zip(outputs_class[:-1], outputs_coord[:-1])]
+            if outputs_span_logits is not None:
+                out['aux_outputs'] = [
+                    {'pred_logits': a, 'pred_spans': b, 'pred_span_logits': c}
+                    for a, b, c in zip(outputs_class[:-1], outputs_coord[:-1], outputs_span_logits[:-1])]
+            else:
+                out['aux_outputs'] = [
+                    {'pred_logits': a, 'pred_spans': b} for a, b in zip(outputs_class[:-1], outputs_coord[:-1])]
         return out
 
     # @torch.jit.unused
@@ -409,11 +461,10 @@ class SetCriterion(nn.Module):
     """
 
     def __init__(self, matcher, weight_dict, eos_coef, losses, temperature, span_loss_type, max_v_l,
+                 dfl_num_bins=16,
                  saliency_margin=1, use_matcher=True, contrastive_start_epoch=0,
                  contrastive_decay_epoch=-1, contrastive_decay_coef=0.0,
-                 quality_start_epoch=0, quality_loss_type="bce", quality_target_mode="matched",
-                 ranking_start_epoch=0, ranking_pos_iou=0.7, ranking_neg_iou=0.5,
-                 ranking_margin=0.2, ranking_score_beta=0.5):
+                 aux_matcher=None, aux_matching_type="hungarian"):
         """ Create the criterion.
         Parameters:
             matcher: module able to compute a matching between targets and proposals
@@ -421,17 +472,24 @@ class SetCriterion(nn.Module):
             eos_coef: relative classification weight applied to the no-object category
             losses: list of all the losses to be applied. See get_loss for list of available losses.
             temperature: float, temperature for NCE loss
-            span_loss_type: str, [l1, ce]
+            span_loss_type: str, [l1, ce, dfl]
             max_v_l: int,
+            dfl_num_bins: int,
             saliency_margin: float
         """
         super().__init__()
         self.matcher = matcher
+        assert aux_matching_type in ("hungarian", "one_to_many")
+        self.aux_matching_type = aux_matching_type
+        self.aux_matcher = matcher if aux_matching_type == "hungarian" else (aux_matcher or matcher)
         self.weight_dict = weight_dict
         self.losses = losses
         self.temperature = temperature
         self.span_loss_type = span_loss_type
         self.max_v_l = max_v_l
+        if dfl_num_bins < 2:
+            raise ValueError("dfl_num_bins must be >= 2.")
+        self.dfl_num_bins = dfl_num_bins
         self.saliency_margin = saliency_margin
 
         # foreground and background classification
@@ -448,28 +506,12 @@ class SetCriterion(nn.Module):
         self.contrastive_decay_epoch = contrastive_decay_epoch
         self.contrastive_decay_coef = contrastive_decay_coef
         self.contrastive_base_coef = self.weight_dict.get("loss_contrastive_align", 0.0)
-        self.quality_start_epoch = quality_start_epoch
-        self.quality_loss_type = quality_loss_type
-        assert quality_target_mode in ("matched", "full")
-        self.quality_target_mode = quality_target_mode
-        self.quality_base_coef = self.weight_dict.get("loss_quality", 0.0)
-        assert 0 <= ranking_neg_iou < ranking_pos_iou <= 1
-        self.ranking_start_epoch = ranking_start_epoch
-        self.ranking_pos_iou = ranking_pos_iou
-        self.ranking_neg_iou = ranking_neg_iou
-        self.ranking_margin = ranking_margin
-        self.ranking_score_beta = ranking_score_beta
-        self.ranking_base_coef = self.weight_dict.get("loss_ranking", 0.0)
         self.current_epoch = 0
         self._update_contrastive_weight()
-        self._update_quality_weight()
-        self._update_ranking_weight()
 
     def set_epoch(self, epoch):
         self.current_epoch = int(epoch)
         self._update_contrastive_weight()
-        self._update_quality_weight()
-        self._update_ranking_weight()
 
     def _update_contrastive_weight(self):
         if "loss_contrastive_align" not in self.weight_dict:
@@ -482,45 +524,28 @@ class SetCriterion(nn.Module):
             coef = self.contrastive_base_coef
         self.weight_dict["loss_contrastive_align"] = coef
 
-    def _update_quality_weight(self):
-        if "loss_quality" not in self.weight_dict:
-            return
-        if self.current_epoch < self.quality_start_epoch:
-            coef = 0.0
-        else:
-            coef = self.quality_base_coef
-        self.weight_dict["loss_quality"] = coef
+    def _loss_dfl(self, src_span_logits, tgt_spans):
+        n_spans = src_span_logits.shape[0]
+        num_bins = self.dfl_num_bins
+        scale = float(num_bins - 1)
+        logits = src_span_logits.reshape(n_spans, 2, num_bins)
+        target_bins = span_cxw_to_xx(tgt_spans).clamp(0, 1) * scale
 
-    def _update_ranking_weight(self):
-        if "loss_ranking" not in self.weight_dict:
-            return
-        if self.current_epoch < self.ranking_start_epoch:
-            coef = 0.0
-        else:
-            coef = self.ranking_base_coef
-        self.weight_dict["loss_ranking"] = coef
+        target_left = target_bins.floor().long().clamp(min=0, max=num_bins - 1)
+        target_right = (target_left + 1).clamp(max=num_bins - 1)
+        weight_right = target_bins - target_left.float()
+        weight_left = 1.0 - weight_right
 
-    @staticmethod
-    def _span_iou(src_spans, tgt_spans):
-        src_xx = span_cxw_to_xx(src_spans)
-        tgt_xx = span_cxw_to_xx(tgt_spans)
-        inter = (torch.min(src_xx[:, 1], tgt_xx[:, 1]) -
-                 torch.max(src_xx[:, 0], tgt_xx[:, 0])).clamp(min=0)
-        src_len = (src_xx[:, 1] - src_xx[:, 0]).clamp(min=0)
-        tgt_len = (tgt_xx[:, 1] - tgt_xx[:, 0]).clamp(min=0)
-        union = (src_len + tgt_len - inter).clamp(min=1e-6)
-        return inter / union
+        logits = logits.reshape(-1, num_bins)
+        target_left = target_left.reshape(-1)
+        target_right = target_right.reshape(-1)
+        weight_left = weight_left.reshape(-1)
+        weight_right = weight_right.reshape(-1)
 
-    @staticmethod
-    def _span_iou_pairwise(src_spans, tgt_spans):
-        src_xx = span_cxw_to_xx(src_spans)[:, None, :]
-        tgt_xx = span_cxw_to_xx(tgt_spans)[None, :, :]
-        inter = (torch.min(src_xx[..., 1], tgt_xx[..., 1]) -
-                 torch.max(src_xx[..., 0], tgt_xx[..., 0])).clamp(min=0)
-        src_len = (src_xx[..., 1] - src_xx[..., 0]).clamp(min=0)
-        tgt_len = (tgt_xx[..., 1] - tgt_xx[..., 0]).clamp(min=0)
-        union = (src_len + tgt_len - inter).clamp(min=1e-6)
-        return inter / union
+        loss_left = F.cross_entropy(logits, target_left, reduction='none')
+        loss_right = F.cross_entropy(logits, target_right, reduction='none')
+        loss = loss_left * weight_left + loss_right * weight_right
+        return (loss / float(np.log(num_bins))).view(n_spans, 2)
 
     def loss_spans(self, outputs, targets, indices):
         """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
@@ -529,11 +554,21 @@ class SetCriterion(nn.Module):
         """
         assert 'pred_spans' in outputs
         targets = targets["span_labels"]
+        if sum(len(src) for src, _ in indices) == 0:
+            zero = outputs["pred_spans"].sum() * 0
+            if "pred_span_logits" in outputs:
+                zero = zero + outputs["pred_span_logits"].sum() * 0
+            return {"loss_span": zero, "loss_giou": zero}
+
         idx = self._get_src_permutation_idx(indices)
         src_spans = outputs['pred_spans'][idx]  # (#spans, max_v_l * 2)
         tgt_spans = torch.cat([t['spans'][i] for t, (_, i) in zip(targets, indices)], dim=0)  # (#spans, 2)
         if self.span_loss_type == "l1":
             loss_span = F.l1_loss(src_spans, tgt_spans, reduction='none')
+            loss_giou = 1 - torch.diag(generalized_temporal_iou(span_cxw_to_xx(src_spans), span_cxw_to_xx(tgt_spans)))
+        elif self.span_loss_type == "dfl":
+            src_span_logits = outputs['pred_span_logits'][idx]
+            loss_span = self._loss_dfl(src_span_logits, tgt_spans)
             loss_giou = 1 - torch.diag(generalized_temporal_iou(span_cxw_to_xx(src_spans), span_cxw_to_xx(tgt_spans)))
         else:  # ce
             n_spans = src_spans.shape[0]
@@ -570,89 +605,12 @@ class SetCriterion(nn.Module):
         loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, self.empty_weight, reduction="none")
         losses = {'loss_label': loss_ce.mean()}
 
-        if log:
+        if log and len(idx[0]) > 0:
             # TODO this should probably be a separate loss, not hacked in this one here
             losses['class_error'] = 100 - accuracy(src_logits[idx], self.foreground_label)[0]
+        elif log:
+            losses['class_error'] = src_logits.new_tensor(100.)
         return losses
-
-    def loss_quality(self, outputs, targets, indices, log=True):
-        """Supervise query quality logits with predicted-span IoU targets."""
-        if self.weight_dict.get("loss_quality", 0.0) == 0:
-            return {"loss_quality": outputs["pred_logits"].new_zeros(())}
-        if "pred_quality" not in outputs:
-            return {"loss_quality": outputs["pred_logits"].new_zeros(())}
-        if self.span_loss_type != "l1":
-            return {"loss_quality": outputs["pred_quality"].new_zeros(())}
-
-        quality_logits = outputs["pred_quality"]
-        quality_targets = torch.zeros_like(quality_logits)
-
-        span_targets = targets["span_labels"]
-        if self.quality_target_mode == "full":
-            pred_spans = outputs["pred_spans"].detach()
-            for batch_idx, target in enumerate(span_targets):
-                tgt_spans = target["spans"]
-                if tgt_spans.numel() == 0:
-                    continue
-                pairwise_iou = self._span_iou_pairwise(pred_spans[batch_idx], tgt_spans)
-                quality_targets[batch_idx] = pairwise_iou.max(dim=1).values.detach()
-        else:
-            idx = self._get_src_permutation_idx(indices)
-            if len(idx[0]) > 0:
-                src_spans = outputs["pred_spans"][idx].detach()
-                tgt_spans = torch.cat(
-                    [t["spans"][i] for t, (_, i) in zip(span_targets, indices)], dim=0
-                )
-                quality_targets[idx] = self._span_iou(src_spans, tgt_spans).detach()
-
-        if self.quality_loss_type == "smooth_l1":
-            loss_quality = F.smooth_l1_loss(
-                torch.sigmoid(quality_logits), quality_targets, reduction="mean"
-            )
-        else:
-            loss_quality = F.binary_cross_entropy_with_logits(
-                quality_logits, quality_targets, reduction="mean"
-            )
-        return {"loss_quality": loss_quality}
-
-    def loss_ranking(self, outputs, targets, indices, log=True):
-        """Rank high-IoU decoder queries above low-IoU queries."""
-        zero = outputs["pred_logits"].new_zeros(())
-        if self.weight_dict.get("loss_ranking", 0.0) == 0:
-            return {"loss_ranking": zero}
-        if self.span_loss_type != "l1" or "pred_spans" not in outputs:
-            return {"loss_ranking": zero}
-
-        foreground_logits = outputs["pred_logits"][..., self.foreground_label]
-        if "pred_quality" in outputs:
-            rank_scores = foreground_logits + self.ranking_score_beta * outputs["pred_quality"]
-        else:
-            rank_scores = foreground_logits
-
-        loss_terms = []
-        pred_spans = outputs["pred_spans"].detach()
-        for batch_idx, target in enumerate(targets["span_labels"]):
-            tgt_spans = target["spans"]
-            if tgt_spans.numel() == 0:
-                continue
-            query_ious = self._span_iou_pairwise(pred_spans[batch_idx], tgt_spans).max(dim=1).values.detach()
-            pos_mask = query_ious >= self.ranking_pos_iou
-            neg_mask = query_ious < self.ranking_neg_iou
-            if not torch.any(pos_mask) or not torch.any(neg_mask):
-                continue
-
-            pos_scores = rank_scores[batch_idx][pos_mask]
-            neg_scores = rank_scores[batch_idx][neg_mask]
-            pos_ious = query_ious[pos_mask]
-            neg_ious = query_ious[neg_mask]
-
-            pair_losses = F.relu(self.ranking_margin - pos_scores[:, None] + neg_scores[None, :])
-            pair_weights = (pos_ious[:, None] - neg_ious[None, :]).clamp(min=0).detach()
-            loss_terms.append((pair_losses * pair_weights).sum() / pair_weights.sum().clamp(min=1e-6))
-
-        if not loss_terms:
-            return {"loss_ranking": zero}
-        return {"loss_ranking": torch.stack(loss_terms).mean()}
 
     def loss_saliency(self, outputs, targets, indices, log=True):
         """higher scores for positive clips"""
@@ -781,12 +739,18 @@ class SetCriterion(nn.Module):
 
     def _get_src_permutation_idx(self, indices):
         # permute predictions following indices
+        if len(indices) == 0 or sum(len(src) for src, _ in indices) == 0:
+            empty = torch.empty(0, dtype=torch.int64)
+            return empty, empty
         batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
         src_idx = torch.cat([src for (src, _) in indices])
         return batch_idx, src_idx  # two 1D tensors of the same length
 
     def _get_tgt_permutation_idx(self, indices):
         # permute targets following indices
+        if len(indices) == 0 or sum(len(tgt) for _, tgt in indices) == 0:
+            empty = torch.empty(0, dtype=torch.int64)
+            return empty, empty
         batch_idx = torch.cat([torch.full_like(tgt, i) for i, (_, tgt) in enumerate(indices)])
         tgt_idx = torch.cat([tgt for (_, tgt) in indices])
         return batch_idx, tgt_idx
@@ -795,8 +759,6 @@ class SetCriterion(nn.Module):
         loss_map = {
             "spans": self.loss_spans,
             "labels": self.loss_labels,
-            "quality": self.loss_quality,
-            "ranking": self.loss_ranking,
             "contrastive_align": self.loss_contrastive_align,
             "saliency": self.loss_saliency,
         }
@@ -834,17 +796,17 @@ class SetCriterion(nn.Module):
             for i, aux_outputs in enumerate(outputs['aux_outputs']):
                 # indices = self.matcher(aux_outputs, targets)
                 if self.use_matcher:
-                    indices = self.matcher(aux_outputs, targets)
+                    aux_indices = self.aux_matcher(aux_outputs, targets)
                     losses_target = self.losses
                 else:
-                    indices = None
+                    aux_indices = None
                     losses_target = ["saliency"]    
                 # for loss in self.losses:
                 for loss in losses_target:
-                    if loss in ("saliency", "contrastive_align", "quality", "ranking"):  # final layer only
+                    if loss in ("saliency", "contrastive_align"):  # final layer only
                         continue
                     kwargs = {}
-                    l_dict = self.get_loss(loss, aux_outputs, targets, indices, **kwargs)
+                    l_dict = self.get_loss(loss, aux_outputs, targets, aux_indices, **kwargs)
                     l_dict = {k + f'_{i}': v for k, v in l_dict.items()}
                     losses.update(l_dict)
         return losses
@@ -903,7 +865,8 @@ def build_model(args):
 
     transformer = build_transformer(args)
     position_embedding, txt_position_embedding = build_position_encoding(args)
-    use_quality_head = getattr(args, "quality_loss_coef", 0.0) > 0
+    dfl_num_bins = getattr(args, "dfl_num_bins", 16)
+    dfl_ref_prior_sigma = getattr(args, "dfl_ref_prior_sigma", 2.0)
 
     if args.a_feat_dir is None:
         model = VMRDETR(
@@ -919,6 +882,8 @@ def build_model(args):
             contrastive_hdim=args.contrastive_hdim,
             max_v_l=args.max_v_l,
             span_loss_type=args.span_loss_type,
+            dfl_num_bins=dfl_num_bins,
+            dfl_ref_prior_sigma=dfl_ref_prior_sigma,
             use_txt_pos=args.use_txt_pos,
             n_input_proj=args.n_input_proj,
             use_gated_video_fusion=args.use_gated_video_fusion,
@@ -930,7 +895,6 @@ def build_model(args):
             dim_feedforward=args.dim_feedforward,
             use_multiscale_stream_adapter=args.use_multiscale_stream_adapter,
             multiscale_adapter_dropout=args.multiscale_adapter_dropout,
-            use_quality_head=use_quality_head,
         )
     else:
         model = VMRDETR(
@@ -947,6 +911,8 @@ def build_model(args):
             contrastive_hdim=args.contrastive_hdim,
             max_v_l=args.max_v_l,
             span_loss_type=args.span_loss_type,
+            dfl_num_bins=dfl_num_bins,
+            dfl_ref_prior_sigma=dfl_ref_prior_sigma,
             use_txt_pos=args.use_txt_pos,
             n_input_proj=args.n_input_proj,
             use_gated_video_fusion=args.use_gated_video_fusion,
@@ -958,35 +924,28 @@ def build_model(args):
             dim_feedforward=args.dim_feedforward,
             use_multiscale_stream_adapter=args.use_multiscale_stream_adapter,
             multiscale_adapter_dropout=args.multiscale_adapter_dropout,
-            use_quality_head=use_quality_head,
         )
 
     matcher = build_matcher(args)
+    aux_matching_type = getattr(args, "aux_matching_type", "hungarian")
+    aux_matcher = build_one_to_many_matcher(args) if aux_matching_type == "one_to_many" else matcher
     weight_dict = {"loss_span": args.span_loss_coef,
                    "loss_giou": args.giou_loss_coef,
                    "loss_label": args.label_loss_coef,
                    "loss_saliency": args.lw_saliency}
     if args.contrastive_align_loss:
         weight_dict["loss_contrastive_align"] = args.contrastive_align_loss_coef
-    if args.quality_loss_coef > 0:
-        weight_dict["loss_quality"] = args.quality_loss_coef
-    if args.ranking_loss_coef > 0:
-        weight_dict["loss_ranking"] = args.ranking_loss_coef
     # TODO this is a hack
     if args.aux_loss:
         aux_weight_dict = {}
         for i in range(args.dec_layers - 1):
             aux_weight_dict.update(
                 {k + f'_{i}': v for k, v in weight_dict.items()
-                 if k not in ("loss_saliency", "loss_contrastive_align", "loss_quality", "loss_ranking")}
+                 if k not in ("loss_saliency", "loss_contrastive_align")}
             )
         weight_dict.update(aux_weight_dict)
 
     losses = ['spans', 'labels', 'saliency']
-    if args.quality_loss_coef > 0:
-        losses += ["quality"]
-    if args.ranking_loss_coef > 0:
-        losses += ["ranking"]
     if args.contrastive_align_loss:
         losses += ["contrastive_align"]
         
@@ -997,18 +956,13 @@ def build_model(args):
         matcher=matcher, weight_dict=weight_dict, losses=losses,
         eos_coef=args.eos_coef, temperature=args.temperature,
         span_loss_type=args.span_loss_type, max_v_l=args.max_v_l,
+        dfl_num_bins=dfl_num_bins,
         saliency_margin=args.saliency_margin, use_matcher=use_matcher,
         contrastive_start_epoch=args.contrastive_start_epoch,
         contrastive_decay_epoch=args.contrastive_decay_epoch,
         contrastive_decay_coef=args.contrastive_decay_coef,
-        quality_start_epoch=args.quality_start_epoch,
-        quality_loss_type=args.quality_loss_type,
-        quality_target_mode=args.quality_target_mode,
-        ranking_start_epoch=args.ranking_start_epoch,
-        ranking_pos_iou=args.ranking_pos_iou,
-        ranking_neg_iou=args.ranking_neg_iou,
-        ranking_margin=args.ranking_margin,
-        ranking_score_beta=args.ranking_score_beta,
+        aux_matcher=aux_matcher,
+        aux_matching_type=aux_matching_type,
     )
     criterion.to(device)
     return model, criterion
