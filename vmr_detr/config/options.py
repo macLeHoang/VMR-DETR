@@ -153,13 +153,20 @@ class BaseOptions(object):
         parser.add_argument("--saliency_margin", type=float, default=0.2)
         parser.add_argument('--no_aux_loss', dest='aux_loss', action='store_false',
                             help="Disables auxiliary decoding losses (loss at each layer)")
-        parser.add_argument("--span_loss_type", default="l1", type=str, choices=['l1', 'ce', 'dfl'],
+        parser.add_argument("--span_loss_type", default="l1", type=str, choices=['l1', 'ce', 'dfl', 'fdr'],
                             help="l1: (center-x, width) regression. ce: (st_idx, ed_idx) classification. "
-                                 "dfl: start/end boundary distributions with expectation decoding.")
+                                 "dfl: start/end boundary distributions with expectation decoding. "
+                                 "fdr: residual boundary-offset distributions around decoder references.")
         parser.add_argument("--dfl_num_bins", default=16, type=int,
                             help="Number of distribution bins for --span_loss_type dfl.")
         parser.add_argument("--dfl_ref_prior_sigma", default=2.0, type=float,
                             help="Gaussian prior sigma in DFL bins for decoder reference-conditioned logits.")
+        parser.add_argument("--fdr_num_bins", default=32, type=int,
+                            help="Number of offset distribution bins for --span_loss_type fdr.")
+        parser.add_argument("--fdr_reg_scale", default=1.5, type=float,
+                            help="Curvature for non-uniform FDR offset bins; >1 is denser around zero.")
+        parser.add_argument("--fdr_min_ref_width", default=-1.0, type=float,
+                            help="Minimum reference width for FDR offset scaling. <=0 uses 1 / max_v_l.")
         parser.add_argument("--contrastive_align_loss", action="store_true",
                             help="Enable contrastive_align_loss between matched query spans and text.")
         parser.add_argument("--contrastive_start_epoch", default=0, type=int,
@@ -193,6 +200,8 @@ class BaseOptions(object):
 
         # * Loss coefficients
         parser.add_argument('--span_loss_coef', default=10, type=float)
+        parser.add_argument("--fgl_loss_coef", default=None, type=float,
+                            help="FGL loss weight for --span_loss_type fdr. Defaults to span_loss_coef.")
         parser.add_argument('--giou_loss_coef', default=1, type=float)
         parser.add_argument('--label_loss_coef', default=4, type=float)
         parser.add_argument('--eos_coef', default=0.1, type=float,
@@ -251,12 +260,14 @@ class BaseOptions(object):
                 raise ValueError("--dfl_num_bins must be >= 2.")
             if opt.dfl_ref_prior_sigma <= 0:
                 raise ValueError("--dfl_ref_prior_sigma must be > 0.")
+            self._validate_fdr_options(opt)
             self._validate_tal_options(opt)
         else:
             if opt.dfl_num_bins < 2:
                 raise ValueError("--dfl_num_bins must be >= 2.")
             if opt.dfl_ref_prior_sigma <= 0:
                 raise ValueError("--dfl_ref_prior_sigma must be > 0.")
+            self._validate_fdr_options(opt)
             self._validate_tal_options(opt)
             if opt.exp_id is None:
                 raise ValueError("--exp_id is required for at a training option!")
@@ -304,8 +315,19 @@ class BaseOptions(object):
             raise ValueError("--tal_topk must be >= 1.")
         if opt.tal_alpha < 0 or opt.tal_beta < 0:
             raise ValueError("--tal_alpha and --tal_beta must be non-negative.")
-        if opt.matching_type == "tal" and opt.span_loss_type not in ("l1", "dfl"):
-            raise ValueError("--matching_type tal requires --span_loss_type l1 or dfl.")
+        if opt.matching_type == "tal" and opt.span_loss_type not in ("l1", "dfl", "fdr"):
+            raise ValueError("--matching_type tal requires --span_loss_type l1, dfl, or fdr.")
+
+    @staticmethod
+    def _validate_fdr_options(opt):
+        if opt.fdr_num_bins < 2:
+            raise ValueError("--fdr_num_bins must be >= 2.")
+        if opt.fdr_reg_scale <= 0:
+            raise ValueError("--fdr_reg_scale must be > 0.")
+        if opt.fdr_min_ref_width <= 0:
+            opt.fdr_min_ref_width = 1.0 / float(opt.max_v_l)
+        if opt.fgl_loss_coef is not None and opt.fgl_loss_coef < 0:
+            raise ValueError("--fgl_loss_coef must be >= 0.")
 
 
 class TestOptions(BaseOptions):

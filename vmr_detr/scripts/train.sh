@@ -3,7 +3,7 @@ ctx_mode=video_tef
 v_feat_types=slowfast_clip
 t_feat_types=clip
 results_root=results
-exp_id=exp_nepoch_100_slowfast_clip_late_gated_clip_scale03_multiscale_contrastive_dfl_tal
+exp_id=exp_nepoch_100_slowfast_clip_late_gated_clip_scale03_multiscale_contrastive_fdr_fgl_tal
 
 ######## data paths
 train_path=/content/drive/MyDrive/Master/Thesis/QD-DETR-Old/data/charades-sta/train.jsonl
@@ -46,23 +46,29 @@ bsz=32
 eval_bsz=32
 n_epoch=100
 clip_length=1
-span_loss_type=dfl
+span_loss_type=fdr
 dfl_num_bins=32
 dfl_ref_prior_sigma=4.0
+fdr_num_bins=32
+fdr_reg_scale=1.5
+fdr_min_ref_width=-1.0
 span_loss_coef=1.0
+fgl_loss_coef=2.0
+giou_loss_coef=3.0
 contrastive_align_loss_coef=0.3
 contrastive_start_epoch=10
 contrastive_decay_epoch=40
 contrastive_decay_coef=0.1
 aux_matching_type=hungarian
-matching_type=tal
+matching_type=hungarian
 tal_topk=1
 tal_alpha=0.5
 tal_beta=6.0
 best_metric=MR-full-R1@0.5+0.7
 dec_layers=3
 enc_layers=3
-lr=2e-04
+lr=1.67e-04
+wd=1e-5
 lr_drop=100
 lr_scheduler=linear
 lrf=0.01
@@ -91,7 +97,12 @@ PYTHONPATH=$PYTHONPATH:. python vmr_detr/cli/train.py \
 --span_loss_type ${span_loss_type} \
 --dfl_num_bins ${dfl_num_bins} \
 --dfl_ref_prior_sigma ${dfl_ref_prior_sigma} \
+--fdr_num_bins ${fdr_num_bins} \
+--fdr_reg_scale ${fdr_reg_scale} \
+--fdr_min_ref_width ${fdr_min_ref_width} \
 --span_loss_coef ${span_loss_coef} \
+--fgl_loss_coef ${fgl_loss_coef} \
+--giou_loss_coef ${giou_loss_coef} \
 --contrastive_align_loss \
 --contrastive_align_loss_coef ${contrastive_align_loss_coef} \
 --contrastive_start_epoch ${contrastive_start_epoch} \
@@ -111,6 +122,7 @@ PYTHONPATH=$PYTHONPATH:. python vmr_detr/cli/train.py \
 --lr_drop ${lr_drop} \
 --lr_scheduler ${lr_scheduler} \
 --lrf ${lrf} \
+--wd ${wd} \
 --exp_id ${exp_id} \
 --num_workers ${num_workers} \
 --eval_every_epoch_after ${eval_every_epoch_after} \

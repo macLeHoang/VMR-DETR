@@ -84,7 +84,7 @@ class HungarianMatcher(nn.Module):
         # The 1 is a constant that doesn't change the matching, it can be omitted.
         cost_class = -out_prob[:, tgt_ids]  # [batch_size * num_queries, total #spans in the batch]
 
-        if self.span_loss_type in ("l1", "dfl"):
+        if self.span_loss_type in ("l1", "dfl", "fdr"):
             # We flatten to compute the cost matrices in a batch
             out_spans = outputs["pred_spans"].flatten(0, 1)  # [batch_size * num_queries, 2]
 
@@ -205,8 +205,8 @@ class TaskAlignedMatcher(nn.Module):
     def __init__(self, span_loss_type: str = "l1", max_v_l: int = 75,
                  topk: int = 2, alpha: float = 1.0, beta: float = 6.0):
         super().__init__()
-        if span_loss_type not in ("l1", "dfl"):
-            raise ValueError("TaskAlignedMatcher requires span_loss_type to be 'l1' or 'dfl'.")
+        if span_loss_type not in ("l1", "dfl", "fdr"):
+            raise ValueError("TaskAlignedMatcher requires span_loss_type to be 'l1', 'dfl', or 'fdr'.")
         if topk < 1:
             raise ValueError("topk must be >= 1 for task-aligned matching")
         if alpha < 0 or beta < 0:

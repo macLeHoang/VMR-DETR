@@ -274,7 +274,7 @@ class StartEndDataset(Dataset):
         if len(windows) > self.max_windows:
             random.shuffle(windows)
             windows = windows[:self.max_windows]
-        if self.span_loss_type in ("l1", "dfl"):
+        if self.span_loss_type in ("l1", "dfl", "fdr"):
             windows = torch.Tensor(windows) / (ctx_l * self.clip_len)  # normalized windows in xx
             windows = span_xx_to_cxw(windows)  # normalized windows in cxw
         elif self.span_loss_type == "ce":

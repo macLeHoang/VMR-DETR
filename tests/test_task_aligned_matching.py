@@ -3,7 +3,7 @@ import unittest
 import torch
 
 from vmr_detr.modeling.matcher import HungarianMatcher, TaskAlignedMatcher
-from vmr_detr.modeling.model import SetCriterion
+from vmr_detr.modeling.model import SetCriterion, fdr_logits_to_spans, fdr_offset_support
 from vmr_detr.ops.span_utils import span_xx_to_cxw
 
 
@@ -75,6 +75,19 @@ class TaskAlignedMatcherTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "span_loss_type"):
             TaskAlignedMatcher(span_loss_type="ce")
 
+    def test_accepts_fdr_spans(self):
+        matcher = TaskAlignedMatcher(span_loss_type="fdr", topk=1)
+        outputs = {
+            "pred_logits": _logits_from_fg_scores([0.80]).unsqueeze(0),
+            "pred_spans": _cxw([[0.4, 0.6]]).unsqueeze(0),
+        }
+        targets = {"span_labels": [dict(spans=_cxw([[0.4, 0.6]]))]}
+
+        indices = matcher(outputs, targets)
+
+        self.assertEqual(indices[0][0].tolist(), [0])
+        self.assertEqual(indices[0][1].tolist(), [0])
+
 
 class TaskAlignedCriterionTest(unittest.TestCase):
     def _criterion(self, matcher, matching_type):
@@ -136,6 +149,97 @@ class TaskAlignedCriterionTest(unittest.TestCase):
                 max_v_l=75,
                 matching_type="tal",
             )
+
+
+class TemporalFDRTest(unittest.TestCase):
+    def test_support_is_symmetric_sorted_and_dense_near_zero(self):
+        support = fdr_offset_support(32, 1.5)
+
+        self.assertEqual(support.numel(), 32)
+        self.assertTrue(torch.all(support[1:] > support[:-1]))
+        self.assertTrue(torch.allclose(support, -support.flip(0), atol=1e-6))
+        center_gap = support[16] - support[15]
+        edge_gap = support[-1] - support[-2]
+        self.assertLess(center_gap, edge_gap)
+
+    def test_zero_logits_decode_to_reference_span(self):
+        refs = _cxw([[0.25, 0.75]]).unsqueeze(0)
+        logits = torch.zeros(1, 1, 64)
+
+        pred = fdr_logits_to_spans(logits, refs, 32, 1.5, 1.0 / 75)
+
+        self.assertTrue(torch.allclose(pred, refs, atol=1e-6))
+
+    def test_boundary_offsets_expand_reference_span(self):
+        refs = _cxw([[0.4, 0.6]]).unsqueeze(0)
+        logits = torch.zeros(1, 1, 2, 32)
+        logits[..., 0, 0] = 20.0
+        logits[..., 1, -1] = 20.0
+
+        pred = fdr_logits_to_spans(logits.reshape(1, 1, 64), refs, 32, 1.5, 1.0 / 75)
+        pred_xx = pred[..., 0] - pred[..., 1] * 0.5, pred[..., 0] + pred[..., 1] * 0.5
+
+        self.assertLess(pred_xx[0].item(), 0.4)
+        self.assertGreater(pred_xx[1].item(), 0.6)
+
+    def test_fdr_criterion_returns_finite_losses_and_backpropagates(self):
+        fdr_num_bins = 32
+        refs = _cxw([[0.3, 0.7]]).unsqueeze(0)
+        pred_logits = torch.zeros(1, 1, 2 * fdr_num_bins, requires_grad=True)
+        pred_spans = fdr_logits_to_spans(pred_logits, refs, fdr_num_bins, 1.5, 1.0 / 75)
+        outputs = {
+            "pred_logits": _logits_from_fg_scores([0.80]).unsqueeze(0).requires_grad_(),
+            "pred_spans": pred_spans,
+            "pred_span_logits": pred_logits,
+            "pred_span_refs": refs,
+        }
+        targets = {"span_labels": [dict(spans=_cxw([[0.28, 0.72]]))]}
+        criterion = SetCriterion(
+            matcher=HungarianMatcher(span_loss_type="fdr"),
+            weight_dict={"loss_fgl": 1.0, "loss_giou": 1.0, "loss_label": 1.0},
+            eos_coef=0.1,
+            losses=["spans", "labels"],
+            temperature=0.07,
+            span_loss_type="fdr",
+            max_v_l=75,
+            fdr_num_bins=fdr_num_bins,
+            fdr_reg_scale=1.5,
+            fdr_min_ref_width=1.0 / 75,
+        )
+
+        losses = criterion(outputs, targets)
+        total_loss = losses["loss_fgl"] + losses["loss_giou"] + losses["loss_label"]
+        total_loss.backward()
+
+        self.assertIn("loss_fgl", losses)
+        self.assertIn("loss_giou", losses)
+        self.assertTrue(torch.isfinite(total_loss))
+        self.assertIsNotNone(pred_logits.grad)
+
+    def test_fdr_empty_targets_return_zero_finite_losses(self):
+        refs = _cxw([[0.3, 0.7]]).unsqueeze(0)
+        pred_logits = torch.zeros(1, 1, 64)
+        outputs = {
+            "pred_logits": _logits_from_fg_scores([0.80]).unsqueeze(0),
+            "pred_spans": fdr_logits_to_spans(pred_logits, refs, 32, 1.5, 1.0 / 75),
+            "pred_span_logits": pred_logits,
+            "pred_span_refs": refs,
+        }
+        targets = {"span_labels": [dict(spans=torch.empty(0, 2))]}
+        criterion = SetCriterion(
+            matcher=HungarianMatcher(span_loss_type="fdr"),
+            weight_dict={"loss_fgl": 1.0, "loss_giou": 1.0, "loss_label": 1.0},
+            eos_coef=0.1,
+            losses=["spans"],
+            temperature=0.07,
+            span_loss_type="fdr",
+            max_v_l=75,
+        )
+
+        losses = criterion(outputs, targets)
+
+        self.assertEqual(losses["loss_fgl"].item(), 0.0)
+        self.assertEqual(losses["loss_giou"].item(), 0.0)
 
 
 if __name__ == "__main__":

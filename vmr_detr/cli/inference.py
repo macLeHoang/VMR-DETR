@@ -205,7 +205,7 @@ def compute_mr_results(model, eval_loader, opt, epoch_i=None, criterion=None, tb
             model_inputs, targets = prepare_batch_inputs_audio(batch[1], opt.device, non_blocking=opt.pin_memory)
         outputs = model(**model_inputs)
         prob = F.softmax(outputs["pred_logits"], -1)  # (batch_size, #queries, #classes=2)
-        if opt.span_loss_type in ("l1", "dfl"):
+        if opt.span_loss_type in ("l1", "dfl", "fdr"):
             scores = prob[..., 0]  # * (batch_size, #queries)  foreground label is 0, we directly take it
             pred_spans = outputs["pred_spans"]  # (bsz, #queries, 2)
             _saliency_scores = outputs["saliency_scores"].half()  # (bsz, L)
@@ -224,7 +224,7 @@ def compute_mr_results(model, eval_loader, opt, epoch_i=None, criterion=None, tb
 
         # compose predictions
         for idx, (meta, spans, score) in enumerate(zip(query_meta, pred_spans.cpu(), scores.cpu())):
-            if opt.span_loss_type in ("l1", "dfl"):
+            if opt.span_loss_type in ("l1", "dfl", "fdr"):
                 spans = span_cxw_to_xx(spans) * meta["duration"]
             # # (#queries, 3), [st(float), ed(float), score(float)]
             cur_ranked_preds = torch.cat([spans, score[:, None]], dim=1).tolist()

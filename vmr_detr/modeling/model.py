@@ -47,6 +47,36 @@ def dfl_reference_prior_logits(reference_spans, dfl_num_bins, sigma):
     return prior.reshape(*reference_spans.shape[:-1], 2 * dfl_num_bins)
 
 
+def fdr_offset_support(num_bins, reg_scale, device=None, dtype=None):
+    """Symmetric non-uniform FDR offset bins, dense around zero."""
+    if num_bins < 2:
+        raise ValueError("num_bins must be >= 2.")
+    if reg_scale <= 0:
+        raise ValueError("reg_scale must be > 0.")
+    base = torch.linspace(-1.0, 1.0, num_bins, device=device, dtype=dtype)
+    return base.sign() * base.abs().pow(float(reg_scale))
+
+
+def fdr_logits_to_spans(span_logits, reference_spans, fdr_num_bins, fdr_reg_scale, fdr_min_ref_width):
+    """Decode residual start/end offset distributions around decoder references."""
+    if fdr_min_ref_width <= 0:
+        raise ValueError("fdr_min_ref_width must be > 0.")
+    logits = span_logits.reshape(*span_logits.shape[:-1], 2, fdr_num_bins)
+    prob = F.softmax(logits, dim=-1)
+    support = fdr_offset_support(
+        fdr_num_bins, fdr_reg_scale, device=prob.device, dtype=prob.dtype
+    )
+    offsets = (prob * support.view(*([1] * (prob.dim() - 1)), fdr_num_bins)).sum(dim=-1)
+
+    ref_xx = span_cxw_to_xx(reference_spans).clamp(0, 1)
+    ref_width = (ref_xx[..., 1] - ref_xx[..., 0]).clamp(min=fdr_min_ref_width)
+    pred_start = ref_xx[..., 0] + offsets[..., 0] * ref_width
+    pred_end = ref_xx[..., 1] + offsets[..., 1] * ref_width
+    start = torch.minimum(pred_start, pred_end).clamp(0, 1)
+    end = torch.maximum(pred_start, pred_end).clamp(0, 1)
+    return span_xx_to_cxw(torch.stack([start, end], dim=-1))
+
+
 class StreamTextConditionedEncoder(nn.Module):
     """Lightweight cross-attention block that conditions a video stream on text."""
 
@@ -139,7 +169,8 @@ class VMRDETR(nn.Module):
                  use_gated_video_fusion=False, use_late_gated_video_fusion=False,
                  slowfast_dim=2304, clip_dim=512, tef_dim=2, dropout=0.1, dim_feedforward=None,
                  use_multiscale_stream_adapter=False, multiscale_adapter_dropout=0.1,
-                 dfl_num_bins=16, dfl_ref_prior_sigma=2.0):
+                 dfl_num_bins=16, dfl_ref_prior_sigma=2.0,
+                 fdr_num_bins=32, fdr_reg_scale=1.5, fdr_min_ref_width=None):
         """ Initializes the model.
         Parameters:
             transformer: torch module of the transformer architecture. See transformer.py
@@ -155,10 +186,11 @@ class VMRDETR(nn.Module):
             max_v_l: int, maximum #clips in videos
             dfl_num_bins: int, number of boundary distribution bins for dfl spans.
             dfl_ref_prior_sigma: float, Gaussian prior sigma in DFL bins.
-            span_loss_type: str, one of [l1, ce, dfl]
+            span_loss_type: str, one of [l1, ce, dfl, fdr]
                 l1: (center-x, width) regression.
                 ce: (st_idx, ed_idx) classification.
                 dfl: start/end boundary distributions with expectation decoding.
+                fdr: residual start/end boundary-offset distributions around decoder references.
             # foreground_thd: float, intersection over prediction >= foreground_thd: labeled as foreground
             # background_thd: float, intersection over prediction <= background_thd: labeled background
         """
@@ -176,10 +208,23 @@ class VMRDETR(nn.Module):
             raise ValueError("dfl_ref_prior_sigma must be > 0.")
         self.dfl_num_bins = dfl_num_bins
         self.dfl_ref_prior_sigma = dfl_ref_prior_sigma
+        if fdr_num_bins < 2:
+            raise ValueError("fdr_num_bins must be >= 2.")
+        if fdr_reg_scale <= 0:
+            raise ValueError("fdr_reg_scale must be > 0.")
+        if fdr_min_ref_width is None:
+            fdr_min_ref_width = 1.0 / float(max_v_l)
+        if fdr_min_ref_width <= 0:
+            raise ValueError("fdr_min_ref_width must be > 0.")
+        self.fdr_num_bins = fdr_num_bins
+        self.fdr_reg_scale = fdr_reg_scale
+        self.fdr_min_ref_width = fdr_min_ref_width
         if span_loss_type == "l1":
             span_pred_dim = 2
         elif span_loss_type == "dfl":
             span_pred_dim = 2 * dfl_num_bins
+        elif span_loss_type == "fdr":
+            span_pred_dim = 2 * fdr_num_bins
         else:
             span_pred_dim = max_v_l * 2
         self.span_embed = MLP(hidden_dim, hidden_dim, span_pred_dim, 3)
@@ -391,18 +436,33 @@ class VMRDETR(nn.Module):
             outputs_coord = tmp + reference_before_sigmoid
             outputs_coord = outputs_coord.sigmoid()
             outputs_span_logits = None
+            outputs_span_refs = None
         elif self.span_loss_type == "dfl":
             reference_prior_logits = dfl_reference_prior_logits(
                 reference, self.dfl_num_bins, self.dfl_ref_prior_sigma
             )
             outputs_span_logits = tmp + reference_prior_logits
             outputs_coord = dfl_logits_to_spans(outputs_span_logits, self.dfl_num_bins)
+            outputs_span_refs = None
+        elif self.span_loss_type == "fdr":
+            outputs_span_logits = torch.cumsum(tmp, dim=0)
+            outputs_coord = fdr_logits_to_spans(
+                outputs_span_logits,
+                reference,
+                self.fdr_num_bins,
+                self.fdr_reg_scale,
+                self.fdr_min_ref_width,
+            )
+            outputs_span_refs = reference
         else:
             outputs_coord = tmp
             outputs_span_logits = None
+            outputs_span_refs = None
         out = {'pred_logits': outputs_class[-1], 'pred_spans': outputs_coord[-1]}
         if outputs_span_logits is not None:
             out["pred_span_logits"] = outputs_span_logits[-1]
+        if outputs_span_refs is not None:
+            out["pred_span_refs"] = outputs_span_refs[-1]
 
         if self.contrastive_align_loss:
             proj_queries = F.normalize(self.contrastive_align_projection_query(hs), p=2, dim=-1)
@@ -435,7 +495,14 @@ class VMRDETR(nn.Module):
         # print(src_vid_mask.shape, src_vid.shape, vid_mem_neg.shape, vid_mem.shape)
         out["video_mask"] = src_vid_mask
         if self.aux_loss:
-            if outputs_span_logits is not None:
+            if outputs_span_refs is not None:
+                out['aux_outputs'] = [
+                    {'pred_logits': a, 'pred_spans': b, 'pred_span_logits': c, 'pred_span_refs': d}
+                    for a, b, c, d in zip(
+                        outputs_class[:-1], outputs_coord[:-1],
+                        outputs_span_logits[:-1], outputs_span_refs[:-1]
+                    )]
+            elif outputs_span_logits is not None:
                 out['aux_outputs'] = [
                     {'pred_logits': a, 'pred_spans': b, 'pred_span_logits': c}
                     for a, b, c in zip(outputs_class[:-1], outputs_coord[:-1], outputs_span_logits[:-1])]
@@ -462,6 +529,7 @@ class SetCriterion(nn.Module):
 
     def __init__(self, matcher, weight_dict, eos_coef, losses, temperature, span_loss_type, max_v_l,
                  dfl_num_bins=16,
+                 fdr_num_bins=32, fdr_reg_scale=1.5, fdr_min_ref_width=None,
                  saliency_margin=1, use_matcher=True, contrastive_start_epoch=0,
                  contrastive_decay_epoch=-1, contrastive_decay_coef=0.0,
                  aux_matcher=None, aux_matching_type="hungarian",
@@ -473,9 +541,12 @@ class SetCriterion(nn.Module):
             eos_coef: relative classification weight applied to the no-object category
             losses: list of all the losses to be applied. See get_loss for list of available losses.
             temperature: float, temperature for NCE loss
-            span_loss_type: str, [l1, ce, dfl]
+            span_loss_type: str, [l1, ce, dfl, fdr]
             max_v_l: int,
             dfl_num_bins: int,
+            fdr_num_bins: int,
+            fdr_reg_scale: float,
+            fdr_min_ref_width: float
             saliency_margin: float
         """
         super().__init__()
@@ -490,8 +561,8 @@ class SetCriterion(nn.Module):
         self.temperature = temperature
         self.span_loss_type = span_loss_type
         self.max_v_l = max_v_l
-        if self.matching_type == "tal" and self.span_loss_type not in ("l1", "dfl"):
-            raise ValueError("TAL matching requires span_loss_type to be 'l1' or 'dfl'.")
+        if self.matching_type == "tal" and self.span_loss_type not in ("l1", "dfl", "fdr"):
+            raise ValueError("TAL matching requires span_loss_type to be 'l1', 'dfl', or 'fdr'.")
         if tal_alpha < 0 or tal_beta < 0:
             raise ValueError("tal_alpha and tal_beta must be non-negative.")
         self.tal_alpha = tal_alpha
@@ -499,6 +570,17 @@ class SetCriterion(nn.Module):
         if dfl_num_bins < 2:
             raise ValueError("dfl_num_bins must be >= 2.")
         self.dfl_num_bins = dfl_num_bins
+        if fdr_num_bins < 2:
+            raise ValueError("fdr_num_bins must be >= 2.")
+        if fdr_reg_scale <= 0:
+            raise ValueError("fdr_reg_scale must be > 0.")
+        if fdr_min_ref_width is None:
+            fdr_min_ref_width = 1.0 / float(max_v_l)
+        if fdr_min_ref_width <= 0:
+            raise ValueError("fdr_min_ref_width must be > 0.")
+        self.fdr_num_bins = fdr_num_bins
+        self.fdr_reg_scale = fdr_reg_scale
+        self.fdr_min_ref_width = fdr_min_ref_width
         self.saliency_margin = saliency_margin
 
         # foreground and background classification
@@ -556,6 +638,50 @@ class SetCriterion(nn.Module):
         loss = loss_left * weight_left + loss_right * weight_right
         return (loss / float(np.log(num_bins))).view(n_spans, 2)
 
+    def _fdr_offset_targets(self, src_span_refs, tgt_spans):
+        ref_xx = span_cxw_to_xx(src_span_refs).clamp(0, 1)
+        tgt_xx = span_cxw_to_xx(tgt_spans).clamp(0, 1)
+        ref_width = (ref_xx[:, 1] - ref_xx[:, 0]).clamp(min=self.fdr_min_ref_width)
+        target_offsets = torch.stack([
+            (tgt_xx[:, 0] - ref_xx[:, 0]) / ref_width,
+            (tgt_xx[:, 1] - ref_xx[:, 1]) / ref_width,
+        ], dim=-1)
+
+        support = fdr_offset_support(
+            self.fdr_num_bins,
+            self.fdr_reg_scale,
+            device=target_offsets.device,
+            dtype=target_offsets.dtype,
+        )
+        flat_offsets = target_offsets.reshape(-1).clamp(min=support[0].item(), max=support[-1].item())
+        target_right = torch.searchsorted(support, flat_offsets).clamp(min=1, max=self.fdr_num_bins - 1)
+        target_left = target_right - 1
+        left_values = support[target_left]
+        right_values = support[target_right]
+        denom = (right_values - left_values).clamp(min=1e-6)
+        weight_right = (flat_offsets - left_values) / denom
+        weight_left = 1.0 - weight_right
+        return target_left, target_right, weight_left, weight_right
+
+    def _loss_fgl(self, src_span_logits, src_span_refs, src_spans, tgt_spans):
+        n_spans = src_span_logits.shape[0]
+        logits = src_span_logits.reshape(n_spans, 2, self.fdr_num_bins).reshape(-1, self.fdr_num_bins)
+        target_left, target_right, weight_left, weight_right = self._fdr_offset_targets(
+            src_span_refs.detach(), tgt_spans
+        )
+
+        loss_left = F.cross_entropy(logits, target_left, reduction='none')
+        loss_right = F.cross_entropy(logits, target_right, reduction='none')
+        loss = loss_left * weight_left + loss_right * weight_right
+
+        with torch.no_grad():
+            ious = torch.diag(
+                temporal_iou(span_cxw_to_xx(src_spans), span_cxw_to_xx(tgt_spans))[0]
+            ).clamp(0, 1)
+            weights = ious.unsqueeze(-1).expand(-1, 2).reshape(-1)
+        loss = loss * weights
+        return (loss / float(np.log(self.fdr_num_bins))).view(n_spans, 2)
+
     def loss_spans(self, outputs, targets, indices):
         """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
            targets dicts must contain the key "spans" containing a tensor of dim [nb_tgt_spans, 2]
@@ -567,6 +693,8 @@ class SetCriterion(nn.Module):
             zero = outputs["pred_spans"].sum() * 0
             if "pred_span_logits" in outputs:
                 zero = zero + outputs["pred_span_logits"].sum() * 0
+            if self.span_loss_type == "fdr":
+                return {"loss_fgl": zero, "loss_giou": zero}
             return {"loss_span": zero, "loss_giou": zero}
 
         idx = self._get_src_permutation_idx(indices)
@@ -578,6 +706,11 @@ class SetCriterion(nn.Module):
         elif self.span_loss_type == "dfl":
             src_span_logits = outputs['pred_span_logits'][idx]
             loss_span = self._loss_dfl(src_span_logits, tgt_spans)
+            loss_giou = 1 - torch.diag(generalized_temporal_iou(span_cxw_to_xx(src_spans), span_cxw_to_xx(tgt_spans)))
+        elif self.span_loss_type == "fdr":
+            src_span_logits = outputs['pred_span_logits'][idx]
+            src_span_refs = outputs['pred_span_refs'][idx]
+            loss_fgl = self._loss_fgl(src_span_logits, src_span_refs, src_spans, tgt_spans)
             loss_giou = 1 - torch.diag(generalized_temporal_iou(span_cxw_to_xx(src_spans), span_cxw_to_xx(tgt_spans)))
         else:  # ce
             n_spans = src_spans.shape[0]
@@ -594,7 +727,10 @@ class SetCriterion(nn.Module):
             loss_giou = loss_span.new_zeros([1])
 
         losses = {}
-        losses['loss_span'] = loss_span.mean()
+        if self.span_loss_type == "fdr":
+            losses['loss_fgl'] = loss_fgl.mean()
+        else:
+            losses['loss_span'] = loss_span.mean()
         losses['loss_giou'] = loss_giou.mean()
         return losses
 
@@ -928,6 +1064,11 @@ def build_model(args):
     position_embedding, txt_position_embedding = build_position_encoding(args)
     dfl_num_bins = getattr(args, "dfl_num_bins", 16)
     dfl_ref_prior_sigma = getattr(args, "dfl_ref_prior_sigma", 2.0)
+    fdr_num_bins = getattr(args, "fdr_num_bins", 32)
+    fdr_reg_scale = getattr(args, "fdr_reg_scale", 1.5)
+    fdr_min_ref_width = getattr(args, "fdr_min_ref_width", None)
+    if fdr_min_ref_width is not None and fdr_min_ref_width <= 0:
+        fdr_min_ref_width = 1.0 / float(args.max_v_l)
 
     if args.a_feat_dir is None:
         model = VMRDETR(
@@ -945,6 +1086,9 @@ def build_model(args):
             span_loss_type=args.span_loss_type,
             dfl_num_bins=dfl_num_bins,
             dfl_ref_prior_sigma=dfl_ref_prior_sigma,
+            fdr_num_bins=fdr_num_bins,
+            fdr_reg_scale=fdr_reg_scale,
+            fdr_min_ref_width=fdr_min_ref_width,
             use_txt_pos=args.use_txt_pos,
             n_input_proj=args.n_input_proj,
             use_gated_video_fusion=args.use_gated_video_fusion,
@@ -974,6 +1118,9 @@ def build_model(args):
             span_loss_type=args.span_loss_type,
             dfl_num_bins=dfl_num_bins,
             dfl_ref_prior_sigma=dfl_ref_prior_sigma,
+            fdr_num_bins=fdr_num_bins,
+            fdr_reg_scale=fdr_reg_scale,
+            fdr_min_ref_width=fdr_min_ref_width,
             use_txt_pos=args.use_txt_pos,
             n_input_proj=args.n_input_proj,
             use_gated_video_fusion=args.use_gated_video_fusion,
@@ -991,7 +1138,13 @@ def build_model(args):
     matcher = build_matcher(args)
     aux_matching_type = getattr(args, "aux_matching_type", "hungarian")
     aux_matcher = build_one_to_many_matcher(args) if aux_matching_type == "one_to_many" else build_hungarian_matcher(args)
-    weight_dict = {"loss_span": args.span_loss_coef,
+    span_loss_key = "loss_fgl" if args.span_loss_type == "fdr" else "loss_span"
+    span_loss_coef = (
+        args.span_loss_coef
+        if span_loss_key == "loss_span" or getattr(args, "fgl_loss_coef", None) is None
+        else args.fgl_loss_coef
+    )
+    weight_dict = {span_loss_key: span_loss_coef,
                    "loss_giou": args.giou_loss_coef,
                    "loss_label": args.label_loss_coef,
                    "loss_saliency": args.lw_saliency}
@@ -1019,6 +1172,9 @@ def build_model(args):
         eos_coef=args.eos_coef, temperature=args.temperature,
         span_loss_type=args.span_loss_type, max_v_l=args.max_v_l,
         dfl_num_bins=dfl_num_bins,
+        fdr_num_bins=fdr_num_bins,
+        fdr_reg_scale=fdr_reg_scale,
+        fdr_min_ref_width=fdr_min_ref_width,
         saliency_margin=args.saliency_margin, use_matcher=use_matcher,
         contrastive_start_epoch=args.contrastive_start_epoch,
         contrastive_decay_epoch=args.contrastive_decay_epoch,
