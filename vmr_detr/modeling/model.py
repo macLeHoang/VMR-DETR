@@ -77,6 +77,21 @@ def fdr_logits_to_spans(span_logits, reference_spans, fdr_num_bins, fdr_reg_scal
     return span_xx_to_cxw(torch.stack([start, end], dim=-1))
 
 
+def _decode_fdr_cumulative_outputs(span_delta_logits, reference_spans, fdr_num_bins,
+                                   fdr_reg_scale, fdr_min_ref_width):
+    """Decode cumulative FDR logits against the initial decoder reference."""
+    span_logits = torch.cumsum(span_delta_logits, dim=0)
+    initial_reference = reference_spans[:1].expand_as(reference_spans)
+    spans = fdr_logits_to_spans(
+        span_logits,
+        initial_reference,
+        fdr_num_bins,
+        fdr_reg_scale,
+        fdr_min_ref_width,
+    )
+    return span_logits, spans, initial_reference
+
+
 class StreamTextConditionedEncoder(nn.Module):
     """Lightweight cross-attention block that conditions a video stream on text."""
 
@@ -228,6 +243,9 @@ class VMRDETR(nn.Module):
         else:
             span_pred_dim = max_v_l * 2
         self.span_embed = MLP(hidden_dim, hidden_dim, span_pred_dim, 3)
+        if span_loss_type == "fdr":
+            nn.init.constant_(self.span_embed.layers[-1].weight, 0)
+            nn.init.constant_(self.span_embed.layers[-1].bias, 0)
         self.class_embed = nn.Linear(hidden_dim, 2)  # 0: foreground, 1: background
         self.use_txt_pos = use_txt_pos
         self.n_input_proj = n_input_proj
@@ -445,15 +463,13 @@ class VMRDETR(nn.Module):
             outputs_coord = dfl_logits_to_spans(outputs_span_logits, self.dfl_num_bins)
             outputs_span_refs = None
         elif self.span_loss_type == "fdr":
-            outputs_span_logits = torch.cumsum(tmp, dim=0)
-            outputs_coord = fdr_logits_to_spans(
-                outputs_span_logits,
+            outputs_span_logits, outputs_coord, outputs_span_refs = _decode_fdr_cumulative_outputs(
+                tmp,
                 reference,
                 self.fdr_num_bins,
                 self.fdr_reg_scale,
                 self.fdr_min_ref_width,
             )
-            outputs_span_refs = reference
         else:
             outputs_coord = tmp
             outputs_span_logits = None
@@ -533,7 +549,10 @@ class SetCriterion(nn.Module):
                  saliency_margin=1, use_matcher=True, contrastive_start_epoch=0,
                  contrastive_decay_epoch=-1, contrastive_decay_coef=0.0,
                  aux_matcher=None, aux_matching_type="hungarian",
-                 matching_type="hungarian", tal_alpha=1.0, tal_beta=6.0):
+                 matching_type="hungarian", tal_alpha=1.0, tal_beta=6.0,
+                 width_loss_type="none",
+                 quality_label_loss=False, quality_label_strength=0.5,
+                 quality_label_warmup_epoch=10, quality_label_ramp_epoch=30):
         """ Create the criterion.
         Parameters:
             matcher: module able to compute a matching between targets and proposals
@@ -548,11 +567,27 @@ class SetCriterion(nn.Module):
             fdr_reg_scale: float,
             fdr_min_ref_width: float
             saliency_margin: float
+            width_loss_type: str, one of [none, l1, log]
+            quality_label_loss: bool, use matched IoU as Hungarian foreground target
+            quality_label_strength: float, strength for softening matched IoU targets
         """
         super().__init__()
         self.matcher = matcher
         assert aux_matching_type in ("hungarian", "one_to_many")
         assert matching_type in ("hungarian", "tal")
+        assert width_loss_type in ("none", "l1", "log")
+        if width_loss_type != "none" and span_loss_type not in ("l1", "dfl", "fdr"):
+            raise ValueError("width_loss_type l1/log requires span_loss_type to be 'l1', 'dfl', or 'fdr'.")
+        if quality_label_warmup_epoch < 0:
+            raise ValueError("quality_label_warmup_epoch must be >= 0.")
+        if quality_label_ramp_epoch < quality_label_warmup_epoch:
+            raise ValueError("quality_label_ramp_epoch must be >= quality_label_warmup_epoch.")
+        if quality_label_strength < 0 or quality_label_strength > 1:
+            raise ValueError("quality_label_strength must be in [0, 1].")
+        if quality_label_loss and matching_type != "hungarian":
+            raise ValueError("quality_label_loss is only supported with Hungarian matching.")
+        if quality_label_loss and span_loss_type not in ("l1", "dfl", "fdr"):
+            raise ValueError("quality_label_loss requires span_loss_type to be 'l1', 'dfl', or 'fdr'.")
         self.aux_matching_type = aux_matching_type
         self.aux_matcher = aux_matcher or matcher
         self.matching_type = matching_type
@@ -561,6 +596,11 @@ class SetCriterion(nn.Module):
         self.temperature = temperature
         self.span_loss_type = span_loss_type
         self.max_v_l = max_v_l
+        self.width_loss_type = width_loss_type
+        self.quality_label_loss = quality_label_loss
+        self.quality_label_strength = quality_label_strength
+        self.quality_label_warmup_epoch = quality_label_warmup_epoch
+        self.quality_label_ramp_epoch = quality_label_ramp_epoch
         if self.matching_type == "tal" and self.span_loss_type not in ("l1", "dfl", "fdr"):
             raise ValueError("TAL matching requires span_loss_type to be 'l1', 'dfl', or 'fdr'.")
         if tal_alpha < 0 or tal_beta < 0:
@@ -682,6 +722,18 @@ class SetCriterion(nn.Module):
         loss = loss * weights
         return (loss / float(np.log(self.fdr_num_bins))).view(n_spans, 2)
 
+    def _loss_width(self, src_spans, tgt_spans):
+        pred_width = src_spans[:, 1]
+        tgt_width = tgt_spans[:, 1]
+        if self.width_loss_type == "l1":
+            return F.l1_loss(pred_width, tgt_width, reduction='none')
+        if self.width_loss_type == "log":
+            eps = 1.0 / float(self.max_v_l)
+            pred_width = pred_width.clamp(min=eps)
+            tgt_width = tgt_width.clamp(min=eps)
+            return F.l1_loss(pred_width.log(), tgt_width.log(), reduction='none')
+        raise ValueError(f"Unsupported width_loss_type: {self.width_loss_type}")
+
     def loss_spans(self, outputs, targets, indices):
         """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
            targets dicts must contain the key "spans" containing a tensor of dim [nb_tgt_spans, 2]
@@ -694,8 +746,12 @@ class SetCriterion(nn.Module):
             if "pred_span_logits" in outputs:
                 zero = zero + outputs["pred_span_logits"].sum() * 0
             if self.span_loss_type == "fdr":
-                return {"loss_fgl": zero, "loss_giou": zero}
-            return {"loss_span": zero, "loss_giou": zero}
+                losses = {"loss_fgl": zero, "loss_giou": zero}
+            else:
+                losses = {"loss_span": zero, "loss_giou": zero}
+            if self.width_loss_type != "none" and self.span_loss_type in ("l1", "dfl", "fdr"):
+                losses["loss_width"] = zero
+            return losses
 
         idx = self._get_src_permutation_idx(indices)
         src_spans = outputs['pred_spans'][idx]  # (#spans, max_v_l * 2)
@@ -732,6 +788,8 @@ class SetCriterion(nn.Module):
         else:
             losses['loss_span'] = loss_span.mean()
         losses['loss_giou'] = loss_giou.mean()
+        if self.width_loss_type != "none" and self.span_loss_type in ("l1", "dfl", "fdr"):
+            losses['loss_width'] = self._loss_width(src_spans, tgt_spans).mean()
         return losses
 
     def _tal_quality_targets(self, outputs, targets, indices):
@@ -747,7 +805,7 @@ class SetCriterion(nn.Module):
                     continue
                 src_idx = src_idx.to(src_logits.device)
                 tgt_idx = tgt_idx.to(src_logits.device)
-                tgt_spans = targets[batch_idx]["spans"]
+                tgt_spans = targets[batch_idx]["spans"].to(src_logits.device)
                 tgt_spans_xx = span_cxw_to_xx(tgt_spans)
                 ious = temporal_iou(pred_spans_xx[batch_idx], tgt_spans_xx)[0].clamp(min=0)
                 alignment = pred_scores[batch_idx].unsqueeze(1).pow(self.tal_alpha) * ious.pow(self.tal_beta)
@@ -780,7 +838,58 @@ class SetCriterion(nn.Module):
             losses['class_error'] = src_logits.new_tensor(100.)
         return losses
 
-    def loss_labels(self, outputs, targets, indices, log=True, matching_type=None):
+    def _quality_label_ramp(self):
+        if self.current_epoch < self.quality_label_warmup_epoch:
+            return 0.0
+        if self.current_epoch >= self.quality_label_ramp_epoch:
+            return 1.0
+        denom = max(1, self.quality_label_ramp_epoch - self.quality_label_warmup_epoch)
+        return float(self.current_epoch - self.quality_label_warmup_epoch) / float(denom)
+
+    def _hungarian_quality_targets(self, outputs, targets, indices):
+        src_logits = outputs['pred_logits']
+        target_quality = src_logits.new_zeros(src_logits.shape[:2])
+        targets = targets["span_labels"]
+        ramp = self._quality_label_ramp()
+
+        with torch.no_grad():
+            pred_spans_xx = span_cxw_to_xx(outputs["pred_spans"])
+            for batch_idx, (src_idx, tgt_idx) in enumerate(indices):
+                if len(src_idx) == 0:
+                    continue
+                src_idx = src_idx.to(src_logits.device)
+                tgt_idx = tgt_idx.to(src_logits.device)
+                tgt_spans = targets[batch_idx]["spans"].to(src_logits.device)
+                tgt_spans_xx = span_cxw_to_xx(tgt_spans)
+                matched_ious = torch.diag(
+                    temporal_iou(pred_spans_xx[batch_idx, src_idx], tgt_spans_xx[tgt_idx])[0]
+                ).clamp(0, 1)
+                target_quality[batch_idx, src_idx] = (
+                    1.0 - ramp * self.quality_label_strength * (1.0 - matched_ious)
+                )
+
+        return target_quality
+
+    def _loss_labels_hungarian_quality(self, outputs, targets, indices, log=True):
+        src_logits = outputs['pred_logits']
+        target_quality = self._hungarian_quality_targets(outputs, targets, indices)
+        fg_logits = src_logits[..., self.foreground_label] - src_logits[..., self.background_label]
+        loss_bce = F.binary_cross_entropy_with_logits(fg_logits, target_quality, reduction="none")
+        loss_weight = torch.full_like(target_quality, self.eos_coef)
+
+        idx = self._get_src_permutation_idx(indices)
+        if len(idx[0]) > 0:
+            loss_weight[idx] = 1.0
+        losses = {'loss_label': (loss_bce * loss_weight).mean()}
+
+        if log and len(idx[0]) > 0:
+            losses['class_error'] = 100 - accuracy(src_logits[idx], self.foreground_label)[0]
+        elif log:
+            losses['class_error'] = src_logits.new_tensor(100.)
+        return losses
+
+    def loss_labels(self, outputs, targets, indices, log=True, matching_type=None,
+                    use_quality_label_loss=None):
         """Classification loss (NLL)
         targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
         """
@@ -789,6 +898,10 @@ class SetCriterion(nn.Module):
         matching_type = self.matching_type if matching_type is None else matching_type
         if matching_type == "tal":
             return self._loss_labels_tal(outputs, targets, indices, log=log)
+        if use_quality_label_loss is None:
+            use_quality_label_loss = self.quality_label_loss
+        if use_quality_label_loss:
+            return self._loss_labels_hungarian_quality(outputs, targets, indices, log=log)
 
         src_logits = outputs['pred_logits']  # (batch_size, #queries, #classes=2)
         # idx is a tuple of two 1D tensors (batch_idx, src_idx), of the same length == #objects in batch
@@ -1003,6 +1116,7 @@ class SetCriterion(nn.Module):
                     kwargs = {}
                     if loss == "labels":
                         kwargs["matching_type"] = "hungarian"
+                        kwargs["use_quality_label_loss"] = False
                     l_dict = self.get_loss(loss, aux_outputs, targets, aux_indices, **kwargs)
                     l_dict = {k + f'_{i}': v for k, v in l_dict.items()}
                     losses.update(l_dict)
@@ -1148,6 +1262,10 @@ def build_model(args):
                    "loss_giou": args.giou_loss_coef,
                    "loss_label": args.label_loss_coef,
                    "loss_saliency": args.lw_saliency}
+    width_loss_type = getattr(args, "width_loss_type", "none")
+    width_loss_coef = getattr(args, "width_loss_coef", 0.0)
+    if width_loss_coef > 0 and width_loss_type != "none":
+        weight_dict["loss_width"] = width_loss_coef
     if args.contrastive_align_loss:
         weight_dict["loss_contrastive_align"] = args.contrastive_align_loss_coef
     # TODO this is a hack
@@ -1184,6 +1302,11 @@ def build_model(args):
         matching_type=matching_type,
         tal_alpha=getattr(args, "tal_alpha", 1.0),
         tal_beta=getattr(args, "tal_beta", 6.0),
+        width_loss_type=width_loss_type if width_loss_coef > 0 else "none",
+        quality_label_loss=getattr(args, "quality_label_loss", False),
+        quality_label_strength=getattr(args, "quality_label_strength", 0.5),
+        quality_label_warmup_epoch=getattr(args, "quality_label_warmup_epoch", 10),
+        quality_label_ramp_epoch=getattr(args, "quality_label_ramp_epoch", 30),
     )
     criterion.to(device)
     return model, criterion

@@ -203,7 +203,20 @@ class BaseOptions(object):
         parser.add_argument("--fgl_loss_coef", default=None, type=float,
                             help="FGL loss weight for --span_loss_type fdr. Defaults to span_loss_coef.")
         parser.add_argument('--giou_loss_coef', default=1, type=float)
+        parser.add_argument("--width_loss_coef", default=0.0, type=float,
+                            help="Optional width regularization loss weight.")
+        parser.add_argument("--width_loss_type", default="log", choices=["none", "l1", "log"],
+                            help="Width regularization type. 'log' penalizes relative width errors.")
         parser.add_argument('--label_loss_coef', default=4, type=float)
+        parser.add_argument("--quality_label_loss", action="store_true",
+                            help="Use softened matched IoU as the Hungarian foreground label target.")
+        parser.add_argument("--quality_label_strength", default=0.5, type=float,
+                            help="Strength for softening matched IoU label targets. 0 keeps hard positives; "
+                                 "1 uses raw IoU after ramp.")
+        parser.add_argument("--quality_label_warmup_epoch", default=10, type=int,
+                            help="Keep hard positive labels before this 1-based epoch.")
+        parser.add_argument("--quality_label_ramp_epoch", default=30, type=int,
+                            help="Finish ramping from hard labels to IoU targets at this 1-based epoch.")
         parser.add_argument('--eos_coef', default=0.1, type=float,
                             help="Relative classification weight of the no-object class")
         parser.add_argument("--contrastive_align_loss_coef", default=0.0, type=float)
@@ -328,6 +341,20 @@ class BaseOptions(object):
             opt.fdr_min_ref_width = 1.0 / float(opt.max_v_l)
         if opt.fgl_loss_coef is not None and opt.fgl_loss_coef < 0:
             raise ValueError("--fgl_loss_coef must be >= 0.")
+        if opt.width_loss_coef < 0:
+            raise ValueError("--width_loss_coef must be >= 0.")
+        if opt.width_loss_coef > 0 and opt.width_loss_type != "none" and opt.span_loss_type == "ce":
+            raise ValueError("--width_loss_type l1/log requires --span_loss_type l1, dfl, or fdr.")
+        if opt.quality_label_warmup_epoch < 0:
+            raise ValueError("--quality_label_warmup_epoch must be >= 0.")
+        if opt.quality_label_ramp_epoch < opt.quality_label_warmup_epoch:
+            raise ValueError("--quality_label_ramp_epoch must be >= --quality_label_warmup_epoch.")
+        if opt.quality_label_strength < 0 or opt.quality_label_strength > 1:
+            raise ValueError("--quality_label_strength must be in [0, 1].")
+        if opt.quality_label_loss and opt.matching_type != "hungarian":
+            raise ValueError("--quality_label_loss is only supported with --matching_type hungarian.")
+        if opt.quality_label_loss and opt.span_loss_type == "ce":
+            raise ValueError("--quality_label_loss requires --span_loss_type l1, dfl, or fdr.")
 
 
 class TestOptions(BaseOptions):
