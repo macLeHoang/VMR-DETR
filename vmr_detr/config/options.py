@@ -202,6 +202,38 @@ class BaseOptions(object):
         parser.add_argument('--span_loss_coef', default=10, type=float)
         parser.add_argument("--fgl_loss_coef", default=None, type=float,
                             help="FGL loss weight for --span_loss_type fdr. Defaults to span_loss_coef.")
+        parser.add_argument("--go_lsd_loss_coef", default=0.0, type=float,
+                            help="GO-LSD/DDF self-distillation weight for FDR auxiliary decoder layers.")
+        parser.add_argument("--go_lsd_temperature", default=2.0, type=float,
+                            help="Temperature for GO-LSD distribution KL.")
+        parser.add_argument("--go_lsd_start_epoch", default=0, type=int,
+                            help="1-based epoch to start GO-LSD. 0 enables it from the beginning.")
+        parser.add_argument("--pairwise_rank_loss_coef", default=0.0, type=float,
+                            help="Weight for length-aware pairwise query ranking loss. 0 disables it.")
+        parser.add_argument("--pairwise_rank_iou_margin", default=0.1, type=float,
+                            help="Minimum length-aware quality gap required to rank a query pair.")
+        parser.add_argument("--pairwise_rank_tau", default=0.2, type=float,
+                            help="Temperature for length-aware pairwise ranking softplus loss.")
+        parser.add_argument("--pairwise_rank_length_lambda", default=0.5, type=float,
+                            help="Strength of the log-width penalty inside length-aware quality.")
+        parser.add_argument("--pairwise_rank_min_quality", default=0.0, type=float,
+                            help="Minimum better-query quality for a valid pairwise ranking comparison.")
+        parser.add_argument("--pairwise_rank_topk", default=10, type=int,
+                            help="Compare only the top-K queries by foreground logit margin.")
+        parser.add_argument("--pairwise_rank_start_epoch", default=5, type=int,
+                            help="1-based epoch to start pairwise ranking loss. 0 enables it from the beginning.")
+        parser.add_argument("--pairwise_rank_aux", action="store_true",
+                            help="Also apply pairwise ranking loss to auxiliary decoder outputs.")
+        parser.add_argument("--top1_rank_loss_coef", default=0.0, type=float,
+                            help="Weight for top1-focused query ranking loss. 0 disables it.")
+        parser.add_argument("--top1_rank_quality_margin", default=0.15, type=float,
+                            help="Minimum length-aware quality gap between best-quality and top-score queries.")
+        parser.add_argument("--top1_rank_tau", default=0.2, type=float,
+                            help="Temperature for top1-focused ranking softplus loss.")
+        parser.add_argument("--top1_rank_topk", default=10, type=int,
+                            help="Choose current top-score and best-quality queries inside top-K by foreground logit margin.")
+        parser.add_argument("--top1_rank_start_epoch", default=10, type=int,
+                            help="1-based epoch to start top1-focused ranking loss. 0 enables it from the beginning.")
         parser.add_argument('--giou_loss_coef', default=1, type=float)
         parser.add_argument("--width_loss_coef", default=0.0, type=float,
                             help="Optional width regularization loss weight.")
@@ -213,6 +245,9 @@ class BaseOptions(object):
         parser.add_argument("--quality_label_strength", default=0.5, type=float,
                             help="Strength for softening matched IoU label targets. 0 keeps hard positives; "
                                  "1 uses raw IoU after ramp.")
+        parser.add_argument("--quality_label_iou_gamma", default=1.0, type=float,
+                            help="Exponent applied to matched IoU quality targets. 1 preserves current behavior; "
+                                 ">1 sharpens high-IoU ranking.")
         parser.add_argument("--quality_label_warmup_epoch", default=10, type=int,
                             help="Keep hard positive labels before this 1-based epoch.")
         parser.add_argument("--quality_label_ramp_epoch", default=30, type=int,
@@ -341,6 +376,50 @@ class BaseOptions(object):
             opt.fdr_min_ref_width = 1.0 / float(opt.max_v_l)
         if opt.fgl_loss_coef is not None and opt.fgl_loss_coef < 0:
             raise ValueError("--fgl_loss_coef must be >= 0.")
+        if opt.go_lsd_loss_coef < 0:
+            raise ValueError("--go_lsd_loss_coef must be >= 0.")
+        if opt.go_lsd_temperature <= 0:
+            raise ValueError("--go_lsd_temperature must be > 0.")
+        if opt.go_lsd_start_epoch < 0:
+            raise ValueError("--go_lsd_start_epoch must be >= 0.")
+        if opt.go_lsd_loss_coef > 0 and opt.span_loss_type != "fdr":
+            raise ValueError("--go_lsd_loss_coef > 0 requires --span_loss_type fdr.")
+        if opt.go_lsd_loss_coef > 0 and not opt.aux_loss:
+            raise ValueError("--go_lsd_loss_coef > 0 requires auxiliary decoder losses.")
+        if opt.go_lsd_loss_coef > 0 and opt.dset_name == "tvsum":
+            raise ValueError("--go_lsd_loss_coef > 0 requires matcher-based VMR training.")
+        if opt.pairwise_rank_loss_coef < 0:
+            raise ValueError("--pairwise_rank_loss_coef must be >= 0.")
+        if opt.pairwise_rank_iou_margin < 0:
+            raise ValueError("--pairwise_rank_iou_margin must be >= 0.")
+        if opt.pairwise_rank_tau <= 0:
+            raise ValueError("--pairwise_rank_tau must be > 0.")
+        if opt.pairwise_rank_length_lambda < 0:
+            raise ValueError("--pairwise_rank_length_lambda must be >= 0.")
+        if opt.pairwise_rank_min_quality < 0 or opt.pairwise_rank_min_quality > 1:
+            raise ValueError("--pairwise_rank_min_quality must be in [0, 1].")
+        if opt.pairwise_rank_topk < 2:
+            raise ValueError("--pairwise_rank_topk must be >= 2.")
+        if opt.pairwise_rank_start_epoch < 0:
+            raise ValueError("--pairwise_rank_start_epoch must be >= 0.")
+        if opt.pairwise_rank_loss_coef > 0 and opt.span_loss_type == "ce":
+            raise ValueError("--pairwise_rank_loss_coef > 0 requires --span_loss_type l1, dfl, or fdr.")
+        if opt.pairwise_rank_loss_coef > 0 and opt.dset_name == "tvsum":
+            raise ValueError("--pairwise_rank_loss_coef > 0 requires matcher-based VMR training.")
+        if opt.top1_rank_loss_coef < 0:
+            raise ValueError("--top1_rank_loss_coef must be >= 0.")
+        if opt.top1_rank_quality_margin < 0:
+            raise ValueError("--top1_rank_quality_margin must be >= 0.")
+        if opt.top1_rank_tau <= 0:
+            raise ValueError("--top1_rank_tau must be > 0.")
+        if opt.top1_rank_topk < 2:
+            raise ValueError("--top1_rank_topk must be >= 2.")
+        if opt.top1_rank_start_epoch < 0:
+            raise ValueError("--top1_rank_start_epoch must be >= 0.")
+        if opt.top1_rank_loss_coef > 0 and opt.span_loss_type == "ce":
+            raise ValueError("--top1_rank_loss_coef > 0 requires --span_loss_type l1, dfl, or fdr.")
+        if opt.top1_rank_loss_coef > 0 and opt.dset_name == "tvsum":
+            raise ValueError("--top1_rank_loss_coef > 0 requires matcher-based VMR training.")
         if opt.width_loss_coef < 0:
             raise ValueError("--width_loss_coef must be >= 0.")
         if opt.width_loss_coef > 0 and opt.width_loss_type != "none" and opt.span_loss_type == "ce":
@@ -351,6 +430,8 @@ class BaseOptions(object):
             raise ValueError("--quality_label_ramp_epoch must be >= --quality_label_warmup_epoch.")
         if opt.quality_label_strength < 0 or opt.quality_label_strength > 1:
             raise ValueError("--quality_label_strength must be in [0, 1].")
+        if opt.quality_label_iou_gamma <= 0:
+            raise ValueError("--quality_label_iou_gamma must be > 0.")
         if opt.quality_label_loss and opt.matching_type != "hungarian":
             raise ValueError("--quality_label_loss is only supported with --matching_type hungarian.")
         if opt.quality_label_loss and opt.span_loss_type == "ce":
