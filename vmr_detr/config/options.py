@@ -224,6 +224,13 @@ class BaseOptions(object):
                             help="1-based epoch to start pairwise ranking loss. 0 enables it from the beginning.")
         parser.add_argument("--pairwise_rank_aux", action="store_true",
                             help="Also apply pairwise ranking loss to auxiliary decoder outputs.")
+        parser.add_argument("--rank_quality_type", default="length_aware",
+                            choices=["length_aware", "raw_iou"],
+                            help="Quality target used by pairwise/top1 query ranking losses.")
+        parser.add_argument("--rank_anchor_matched_only", action="store_true",
+                            help="Only promote matcher-supervised queries in pairwise/top1 ranking losses.")
+        parser.add_argument("--rank_loss_ramp_epoch", default=0, type=int,
+                            help="Linearly ramp rank loss weights over this many epochs after each rank loss starts.")
         parser.add_argument("--top1_rank_loss_coef", default=0.0, type=float,
                             help="Weight for top1-focused query ranking loss. 0 disables it.")
         parser.add_argument("--top1_rank_quality_margin", default=0.15, type=float,
@@ -402,6 +409,8 @@ class BaseOptions(object):
             raise ValueError("--pairwise_rank_topk must be >= 2.")
         if opt.pairwise_rank_start_epoch < 0:
             raise ValueError("--pairwise_rank_start_epoch must be >= 0.")
+        if opt.rank_loss_ramp_epoch < 0:
+            raise ValueError("--rank_loss_ramp_epoch must be >= 0.")
         if opt.pairwise_rank_loss_coef > 0 and opt.span_loss_type == "ce":
             raise ValueError("--pairwise_rank_loss_coef > 0 requires --span_loss_type l1, dfl, or fdr.")
         if opt.pairwise_rank_loss_coef > 0 and opt.dset_name == "tvsum":

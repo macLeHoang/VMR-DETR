@@ -4,7 +4,7 @@
 dset_name=charades_sta
 ctx_mode=video_tef
 results_root=results
-exp_id=exp_fdr_no_golsd_quality_s05_pairwise_rank_top1rank_c02_m015_start10
+exp_id=exp_fdr_no_golsd_quality_s05_rankv2_rawiou_matched_ramp10_top1_start20
 
 # Data paths
 train_path=/content/drive/MyDrive/Master/Thesis/QD-DETR-Old/data/charades-sta/train.jsonl
@@ -82,7 +82,7 @@ go_lsd_loss_coef=0.0
 go_lsd_temperature=2.0
 go_lsd_start_epoch=10
 
-# Losses: pairwise ranking with stronger length-aware quality
+# Losses: pairwise ranking, conservative v2 setup for preserving R1
 pairwise_rank_loss_coef=0.5
 pairwise_rank_iou_margin=0.15
 pairwise_rank_tau=0.2
@@ -90,13 +90,16 @@ pairwise_rank_length_lambda=0.75
 pairwise_rank_min_quality=0.3
 pairwise_rank_topk=10
 pairwise_rank_start_epoch=10
+rank_quality_type=raw_iou
+rank_anchor_matched_only_flag=--rank_anchor_matched_only
+rank_loss_ramp_epoch=10
 
 # Losses: top1-focused ranking inside top-K
 top1_rank_loss_coef=0.2
-top1_rank_quality_margin=0.15
+top1_rank_quality_margin=0.2
 top1_rank_tau=0.2
 top1_rank_topk=10
-top1_rank_start_epoch=10
+top1_rank_start_epoch=20
 
 # Losses: contrastive query/text alignment
 contrastive_align_loss_flag=--contrastive_align_loss
@@ -168,6 +171,9 @@ PYTHONPATH="${PYTHONPATH}:." python vmr_detr/cli/train.py \
   --pairwise_rank_min_quality "${pairwise_rank_min_quality}" \
   --pairwise_rank_topk "${pairwise_rank_topk}" \
   --pairwise_rank_start_epoch "${pairwise_rank_start_epoch}" \
+  --rank_quality_type "${rank_quality_type}" \
+  ${rank_anchor_matched_only_flag} \
+  --rank_loss_ramp_epoch "${rank_loss_ramp_epoch}" \
   --top1_rank_loss_coef "${top1_rank_loss_coef}" \
   --top1_rank_quality_margin "${top1_rank_quality_margin}" \
   --top1_rank_tau "${top1_rank_tau}" \

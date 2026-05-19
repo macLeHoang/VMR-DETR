@@ -699,6 +699,109 @@ class TaskAlignedCriterionTest(unittest.TestCase):
         self.assertIn("loss_top1_rank", losses)
         self.assertNotIn("loss_top1_rank_0", losses)
 
+    def test_raw_iou_rank_quality_ignores_length_penalty(self):
+        outputs = {
+            "pred_logits": _logits_from_fg_scores([0.30, 0.70]).unsqueeze(0),
+            "pred_spans": _cxw([[0.4, 0.6], [0.3, 0.7]]).unsqueeze(0),
+        }
+        targets = {"span_labels": [dict(spans=_cxw([[0.4, 0.6]]))]}
+        raw = self._criterion(HungarianMatcher(), "hungarian", rank_quality_type="raw_iou")
+        length_aware = self._criterion(
+            HungarianMatcher(),
+            "hungarian",
+            pairwise_rank_length_lambda=1.0,
+        )
+
+        self.assertTrue(torch.allclose(
+            raw._pairwise_rank_quality_targets(outputs, targets)[0, :2],
+            torch.tensor([1.0, 0.5]),
+        ))
+        self.assertTrue(torch.allclose(
+            length_aware._pairwise_rank_quality_targets(outputs, targets)[0, :2],
+            torch.tensor([1.0, 0.25]),
+        ))
+
+    def test_rank_weight_ramp_updates_pairwise_and_top1_weights(self):
+        criterion = SetCriterion(
+            matcher=HungarianMatcher(),
+            weight_dict={"loss_pairwise_rank": 2.0, "loss_top1_rank": 1.0},
+            eos_coef=0.1,
+            losses=["pairwise_rank", "top1_rank"],
+            temperature=0.07,
+            span_loss_type="l1",
+            max_v_l=75,
+            pairwise_rank_start_epoch=5,
+            top1_rank_start_epoch=10,
+            rank_loss_ramp_epoch=10,
+        )
+
+        self.assertEqual(criterion.weight_dict["loss_pairwise_rank"], 0.0)
+        self.assertEqual(criterion.weight_dict["loss_top1_rank"], 0.0)
+        criterion.set_epoch(10)
+        self.assertEqual(criterion.weight_dict["loss_pairwise_rank"], 1.0)
+        self.assertEqual(criterion.weight_dict["loss_top1_rank"], 0.0)
+        criterion.set_epoch(15)
+        self.assertEqual(criterion.weight_dict["loss_pairwise_rank"], 2.0)
+        self.assertEqual(criterion.weight_dict["loss_top1_rank"], 0.5)
+        criterion.set_epoch(20)
+        self.assertEqual(criterion.weight_dict["loss_top1_rank"], 1.0)
+
+    def test_pairwise_matched_only_does_not_promote_unmatched_high_quality_query(self):
+        outputs = {
+            "pred_logits": _logits_from_fg_scores([0.20, 0.80]).unsqueeze(0),
+            "pred_spans": _cxw([[0.4, 0.6], [0.0, 0.2]]).unsqueeze(0),
+        }
+        targets = {"span_labels": [dict(spans=_cxw([[0.4, 0.6]]))]}
+        indices = [(torch.tensor([1]), torch.tensor([0]))]
+        unrestricted = self._criterion(
+            HungarianMatcher(),
+            "hungarian",
+            rank_quality_type="raw_iou",
+            pairwise_rank_start_epoch=0,
+        )
+        matched_only = self._criterion(
+            HungarianMatcher(),
+            "hungarian",
+            rank_quality_type="raw_iou",
+            rank_anchor_matched_only=True,
+            pairwise_rank_start_epoch=0,
+        )
+
+        unrestricted_loss = unrestricted.loss_pairwise_rank(outputs, targets, indices)["loss_pairwise_rank"]
+        matched_only_loss = matched_only.loss_pairwise_rank(outputs, targets, indices)["loss_pairwise_rank"]
+
+        self.assertGreater(unrestricted_loss.item(), 0.0)
+        self.assertEqual(matched_only_loss.item(), 0.0)
+
+    def test_top1_matched_only_does_not_promote_unmatched_best_quality_query(self):
+        outputs = {
+            "pred_logits": _logits_from_fg_scores([0.20, 0.80]).unsqueeze(0),
+            "pred_spans": _cxw([[0.4, 0.6], [0.0, 0.2]]).unsqueeze(0),
+        }
+        targets = {"span_labels": [dict(spans=_cxw([[0.4, 0.6]]))]}
+        indices = [(torch.tensor([1]), torch.tensor([0]))]
+        unrestricted = self._criterion(
+            HungarianMatcher(),
+            "hungarian",
+            rank_quality_type="raw_iou",
+            top1_rank_quality_margin=0.1,
+            top1_rank_start_epoch=0,
+        )
+        matched_only = self._criterion(
+            HungarianMatcher(),
+            "hungarian",
+            rank_quality_type="raw_iou",
+            rank_anchor_matched_only=True,
+            top1_rank_quality_margin=0.1,
+            top1_rank_start_epoch=0,
+        )
+
+        unrestricted_loss = unrestricted.loss_top1_rank(outputs, targets, indices)["loss_top1_rank"]
+        matched_only_loss = matched_only.loss_top1_rank(outputs, targets, indices)["loss_top1_rank"]
+
+        self.assertGreater(unrestricted_loss.item(), 0.0)
+        self.assertEqual(matched_only_loss.item(), 0.0)
+
     def test_top1_rank_loss_rejects_invalid_settings(self):
         with self.assertRaisesRegex(ValueError, "top1_rank_tau"):
             self._criterion(

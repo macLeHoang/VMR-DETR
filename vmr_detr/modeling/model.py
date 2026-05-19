@@ -559,6 +559,8 @@ class SetCriterion(nn.Module):
                  pairwise_rank_length_lambda=0.5, pairwise_rank_min_quality=0.0,
                  pairwise_rank_topk=10, pairwise_rank_start_epoch=5,
                  pairwise_rank_aux=False,
+                 rank_quality_type="length_aware", rank_anchor_matched_only=False,
+                 rank_loss_ramp_epoch=0,
                  top1_rank_quality_margin=0.15, top1_rank_tau=0.2,
                  top1_rank_topk=10, top1_rank_start_epoch=10):
         """ Create the criterion.
@@ -584,6 +586,9 @@ class SetCriterion(nn.Module):
             pairwise_rank_iou_margin: float, minimum length-aware quality gap for ranking pairs
             pairwise_rank_tau: float, temperature for the pairwise softplus ranking loss
             pairwise_rank_length_lambda: float, log-width penalty strength for length-aware quality
+            rank_quality_type: str, one of [length_aware, raw_iou]
+            rank_anchor_matched_only: bool, only promote matcher-supervised queries in ranking losses
+            rank_loss_ramp_epoch: int, epochs used to linearly ramp rank loss weights after each start epoch
             top1_rank_quality_margin: float, minimum quality gap to compare top-score vs best-quality query
             top1_rank_tau: float, temperature for the top1-focused softplus ranking loss
         """
@@ -592,6 +597,7 @@ class SetCriterion(nn.Module):
         assert aux_matching_type in ("hungarian", "one_to_many")
         assert matching_type in ("hungarian", "tal")
         assert width_loss_type in ("none", "l1", "log")
+        assert rank_quality_type in ("length_aware", "raw_iou")
         if width_loss_type != "none" and span_loss_type not in ("l1", "dfl", "fdr"):
             raise ValueError("width_loss_type l1/log requires span_loss_type to be 'l1', 'dfl', or 'fdr'.")
         if quality_label_warmup_epoch < 0:
@@ -622,6 +628,8 @@ class SetCriterion(nn.Module):
             raise ValueError("pairwise_rank_topk must be >= 2.")
         if pairwise_rank_start_epoch < 0:
             raise ValueError("pairwise_rank_start_epoch must be >= 0.")
+        if rank_loss_ramp_epoch < 0:
+            raise ValueError("rank_loss_ramp_epoch must be >= 0.")
         if top1_rank_quality_margin < 0:
             raise ValueError("top1_rank_quality_margin must be >= 0.")
         if top1_rank_tau <= 0:
@@ -670,6 +678,9 @@ class SetCriterion(nn.Module):
         self.pairwise_rank_topk = pairwise_rank_topk
         self.pairwise_rank_start_epoch = pairwise_rank_start_epoch
         self.pairwise_rank_aux = pairwise_rank_aux
+        self.rank_quality_type = rank_quality_type
+        self.rank_anchor_matched_only = rank_anchor_matched_only
+        self.rank_loss_ramp_epoch = rank_loss_ramp_epoch
         self.top1_rank_quality_margin = top1_rank_quality_margin
         self.top1_rank_tau = top1_rank_tau
         self.top1_rank_topk = top1_rank_topk
@@ -710,12 +721,19 @@ class SetCriterion(nn.Module):
         self.contrastive_decay_epoch = contrastive_decay_epoch
         self.contrastive_decay_coef = contrastive_decay_coef
         self.contrastive_base_coef = self.weight_dict.get("loss_contrastive_align", 0.0)
+        self.rank_base_coefs = {
+            k: v for k, v in self.weight_dict.items()
+            if k == "loss_pairwise_rank" or k.startswith("loss_pairwise_rank_")
+            or k == "loss_top1_rank" or k.startswith("loss_top1_rank_")
+        }
         self.current_epoch = 0
         self._update_contrastive_weight()
+        self._update_rank_weights()
 
     def set_epoch(self, epoch):
         self.current_epoch = int(epoch)
         self._update_contrastive_weight()
+        self._update_rank_weights()
 
     def _update_contrastive_weight(self):
         if "loss_contrastive_align" not in self.weight_dict:
@@ -727,6 +745,23 @@ class SetCriterion(nn.Module):
         else:
             coef = self.contrastive_base_coef
         self.weight_dict["loss_contrastive_align"] = coef
+
+    def _rank_weight_factor(self, start_epoch):
+        if self.current_epoch < start_epoch:
+            return 0.0
+        if self.rank_loss_ramp_epoch == 0:
+            return 1.0
+        if self.current_epoch >= start_epoch + self.rank_loss_ramp_epoch:
+            return 1.0
+        return float(self.current_epoch - start_epoch) / float(self.rank_loss_ramp_epoch)
+
+    def _update_rank_weights(self):
+        for key, base_coef in self.rank_base_coefs.items():
+            if key == "loss_pairwise_rank" or key.startswith("loss_pairwise_rank_"):
+                factor = self._rank_weight_factor(self.pairwise_rank_start_epoch)
+            else:
+                factor = self._rank_weight_factor(self.top1_rank_start_epoch)
+            self.weight_dict[key] = base_coef * factor
 
     def _loss_dfl(self, src_span_logits, tgt_spans):
         n_spans = src_span_logits.shape[0]
@@ -807,9 +842,34 @@ class SetCriterion(nn.Module):
             return F.l1_loss(pred_width.log(), tgt_width.log(), reduction='none')
         raise ValueError(f"Unsupported width_loss_type: {self.width_loss_type}")
 
+    def _rank_v2_enabled(self):
+        return (
+            self.rank_quality_type != "length_aware"
+            or self.rank_anchor_matched_only
+            or self.rank_loss_ramp_epoch > 0
+        )
+
+    @torch.no_grad()
+    def _rank_matched_query_mask(self, outputs, indices):
+        if not self.rank_anchor_matched_only:
+            return None
+
+        bsz, num_queries = outputs["pred_logits"].shape[:2]
+        matched_mask = torch.zeros(
+            (bsz, num_queries), dtype=torch.bool, device=outputs["pred_logits"].device
+        )
+        if indices is None:
+            return matched_mask
+
+        for batch_idx, (src_idx, _) in enumerate(indices):
+            if len(src_idx) == 0:
+                continue
+            matched_mask[batch_idx, src_idx.to(matched_mask.device)] = True
+        return matched_mask
+
     @torch.no_grad()
     def _pairwise_rank_quality_targets(self, outputs, targets):
-        """Length-aware IoU quality for every query, detached from span gradients."""
+        """IoU-derived quality for every query, detached from span gradients."""
         pred_spans = outputs["pred_spans"]
         bsz, num_queries = pred_spans.shape[:2]
         quality = pred_spans.new_zeros((bsz, num_queries))
@@ -825,6 +885,10 @@ class SetCriterion(nn.Module):
             ious = temporal_iou(pred_spans_xx[batch_idx], tgt_spans_xx)[0].clamp(0, 1)
             best_iou, best_tgt_idx = ious.max(dim=1)
 
+            if self.rank_quality_type == "raw_iou":
+                quality[batch_idx] = best_iou
+                continue
+
             pred_width = (pred_spans_xx[batch_idx, :, 1] - pred_spans_xx[batch_idx, :, 0]).clamp(min=1e-6)
             tgt_width = (tgt_spans_xx[best_tgt_idx, 1] - tgt_spans_xx[best_tgt_idx, 0]).clamp(min=1e-6)
             length_penalty = torch.log((pred_width / tgt_width).clamp(min=1e-6)).abs()
@@ -833,27 +897,31 @@ class SetCriterion(nn.Module):
         return quality
 
     def loss_pairwise_rank(self, outputs, targets, indices, log=True):
-        """Rank queries by detached length-aware IoU quality within each sample."""
+        """Rank queries by detached IoU-derived quality within each sample."""
         if self.current_epoch < self.pairwise_rank_start_epoch:
             return {"loss_pairwise_rank": outputs["pred_logits"].sum() * 0}
 
         src_logits = outputs["pred_logits"]
         rank_scores = src_logits[..., self.foreground_label] - src_logits[..., self.background_label]
         quality = self._pairwise_rank_quality_targets(outputs, targets).detach()
+        matched_mask = self._rank_matched_query_mask(outputs, indices)
         bsz, num_queries = rank_scores.shape
         topk = min(self.pairwise_rank_topk, num_queries)
         if topk < 2:
             return {"loss_pairwise_rank": src_logits.sum() * 0}
 
         pair_losses = []
+        sample_average = self._rank_v2_enabled()
         for batch_idx in range(bsz):
             if topk < num_queries:
                 selected = torch.topk(rank_scores[batch_idx].detach(), k=topk, largest=True).indices
                 scores = rank_scores[batch_idx, selected]
                 cur_quality = quality[batch_idx, selected]
+                cur_matched = matched_mask[batch_idx, selected] if matched_mask is not None else None
             else:
                 scores = rank_scores[batch_idx]
                 cur_quality = quality[batch_idx]
+                cur_matched = matched_mask[batch_idx] if matched_mask is not None else None
 
             quality_diff = cur_quality[:, None] - cur_quality[None, :]
             score_diff = scores[:, None] - scores[None, :]
@@ -861,12 +929,17 @@ class SetCriterion(nn.Module):
                 (quality_diff > self.pairwise_rank_iou_margin)
                 & (cur_quality[:, None] > self.pairwise_rank_min_quality)
             )
+            if cur_matched is not None:
+                valid_pairs = valid_pairs & cur_matched[:, None]
             if valid_pairs.any():
                 loss = F.softplus(-score_diff[valid_pairs] / self.pairwise_rank_tau)
-                pair_losses.append(loss * quality_diff[valid_pairs])
+                weighted_loss = loss * quality_diff[valid_pairs]
+                pair_losses.append(weighted_loss.mean() if sample_average else weighted_loss)
 
         if not pair_losses:
             return {"loss_pairwise_rank": src_logits.sum() * 0}
+        if sample_average:
+            return {"loss_pairwise_rank": torch.stack(pair_losses).mean()}
         return {"loss_pairwise_rank": torch.cat(pair_losses).mean()}
 
     def loss_top1_rank(self, outputs, targets, indices, log=True):
@@ -877,6 +950,7 @@ class SetCriterion(nn.Module):
         src_logits = outputs["pred_logits"]
         rank_scores = src_logits[..., self.foreground_label] - src_logits[..., self.background_label]
         quality = self._pairwise_rank_quality_targets(outputs, targets).detach()
+        matched_mask = self._rank_matched_query_mask(outputs, indices)
         bsz, num_queries = rank_scores.shape
         topk = min(self.top1_rank_topk, num_queries)
         if topk < 2:
@@ -888,12 +962,19 @@ class SetCriterion(nn.Module):
                 selected = torch.topk(rank_scores[batch_idx].detach(), k=topk, largest=True).indices
                 scores = rank_scores[batch_idx, selected]
                 cur_quality = quality[batch_idx, selected]
+                cur_matched = matched_mask[batch_idx, selected] if matched_mask is not None else None
             else:
                 scores = rank_scores[batch_idx]
                 cur_quality = quality[batch_idx]
+                cur_matched = matched_mask[batch_idx] if matched_mask is not None else None
 
             top_score_idx = scores.detach().argmax()
-            best_quality_idx = cur_quality.argmax()
+            if cur_matched is not None:
+                if not cur_matched.any():
+                    continue
+                best_quality_idx = cur_quality.masked_fill(~cur_matched, -1.0).argmax()
+            else:
+                best_quality_idx = cur_quality.argmax()
             if top_score_idx.item() == best_quality_idx.item():
                 continue
 
@@ -1637,6 +1718,9 @@ def build_model(args):
         pairwise_rank_topk=getattr(args, "pairwise_rank_topk", 10),
         pairwise_rank_start_epoch=getattr(args, "pairwise_rank_start_epoch", 5),
         pairwise_rank_aux=getattr(args, "pairwise_rank_aux", False),
+        rank_quality_type=getattr(args, "rank_quality_type", "length_aware"),
+        rank_anchor_matched_only=getattr(args, "rank_anchor_matched_only", False),
+        rank_loss_ramp_epoch=getattr(args, "rank_loss_ramp_epoch", 0),
         top1_rank_quality_margin=getattr(args, "top1_rank_quality_margin", 0.15),
         top1_rank_tau=getattr(args, "top1_rank_tau", 0.2),
         top1_rank_topk=getattr(args, "top1_rank_topk", 10),
