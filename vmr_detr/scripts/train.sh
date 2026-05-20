@@ -4,7 +4,7 @@
 dset_name=charades_sta
 ctx_mode=video_tef
 results_root=results
-exp_id=exp_fdr_no_golsd_quality_s05_rankv2_rawiou_matched_ramp10_top1_start20
+exp_id=exp_fdr_no_golsd_quality_s05_listwise_lengthaware_matched_ramp10
 
 # Data paths
 train_path=/content/drive/MyDrive/Master/Thesis/QD-DETR-Old/data/charades-sta/train.jsonl
@@ -83,23 +83,32 @@ go_lsd_temperature=2.0
 go_lsd_start_epoch=10
 
 # Losses: pairwise ranking, conservative v2 setup for preserving R1
-pairwise_rank_loss_coef=0.5
-pairwise_rank_iou_margin=0.15
+pairwise_rank_loss_coef=0.2
+pairwise_rank_iou_margin=0.10
 pairwise_rank_tau=0.2
-pairwise_rank_length_lambda=0.75
-pairwise_rank_min_quality=0.3
+pairwise_rank_score_margin=1.0
+pairwise_rank_length_lambda=0.5
+pairwise_rank_min_quality=0.35
 pairwise_rank_topk=10
-pairwise_rank_start_epoch=10
-rank_quality_type=raw_iou
+pairwise_rank_start_epoch=20
+rank_quality_type=length_aware
 rank_anchor_matched_only_flag=--rank_anchor_matched_only
 rank_loss_ramp_epoch=10
 
 # Losses: top1-focused ranking inside top-K
-top1_rank_loss_coef=0.2
-top1_rank_quality_margin=0.2
+top1_rank_loss_coef=0.1
+top1_rank_quality_margin=0.10
 top1_rank_tau=0.2
 top1_rank_topk=10
-top1_rank_start_epoch=20
+top1_rank_start_epoch=25
+
+# Losses: listwise query ranking for score separation
+listwise_rank_loss_coef=0.3
+listwise_rank_score_tau=0.2
+listwise_rank_quality_tau=0.1
+listwise_rank_min_quality=0.3
+listwise_rank_topk=10
+listwise_rank_start_epoch=20
 
 # Losses: contrastive query/text alignment
 contrastive_align_loss_flag=--contrastive_align_loss
@@ -167,6 +176,7 @@ PYTHONPATH="${PYTHONPATH}:." python vmr_detr/cli/train.py \
   --pairwise_rank_loss_coef "${pairwise_rank_loss_coef}" \
   --pairwise_rank_iou_margin "${pairwise_rank_iou_margin}" \
   --pairwise_rank_tau "${pairwise_rank_tau}" \
+  --pairwise_rank_score_margin "${pairwise_rank_score_margin}" \
   --pairwise_rank_length_lambda "${pairwise_rank_length_lambda}" \
   --pairwise_rank_min_quality "${pairwise_rank_min_quality}" \
   --pairwise_rank_topk "${pairwise_rank_topk}" \
@@ -179,6 +189,12 @@ PYTHONPATH="${PYTHONPATH}:." python vmr_detr/cli/train.py \
   --top1_rank_tau "${top1_rank_tau}" \
   --top1_rank_topk "${top1_rank_topk}" \
   --top1_rank_start_epoch "${top1_rank_start_epoch}" \
+  --listwise_rank_loss_coef "${listwise_rank_loss_coef}" \
+  --listwise_rank_score_tau "${listwise_rank_score_tau}" \
+  --listwise_rank_quality_tau "${listwise_rank_quality_tau}" \
+  --listwise_rank_min_quality "${listwise_rank_min_quality}" \
+  --listwise_rank_topk "${listwise_rank_topk}" \
+  --listwise_rank_start_epoch "${listwise_rank_start_epoch}" \
   ${contrastive_align_loss_flag} \
   --contrastive_align_loss_coef "${contrastive_align_loss_coef}" \
   --contrastive_start_epoch "${contrastive_start_epoch}" \

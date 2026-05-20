@@ -214,6 +214,8 @@ class BaseOptions(object):
                             help="Minimum length-aware quality gap required to rank a query pair.")
         parser.add_argument("--pairwise_rank_tau", default=0.2, type=float,
                             help="Temperature for length-aware pairwise ranking softplus loss.")
+        parser.add_argument("--pairwise_rank_score_margin", default=1.0, type=float,
+                            help="Logit-margin multiplier for pairwise ranking comparisons.")
         parser.add_argument("--pairwise_rank_length_lambda", default=0.5, type=float,
                             help="Strength of the log-width penalty inside length-aware quality.")
         parser.add_argument("--pairwise_rank_min_quality", default=0.0, type=float,
@@ -226,7 +228,7 @@ class BaseOptions(object):
                             help="Also apply pairwise ranking loss to auxiliary decoder outputs.")
         parser.add_argument("--rank_quality_type", default="length_aware",
                             choices=["length_aware", "raw_iou"],
-                            help="Quality target used by pairwise/top1 query ranking losses.")
+                            help="Quality target used by query ranking losses.")
         parser.add_argument("--rank_anchor_matched_only", action="store_true",
                             help="Only promote matcher-supervised queries in pairwise/top1 ranking losses.")
         parser.add_argument("--rank_loss_ramp_epoch", default=0, type=int,
@@ -241,6 +243,18 @@ class BaseOptions(object):
                             help="Choose current top-score and best-quality queries inside top-K by foreground logit margin.")
         parser.add_argument("--top1_rank_start_epoch", default=10, type=int,
                             help="1-based epoch to start top1-focused ranking loss. 0 enables it from the beginning.")
+        parser.add_argument("--listwise_rank_loss_coef", default=0.0, type=float,
+                            help="Weight for listwise query ranking loss. 0 disables it.")
+        parser.add_argument("--listwise_rank_score_tau", default=0.2, type=float,
+                            help="Temperature applied to query score logits in listwise ranking.")
+        parser.add_argument("--listwise_rank_quality_tau", default=0.1, type=float,
+                            help="Temperature applied to detached quality targets in listwise ranking.")
+        parser.add_argument("--listwise_rank_min_quality", default=0.3, type=float,
+                            help="Minimum max query quality required for a listwise ranking sample.")
+        parser.add_argument("--listwise_rank_topk", default=10, type=int,
+                            help="Compare only the top-K queries by foreground logit margin in listwise ranking.")
+        parser.add_argument("--listwise_rank_start_epoch", default=20, type=int,
+                            help="1-based epoch to start listwise ranking loss. 0 enables it from the beginning.")
         parser.add_argument('--giou_loss_coef', default=1, type=float)
         parser.add_argument("--width_loss_coef", default=0.0, type=float,
                             help="Optional width regularization loss weight.")
@@ -401,6 +415,8 @@ class BaseOptions(object):
             raise ValueError("--pairwise_rank_iou_margin must be >= 0.")
         if opt.pairwise_rank_tau <= 0:
             raise ValueError("--pairwise_rank_tau must be > 0.")
+        if opt.pairwise_rank_score_margin < 0:
+            raise ValueError("--pairwise_rank_score_margin must be >= 0.")
         if opt.pairwise_rank_length_lambda < 0:
             raise ValueError("--pairwise_rank_length_lambda must be >= 0.")
         if opt.pairwise_rank_min_quality < 0 or opt.pairwise_rank_min_quality > 1:
@@ -429,6 +445,22 @@ class BaseOptions(object):
             raise ValueError("--top1_rank_loss_coef > 0 requires --span_loss_type l1, dfl, or fdr.")
         if opt.top1_rank_loss_coef > 0 and opt.dset_name == "tvsum":
             raise ValueError("--top1_rank_loss_coef > 0 requires matcher-based VMR training.")
+        if opt.listwise_rank_loss_coef < 0:
+            raise ValueError("--listwise_rank_loss_coef must be >= 0.")
+        if opt.listwise_rank_score_tau <= 0:
+            raise ValueError("--listwise_rank_score_tau must be > 0.")
+        if opt.listwise_rank_quality_tau <= 0:
+            raise ValueError("--listwise_rank_quality_tau must be > 0.")
+        if opt.listwise_rank_min_quality < 0 or opt.listwise_rank_min_quality > 1:
+            raise ValueError("--listwise_rank_min_quality must be in [0, 1].")
+        if opt.listwise_rank_topk < 2:
+            raise ValueError("--listwise_rank_topk must be >= 2.")
+        if opt.listwise_rank_start_epoch < 0:
+            raise ValueError("--listwise_rank_start_epoch must be >= 0.")
+        if opt.listwise_rank_loss_coef > 0 and opt.span_loss_type == "ce":
+            raise ValueError("--listwise_rank_loss_coef > 0 requires --span_loss_type l1, dfl, or fdr.")
+        if opt.listwise_rank_loss_coef > 0 and opt.dset_name == "tvsum":
+            raise ValueError("--listwise_rank_loss_coef > 0 requires matcher-based VMR training.")
         if opt.width_loss_coef < 0:
             raise ValueError("--width_loss_coef must be >= 0.")
         if opt.width_loss_coef > 0 and opt.width_loss_type != "none" and opt.span_loss_type == "ce":
