@@ -842,14 +842,16 @@ class TaskAlignedCriterionTest(unittest.TestCase):
                 "loss_pairwise_rank": 2.0,
                 "loss_top1_rank": 1.0,
                 "loss_listwise_rank": 3.0,
+                "loss_metric_rank": 4.0,
             },
             eos_coef=0.1,
-            losses=["pairwise_rank", "top1_rank", "listwise_rank"],
+            losses=["pairwise_rank", "top1_rank", "listwise_rank", "metric_rank"],
             temperature=0.07,
             span_loss_type="l1",
             max_v_l=75,
             pairwise_rank_start_epoch=5,
             top1_rank_start_epoch=10,
+            metric_rank_start_epoch=15,
             listwise_rank_start_epoch=20,
             rank_loss_ramp_epoch=10,
         )
@@ -857,18 +859,23 @@ class TaskAlignedCriterionTest(unittest.TestCase):
         self.assertEqual(criterion.weight_dict["loss_pairwise_rank"], 0.0)
         self.assertEqual(criterion.weight_dict["loss_top1_rank"], 0.0)
         self.assertEqual(criterion.weight_dict["loss_listwise_rank"], 0.0)
+        self.assertEqual(criterion.weight_dict["loss_metric_rank"], 0.0)
         criterion.set_epoch(10)
         self.assertEqual(criterion.weight_dict["loss_pairwise_rank"], 1.0)
         self.assertEqual(criterion.weight_dict["loss_top1_rank"], 0.0)
+        self.assertEqual(criterion.weight_dict["loss_metric_rank"], 0.0)
         self.assertEqual(criterion.weight_dict["loss_listwise_rank"], 0.0)
         criterion.set_epoch(15)
         self.assertEqual(criterion.weight_dict["loss_pairwise_rank"], 2.0)
         self.assertEqual(criterion.weight_dict["loss_top1_rank"], 0.5)
+        self.assertEqual(criterion.weight_dict["loss_metric_rank"], 0.0)
         self.assertEqual(criterion.weight_dict["loss_listwise_rank"], 0.0)
         criterion.set_epoch(20)
         self.assertEqual(criterion.weight_dict["loss_top1_rank"], 1.0)
+        self.assertEqual(criterion.weight_dict["loss_metric_rank"], 2.0)
         self.assertEqual(criterion.weight_dict["loss_listwise_rank"], 0.0)
         criterion.set_epoch(25)
+        self.assertEqual(criterion.weight_dict["loss_metric_rank"], 4.0)
         self.assertEqual(criterion.weight_dict["loss_listwise_rank"], 1.5)
         criterion.set_epoch(30)
         self.assertEqual(criterion.weight_dict["loss_listwise_rank"], 3.0)
@@ -957,6 +964,171 @@ class TaskAlignedCriterionTest(unittest.TestCase):
 
         self.assertGreater(unrestricted_loss.item(), 0.0)
         self.assertEqual(matched_only_loss.item(), 0.0)
+
+    def test_metric_rank_loss_is_lower_when_r1_valid_candidate_scores_higher(self):
+        targets = {"span_labels": [dict(spans=_cxw([[0.4, 0.6]]))]}
+        pred_spans = _cxw([[0.0, 0.2], [0.4, 0.6]]).unsqueeze(0)
+        bad_order_outputs = {
+            "pred_logits": _logits_from_fg_scores([0.90, 0.10]).unsqueeze(0),
+            "pred_spans": pred_spans,
+        }
+        good_order_outputs = {
+            "pred_logits": _logits_from_fg_scores([0.10, 0.90]).unsqueeze(0),
+            "pred_spans": pred_spans,
+        }
+        criterion = self._criterion(
+            HungarianMatcher(),
+            "hungarian",
+            metric_rank_start_epoch=0,
+        )
+
+        bad_loss = criterion.loss_metric_rank(bad_order_outputs, targets, None)["loss_metric_rank"]
+        good_loss = criterion.loss_metric_rank(good_order_outputs, targets, None)["loss_metric_rank"]
+
+        self.assertGreater(bad_loss.item(), good_loss.item())
+        self.assertTrue(torch.isfinite(bad_loss))
+        self.assertTrue(torch.isfinite(good_loss))
+
+    def test_metric_rank_top1_guard_protects_already_valid_top1(self):
+        outputs = {
+            "pred_logits": _logits_from_fg_scores([0.90, 0.10]).unsqueeze(0),
+            "pred_spans": _cxw([[0.35, 0.65], [0.38, 0.62]]).unsqueeze(0),
+        }
+        targets = {"span_labels": [dict(spans=_cxw([[0.4, 0.6]]))]}
+        criterion = self._criterion(
+            HungarianMatcher(),
+            "hungarian",
+            metric_rank_start_epoch=0,
+            metric_rank_min_gain_gap=0.0,
+            metric_rank_top1_guard_threshold=0.5,
+            metric_rank_top1_guard_margin=0.25,
+        )
+
+        result = criterion.loss_metric_rank(outputs, targets, None)
+
+        self.assertEqual(result["loss_metric_rank"].item(), 0.0)
+        self.assertEqual(result["metric_rank_top1_guard_count"].item(), 1.0)
+
+    def test_metric_rank_still_promotes_better_candidate_when_top1_is_bad(self):
+        outputs = {
+            "pred_logits": _logits_from_fg_scores([0.90, 0.10]).unsqueeze(0),
+            "pred_spans": _cxw([[0.0, 0.2], [0.4, 0.6]]).unsqueeze(0),
+        }
+        targets = {"span_labels": [dict(spans=_cxw([[0.4, 0.6]]))]}
+        criterion = self._criterion(
+            HungarianMatcher(),
+            "hungarian",
+            metric_rank_start_epoch=0,
+            metric_rank_top1_guard_threshold=0.5,
+        )
+
+        result = criterion.loss_metric_rank(outputs, targets, None)
+
+        self.assertGreater(result["loss_metric_rank"].item(), 0.0)
+        self.assertEqual(result["metric_rank_valid_pair_count"].item(), 1.0)
+
+    def test_metric_rank_candidate_union_includes_low_score_high_iou_query(self):
+        outputs = {
+            "pred_logits": _logits_from_fg_scores([0.90, 0.80, 0.10]).unsqueeze(0),
+            "pred_spans": _cxw([[0.0, 0.2], [0.7, 0.9], [0.4, 0.6]]).unsqueeze(0),
+        }
+        targets = {"span_labels": [dict(spans=_cxw([[0.4, 0.6]]))]}
+        criterion = self._criterion(
+            HungarianMatcher(),
+            "hungarian",
+            metric_rank_topk=2,
+            metric_rank_quality_topk=1,
+        )
+        ious = criterion._metric_rank_iou_targets(outputs, targets)[0]
+        rank_scores = outputs["pred_logits"][0, :, 0] - outputs["pred_logits"][0, :, 1]
+
+        selected = criterion._metric_rank_candidate_indices(rank_scores, ious)
+
+        self.assertEqual(selected.tolist(), [0, 1, 2])
+
+    def test_metric_rank_loss_returns_zero_for_empty_targets(self):
+        outputs = {
+            "pred_logits": _logits_from_fg_scores([0.90, 0.10]).unsqueeze(0),
+            "pred_spans": _cxw([[0.0, 0.2], [0.4, 0.6]]).unsqueeze(0),
+        }
+        targets = {"span_labels": [dict(spans=torch.empty(0, 2))]}
+        criterion = self._criterion(
+            HungarianMatcher(),
+            "hungarian",
+            metric_rank_start_epoch=0,
+        )
+
+        result = criterion.loss_metric_rank(outputs, targets, None)
+
+        self.assertEqual(result["loss_metric_rank"].item(), 0.0)
+        self.assertEqual(result["metric_rank_valid_pair_count"].item(), 0.0)
+
+    def test_metric_rank_loss_detaches_iou_targets_from_span_gradients(self):
+        pred_logits = _logits_from_fg_scores([0.90, 0.10]).unsqueeze(0).requires_grad_()
+        pred_spans = _cxw([[0.0, 0.2], [0.4, 0.6]]).unsqueeze(0).requires_grad_()
+        outputs = {
+            "pred_logits": pred_logits,
+            "pred_spans": pred_spans,
+        }
+        targets = {"span_labels": [dict(spans=_cxw([[0.4, 0.6]]))]}
+        criterion = self._criterion(
+            HungarianMatcher(),
+            "hungarian",
+            metric_rank_start_epoch=0,
+        )
+
+        loss = criterion.loss_metric_rank(outputs, targets, None)["loss_metric_rank"]
+        loss.backward()
+
+        self.assertIsNotNone(pred_logits.grad)
+        self.assertIsNone(pred_spans.grad)
+
+    def test_metric_rank_forward_uses_final_layer_only(self):
+        outputs = {
+            "pred_logits": _logits_from_fg_scores([0.90, 0.10]).unsqueeze(0),
+            "pred_spans": _cxw([[0.0, 0.2], [0.4, 0.6]]).unsqueeze(0),
+            "aux_outputs": [
+                {
+                    "pred_logits": _logits_from_fg_scores([0.80, 0.20]).unsqueeze(0),
+                    "pred_spans": _cxw([[0.0, 0.2], [0.4, 0.6]]).unsqueeze(0),
+                }
+            ],
+        }
+        targets = {"span_labels": [dict(spans=_cxw([[0.4, 0.6]]))]}
+        criterion = SetCriterion(
+            matcher=HungarianMatcher(),
+            weight_dict={"loss_metric_rank": 1.0},
+            eos_coef=0.1,
+            losses=["metric_rank"],
+            temperature=0.07,
+            span_loss_type="l1",
+            max_v_l=75,
+            metric_rank_start_epoch=0,
+        )
+
+        losses = criterion(outputs, targets)
+
+        self.assertIn("loss_metric_rank", losses)
+        self.assertNotIn("loss_metric_rank_0", losses)
+
+    def test_metric_rank_loss_rejects_invalid_settings(self):
+        with self.assertRaisesRegex(ValueError, "metric_rank_gain_tau"):
+            self._criterion(
+                HungarianMatcher(),
+                "hungarian",
+                metric_rank_gain_tau=0.0,
+            )
+
+        with self.assertRaisesRegex(ValueError, "metric_rank"):
+            SetCriterion(
+                matcher=HungarianMatcher(span_loss_type="ce"),
+                weight_dict={"loss_metric_rank": 1.0},
+                eos_coef=0.1,
+                losses=["metric_rank"],
+                temperature=0.07,
+                span_loss_type="ce",
+                max_v_l=75,
+            )
 
     def test_top1_rank_loss_rejects_invalid_settings(self):
         with self.assertRaisesRegex(ValueError, "top1_rank_tau"):

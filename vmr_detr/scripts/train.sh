@@ -4,7 +4,7 @@
 dset_name=charades_sta
 ctx_mode=video_tef
 results_root=results
-exp_id=exp_fdr_no_golsd_quality_s05_listwise_lengthaware_matched_ramp10
+exp_id=exp_fdr_no_golsd_quality_s05_metricrank_r1guard_ramp10
 
 # Data paths
 train_path=/content/drive/MyDrive/Master/Thesis/QD-DETR-Old/data/charades-sta/train.jsonl
@@ -82,8 +82,8 @@ go_lsd_loss_coef=0.0
 go_lsd_temperature=2.0
 go_lsd_start_epoch=10
 
-# Losses: pairwise ranking, conservative v2 setup for preserving R1
-pairwise_rank_loss_coef=0.2
+# Losses: legacy query ranking, disabled for clean metric-rank ablation
+pairwise_rank_loss_coef=0.0
 pairwise_rank_iou_margin=0.10
 pairwise_rank_tau=0.2
 pairwise_rank_score_margin=1.0
@@ -95,15 +95,27 @@ rank_quality_type=length_aware
 rank_anchor_matched_only_flag=--rank_anchor_matched_only
 rank_loss_ramp_epoch=10
 
-# Losses: top1-focused ranking inside top-K
-top1_rank_loss_coef=0.1
+# Losses: legacy top1-focused ranking inside top-K, disabled for clean metric-rank ablation
+top1_rank_loss_coef=0.0
 top1_rank_quality_margin=0.10
 top1_rank_tau=0.2
 top1_rank_topk=10
 top1_rank_start_epoch=25
 
-# Losses: listwise query ranking for score separation
-listwise_rank_loss_coef=0.3
+# Losses: metric-aware LambdaRank with Top1 Guard for R1
+metric_rank_loss_coef=0.1
+metric_rank_r1_thresholds=0.3,0.5,0.7
+metric_rank_gain_tau=0.05
+metric_rank_loss_tau=0.2
+metric_rank_topk=10
+metric_rank_quality_topk=5
+metric_rank_min_gain_gap=0.05
+metric_rank_top1_guard_margin=0.05
+metric_rank_top1_guard_threshold=0.5
+metric_rank_start_epoch=20
+
+# Losses: legacy listwise query ranking for score separation, disabled for clean metric-rank ablation
+listwise_rank_loss_coef=0.0
 listwise_rank_score_tau=0.2
 listwise_rank_quality_tau=0.1
 listwise_rank_min_quality=0.3
@@ -189,6 +201,16 @@ PYTHONPATH="${PYTHONPATH}:." python vmr_detr/cli/train.py \
   --top1_rank_tau "${top1_rank_tau}" \
   --top1_rank_topk "${top1_rank_topk}" \
   --top1_rank_start_epoch "${top1_rank_start_epoch}" \
+  --metric_rank_loss_coef "${metric_rank_loss_coef}" \
+  --metric_rank_r1_thresholds "${metric_rank_r1_thresholds}" \
+  --metric_rank_gain_tau "${metric_rank_gain_tau}" \
+  --metric_rank_loss_tau "${metric_rank_loss_tau}" \
+  --metric_rank_topk "${metric_rank_topk}" \
+  --metric_rank_quality_topk "${metric_rank_quality_topk}" \
+  --metric_rank_min_gain_gap "${metric_rank_min_gain_gap}" \
+  --metric_rank_top1_guard_margin "${metric_rank_top1_guard_margin}" \
+  --metric_rank_top1_guard_threshold "${metric_rank_top1_guard_threshold}" \
+  --metric_rank_start_epoch "${metric_rank_start_epoch}" \
   --listwise_rank_loss_coef "${listwise_rank_loss_coef}" \
   --listwise_rank_score_tau "${listwise_rank_score_tau}" \
   --listwise_rank_quality_tau "${listwise_rank_quality_tau}" \

@@ -243,6 +243,26 @@ class BaseOptions(object):
                             help="Choose current top-score and best-quality queries inside top-K by foreground logit margin.")
         parser.add_argument("--top1_rank_start_epoch", default=10, type=int,
                             help="1-based epoch to start top1-focused ranking loss. 0 enables it from the beginning.")
+        parser.add_argument("--metric_rank_loss_coef", default=0.0, type=float,
+                            help="Weight for metric-aware LambdaRank query ranking loss. 0 disables it.")
+        parser.add_argument("--metric_rank_r1_thresholds", default="0.3,0.5,0.7", type=str,
+                            help="Comma-separated IoU thresholds used for soft R1 gain.")
+        parser.add_argument("--metric_rank_gain_tau", default=0.05, type=float,
+                            help="Temperature for soft R1 threshold gains in metric-aware ranking.")
+        parser.add_argument("--metric_rank_loss_tau", default=0.2, type=float,
+                            help="Temperature for metric-aware LambdaRank pairwise loss.")
+        parser.add_argument("--metric_rank_topk", default=10, type=int,
+                            help="Score-topK candidates used by metric-aware ranking.")
+        parser.add_argument("--metric_rank_quality_topk", default=5, type=int,
+                            help="IoU-topK candidates added to metric-aware ranking.")
+        parser.add_argument("--metric_rank_min_gain_gap", default=0.05, type=float,
+                            help="Minimum soft R1 gain gap required for a metric-aware ranking pair.")
+        parser.add_argument("--metric_rank_top1_guard_margin", default=0.05, type=float,
+                            help="Minimum IoU improvement needed to demote an already-valid top1 prediction.")
+        parser.add_argument("--metric_rank_top1_guard_threshold", default=0.5, type=float,
+                            help="Top1 IoU threshold at or above which metric-aware ranking protects current top1.")
+        parser.add_argument("--metric_rank_start_epoch", default=20, type=int,
+                            help="1-based epoch to start metric-aware ranking loss. 0 enables it from the beginning.")
         parser.add_argument("--listwise_rank_loss_coef", default=0.0, type=float,
                             help="Weight for listwise query ranking loss. 0 disables it.")
         parser.add_argument("--listwise_rank_score_tau", default=0.2, type=float,
@@ -445,6 +465,38 @@ class BaseOptions(object):
             raise ValueError("--top1_rank_loss_coef > 0 requires --span_loss_type l1, dfl, or fdr.")
         if opt.top1_rank_loss_coef > 0 and opt.dset_name == "tvsum":
             raise ValueError("--top1_rank_loss_coef > 0 requires matcher-based VMR training.")
+        if opt.metric_rank_loss_coef < 0:
+            raise ValueError("--metric_rank_loss_coef must be >= 0.")
+        try:
+            metric_rank_thresholds = [
+                float(value.strip()) for value in opt.metric_rank_r1_thresholds.split(",") if value.strip()
+            ]
+        except ValueError as exc:
+            raise ValueError("--metric_rank_r1_thresholds must be comma-separated floats.") from exc
+        if len(metric_rank_thresholds) == 0:
+            raise ValueError("--metric_rank_r1_thresholds must contain at least one threshold.")
+        if any(thd < 0 or thd > 1 for thd in metric_rank_thresholds):
+            raise ValueError("--metric_rank_r1_thresholds values must be in [0, 1].")
+        if opt.metric_rank_gain_tau <= 0:
+            raise ValueError("--metric_rank_gain_tau must be > 0.")
+        if opt.metric_rank_loss_tau <= 0:
+            raise ValueError("--metric_rank_loss_tau must be > 0.")
+        if opt.metric_rank_topk < 1:
+            raise ValueError("--metric_rank_topk must be >= 1.")
+        if opt.metric_rank_quality_topk < 1:
+            raise ValueError("--metric_rank_quality_topk must be >= 1.")
+        if opt.metric_rank_min_gain_gap < 0:
+            raise ValueError("--metric_rank_min_gain_gap must be >= 0.")
+        if opt.metric_rank_top1_guard_margin < 0:
+            raise ValueError("--metric_rank_top1_guard_margin must be >= 0.")
+        if opt.metric_rank_top1_guard_threshold < 0 or opt.metric_rank_top1_guard_threshold > 1:
+            raise ValueError("--metric_rank_top1_guard_threshold must be in [0, 1].")
+        if opt.metric_rank_start_epoch < 0:
+            raise ValueError("--metric_rank_start_epoch must be >= 0.")
+        if opt.metric_rank_loss_coef > 0 and opt.span_loss_type == "ce":
+            raise ValueError("--metric_rank_loss_coef > 0 requires --span_loss_type l1, dfl, or fdr.")
+        if opt.metric_rank_loss_coef > 0 and opt.dset_name == "tvsum":
+            raise ValueError("--metric_rank_loss_coef > 0 requires matcher-based VMR training.")
         if opt.listwise_rank_loss_coef < 0:
             raise ValueError("--listwise_rank_loss_coef must be >= 0.")
         if opt.listwise_rank_score_tau <= 0:

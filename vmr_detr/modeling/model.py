@@ -566,7 +566,14 @@ class SetCriterion(nn.Module):
                  top1_rank_topk=10, top1_rank_start_epoch=10,
                  listwise_rank_score_tau=0.2, listwise_rank_quality_tau=0.1,
                  listwise_rank_min_quality=0.3, listwise_rank_topk=10,
-                 listwise_rank_start_epoch=20):
+                 listwise_rank_start_epoch=20,
+                 metric_rank_r1_thresholds=(0.3, 0.5, 0.7),
+                 metric_rank_gain_tau=0.05, metric_rank_loss_tau=0.2,
+                 metric_rank_topk=10, metric_rank_quality_topk=5,
+                 metric_rank_min_gain_gap=0.05,
+                 metric_rank_top1_guard_margin=0.05,
+                 metric_rank_top1_guard_threshold=0.5,
+                 metric_rank_start_epoch=20):
         """ Create the criterion.
         Parameters:
             matcher: module able to compute a matching between targets and proposals
@@ -601,6 +608,15 @@ class SetCriterion(nn.Module):
             listwise_rank_min_quality: float, minimum max quality for a valid listwise sample
             listwise_rank_topk: int, compare only the top-K queries by foreground logit margin
             listwise_rank_start_epoch: int, 1-based epoch to start listwise ranking loss
+            metric_rank_r1_thresholds: tuple/list/str, IoU thresholds used for soft R1 gain
+            metric_rank_gain_tau: float, soft threshold temperature for metric-aware gains
+            metric_rank_loss_tau: float, temperature for metric-aware pairwise ranking loss
+            metric_rank_topk: int, score-topK candidate count
+            metric_rank_quality_topk: int, IoU-topK candidate count
+            metric_rank_min_gain_gap: float, minimum soft metric gain gap for valid pairs
+            metric_rank_top1_guard_margin: float, minimum IoU improvement needed to demote a valid top1
+            metric_rank_top1_guard_threshold: float, IoU threshold used by top1 protection
+            metric_rank_start_epoch: int, 1-based epoch to start metric-aware ranking loss
         """
         super().__init__()
         self.matcher = matcher
@@ -660,6 +676,32 @@ class SetCriterion(nn.Module):
             raise ValueError("listwise_rank_topk must be >= 2.")
         if listwise_rank_start_epoch < 0:
             raise ValueError("listwise_rank_start_epoch must be >= 0.")
+        if isinstance(metric_rank_r1_thresholds, str):
+            metric_rank_r1_thresholds = [
+                float(value.strip()) for value in metric_rank_r1_thresholds.split(",") if value.strip()
+            ]
+        else:
+            metric_rank_r1_thresholds = [float(value) for value in metric_rank_r1_thresholds]
+        if len(metric_rank_r1_thresholds) == 0:
+            raise ValueError("metric_rank_r1_thresholds must contain at least one threshold.")
+        if any(thd < 0 or thd > 1 for thd in metric_rank_r1_thresholds):
+            raise ValueError("metric_rank_r1_thresholds values must be in [0, 1].")
+        if metric_rank_gain_tau <= 0:
+            raise ValueError("metric_rank_gain_tau must be > 0.")
+        if metric_rank_loss_tau <= 0:
+            raise ValueError("metric_rank_loss_tau must be > 0.")
+        if metric_rank_topk < 1:
+            raise ValueError("metric_rank_topk must be >= 1.")
+        if metric_rank_quality_topk < 1:
+            raise ValueError("metric_rank_quality_topk must be >= 1.")
+        if metric_rank_min_gain_gap < 0:
+            raise ValueError("metric_rank_min_gain_gap must be >= 0.")
+        if metric_rank_top1_guard_margin < 0:
+            raise ValueError("metric_rank_top1_guard_margin must be >= 0.")
+        if metric_rank_top1_guard_threshold < 0 or metric_rank_top1_guard_threshold > 1:
+            raise ValueError("metric_rank_top1_guard_threshold must be in [0, 1].")
+        if metric_rank_start_epoch < 0:
+            raise ValueError("metric_rank_start_epoch must be >= 0.")
         self.aux_matching_type = aux_matching_type
         self.aux_matcher = aux_matcher or matcher
         self.matching_type = matching_type
@@ -676,6 +718,10 @@ class SetCriterion(nn.Module):
             "listwise_rank" in losses
             or any(k == "loss_listwise_rank" or k.startswith("loss_listwise_rank_") for k in weight_dict)
         )
+        self.metric_rank_loss_enabled = (
+            "metric_rank" in losses
+            or any(k == "loss_metric_rank" or k.startswith("loss_metric_rank_") for k in weight_dict)
+        )
         self.go_lsd_loss_enabled = any(
             k == "loss_golsd" or k.startswith("loss_golsd_") for k in weight_dict
         )
@@ -687,6 +733,8 @@ class SetCriterion(nn.Module):
             raise ValueError("top1_rank loss requires span_loss_type to be 'l1', 'dfl', or 'fdr'.")
         if self.listwise_rank_loss_enabled and span_loss_type not in ("l1", "dfl", "fdr"):
             raise ValueError("listwise_rank loss requires span_loss_type to be 'l1', 'dfl', or 'fdr'.")
+        if self.metric_rank_loss_enabled and span_loss_type not in ("l1", "dfl", "fdr"):
+            raise ValueError("metric_rank loss requires span_loss_type to be 'l1', 'dfl', or 'fdr'.")
         self.losses = losses
         self.temperature = temperature
         self.span_loss_type = span_loss_type
@@ -719,6 +767,18 @@ class SetCriterion(nn.Module):
         self.listwise_rank_min_quality = listwise_rank_min_quality
         self.listwise_rank_topk = listwise_rank_topk
         self.listwise_rank_start_epoch = listwise_rank_start_epoch
+        self.metric_rank_gain_tau = metric_rank_gain_tau
+        self.metric_rank_loss_tau = metric_rank_loss_tau
+        self.metric_rank_topk = metric_rank_topk
+        self.metric_rank_quality_topk = metric_rank_quality_topk
+        self.metric_rank_min_gain_gap = metric_rank_min_gain_gap
+        self.metric_rank_top1_guard_margin = metric_rank_top1_guard_margin
+        self.metric_rank_top1_guard_threshold = metric_rank_top1_guard_threshold
+        self.metric_rank_start_epoch = metric_rank_start_epoch
+        self.register_buffer(
+            "metric_rank_r1_thresholds",
+            torch.as_tensor(metric_rank_r1_thresholds, dtype=torch.float32)
+        )
         if self.matching_type == "tal" and self.span_loss_type not in ("l1", "dfl", "fdr"):
             raise ValueError("TAL matching requires span_loss_type to be 'l1', 'dfl', or 'fdr'.")
         if tal_alpha < 0 or tal_beta < 0:
@@ -760,6 +820,7 @@ class SetCriterion(nn.Module):
             if k == "loss_pairwise_rank" or k.startswith("loss_pairwise_rank_")
             or k == "loss_top1_rank" or k.startswith("loss_top1_rank_")
             or k == "loss_listwise_rank" or k.startswith("loss_listwise_rank_")
+            or k == "loss_metric_rank" or k.startswith("loss_metric_rank_")
         }
         self.current_epoch = 0
         self._update_contrastive_weight()
@@ -796,8 +857,10 @@ class SetCriterion(nn.Module):
                 factor = self._rank_weight_factor(self.pairwise_rank_start_epoch)
             elif key == "loss_top1_rank" or key.startswith("loss_top1_rank_"):
                 factor = self._rank_weight_factor(self.top1_rank_start_epoch)
-            else:
+            elif key == "loss_listwise_rank" or key.startswith("loss_listwise_rank_"):
                 factor = self._rank_weight_factor(self.listwise_rank_start_epoch)
+            else:
+                factor = self._rank_weight_factor(self.metric_rank_start_epoch)
             self.weight_dict[key] = base_coef * factor
 
     def _loss_dfl(self, src_span_logits, tgt_spans):
@@ -887,10 +950,7 @@ class SetCriterion(nn.Module):
         )
 
     @torch.no_grad()
-    def _rank_matched_query_mask(self, outputs, indices):
-        if not self.rank_anchor_matched_only:
-            return None
-
+    def _query_matched_mask(self, outputs, indices):
         bsz, num_queries = outputs["pred_logits"].shape[:2]
         matched_mask = torch.zeros(
             (bsz, num_queries), dtype=torch.bool, device=outputs["pred_logits"].device
@@ -903,6 +963,12 @@ class SetCriterion(nn.Module):
                 continue
             matched_mask[batch_idx, src_idx.to(matched_mask.device)] = True
         return matched_mask
+
+    @torch.no_grad()
+    def _rank_matched_query_mask(self, outputs, indices):
+        if not self.rank_anchor_matched_only:
+            return None
+        return self._query_matched_mask(outputs, indices)
 
     @torch.no_grad()
     def _pairwise_rank_quality_targets(self, outputs, targets):
@@ -932,6 +998,48 @@ class SetCriterion(nn.Module):
             quality[batch_idx] = best_iou * torch.exp(-self.pairwise_rank_length_lambda * length_penalty)
 
         return quality
+
+    @torch.no_grad()
+    def _metric_rank_iou_targets(self, outputs, targets):
+        """Raw best-IoU target for metric-aware ranking, detached from span gradients."""
+        pred_spans = outputs["pred_spans"]
+        bsz, num_queries = pred_spans.shape[:2]
+        iou_targets = pred_spans.new_zeros((bsz, num_queries))
+        targets = targets["span_labels"]
+        pred_spans_xx = span_cxw_to_xx(pred_spans.detach())
+
+        for batch_idx in range(bsz):
+            tgt_spans = targets[batch_idx]["spans"].to(pred_spans.device)
+            if len(tgt_spans) == 0:
+                continue
+            tgt_spans_xx = span_cxw_to_xx(tgt_spans).detach()
+            ious = temporal_iou(pred_spans_xx[batch_idx], tgt_spans_xx)[0].clamp(0, 1)
+            iou_targets[batch_idx] = ious.max(dim=1).values
+
+        return iou_targets
+
+    def _metric_rank_gain(self, ious):
+        thresholds = self.metric_rank_r1_thresholds.to(device=ious.device, dtype=ious.dtype)
+        gains = torch.sigmoid(
+            (ious.unsqueeze(-1) - thresholds.view(*([1] * ious.dim()), -1))
+            / self.metric_rank_gain_tau
+        )
+        return gains.mean(dim=-1)
+
+    @torch.no_grad()
+    def _metric_rank_candidate_indices(self, rank_scores, ious, matched_mask=None):
+        num_queries = rank_scores.shape[0]
+        if num_queries == 0:
+            return torch.empty(0, dtype=torch.int64, device=rank_scores.device)
+
+        candidate_indices = []
+        score_k = min(self.metric_rank_topk, num_queries)
+        quality_k = min(self.metric_rank_quality_topk, num_queries)
+        candidate_indices.append(torch.topk(rank_scores.detach(), k=score_k, largest=True).indices)
+        candidate_indices.append(torch.topk(ious.detach(), k=quality_k, largest=True).indices)
+        if matched_mask is not None and matched_mask.any():
+            candidate_indices.append(matched_mask.nonzero(as_tuple=False).flatten())
+        return torch.unique(torch.cat(candidate_indices))
 
     def loss_pairwise_rank(self, outputs, targets, indices, log=True):
         """Rank queries by detached IoU-derived quality within each sample."""
@@ -1060,6 +1168,72 @@ class SetCriterion(nn.Module):
         return {
             "loss_top1_rank": torch.stack(top1_losses).mean(),
             "rank_top1_valid_count": src_logits.new_tensor(float(len(top1_losses))),
+        }
+
+    def loss_metric_rank(self, outputs, targets, indices, log=True):
+        """Metric-aware LambdaRank loss with top1 protection for R1-sensitive ordering."""
+        zero = outputs["pred_logits"].sum() * 0
+        if self.current_epoch < self.metric_rank_start_epoch:
+            return {
+                "loss_metric_rank": zero,
+                "metric_rank_valid_pair_count": zero.detach(),
+                "metric_rank_top1_guard_count": zero.detach(),
+            }
+
+        src_logits = outputs["pred_logits"]
+        rank_scores = src_logits[..., self.foreground_label] - src_logits[..., self.background_label]
+        ious = self._metric_rank_iou_targets(outputs, targets).detach()
+        gains = self._metric_rank_gain(ious).detach()
+        matched_mask = self._query_matched_mask(outputs, indices)
+
+        metric_losses = []
+        valid_pair_count = 0
+        top1_guard_count = 0
+        bsz = rank_scores.shape[0]
+        for batch_idx in range(bsz):
+            selected = self._metric_rank_candidate_indices(
+                rank_scores[batch_idx], ious[batch_idx], matched_mask[batch_idx]
+            )
+            if selected.numel() < 2:
+                continue
+
+            scores = rank_scores[batch_idx, selected]
+            cur_ious = ious[batch_idx, selected]
+            cur_gains = gains[batch_idx, selected]
+            gain_diff = cur_gains[:, None] - cur_gains[None, :]
+            score_diff = scores[:, None] - scores[None, :]
+            valid_pairs = gain_diff > self.metric_rank_min_gain_gap
+
+            top_score_idx = scores.detach().argmax()
+            best_gain_idx = cur_gains.argmax()
+            top_iou = cur_ious[top_score_idx]
+            best_iou = cur_ious[best_gain_idx]
+            if (
+                top_iou.item() >= self.metric_rank_top1_guard_threshold
+                and (best_iou - top_iou).item() < self.metric_rank_top1_guard_margin
+            ):
+                valid_pairs[:, top_score_idx] = False
+                top1_guard_count += 1
+
+            if not valid_pairs.any():
+                continue
+
+            gain_weight = gain_diff[valid_pairs].detach()
+            loss = F.softplus(-score_diff[valid_pairs] / self.metric_rank_loss_tau)
+            metric_losses.append((loss * gain_weight).mean())
+            valid_pair_count += int(valid_pairs.sum().item())
+
+        if not metric_losses:
+            return {
+                "loss_metric_rank": zero,
+                "metric_rank_valid_pair_count": zero.detach(),
+                "metric_rank_top1_guard_count": src_logits.new_tensor(float(top1_guard_count)),
+            }
+
+        return {
+            "loss_metric_rank": torch.stack(metric_losses).mean(),
+            "metric_rank_valid_pair_count": src_logits.new_tensor(float(valid_pair_count)),
+            "metric_rank_top1_guard_count": src_logits.new_tensor(float(top1_guard_count)),
         }
 
     def loss_listwise_rank(self, outputs, targets, indices, log=True):
@@ -1560,6 +1734,7 @@ class SetCriterion(nn.Module):
             "saliency": self.loss_saliency,
             "pairwise_rank": self.loss_pairwise_rank,
             "top1_rank": self.loss_top1_rank,
+            "metric_rank": self.loss_metric_rank,
             "listwise_rank": self.loss_listwise_rank,
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
@@ -1620,6 +1795,8 @@ class SetCriterion(nn.Module):
                     if loss in ("saliency", "contrastive_align"):  # final layer only
                         continue
                     if loss == "top1_rank":  # final layer only
+                        continue
+                    if loss == "metric_rank":  # final layer only
                         continue
                     if loss == "listwise_rank":  # final layer only
                         continue
@@ -1798,6 +1975,9 @@ def build_model(args):
     top1_rank_loss_coef = getattr(args, "top1_rank_loss_coef", 0.0)
     if top1_rank_loss_coef > 0:
         weight_dict["loss_top1_rank"] = top1_rank_loss_coef
+    metric_rank_loss_coef = getattr(args, "metric_rank_loss_coef", 0.0)
+    if metric_rank_loss_coef > 0:
+        weight_dict["loss_metric_rank"] = metric_rank_loss_coef
     listwise_rank_loss_coef = getattr(args, "listwise_rank_loss_coef", 0.0)
     if listwise_rank_loss_coef > 0:
         weight_dict["loss_listwise_rank"] = listwise_rank_loss_coef
@@ -1809,6 +1989,7 @@ def build_model(args):
             "loss_saliency",
             "loss_contrastive_align",
             "loss_top1_rank",
+            "loss_metric_rank",
             "loss_listwise_rank",
         }
         if not getattr(args, "pairwise_rank_aux", False):
@@ -1828,6 +2009,8 @@ def build_model(args):
         losses += ["pairwise_rank"]
     if top1_rank_loss_coef > 0:
         losses += ["top1_rank"]
+    if metric_rank_loss_coef > 0:
+        losses += ["metric_rank"]
     if listwise_rank_loss_coef > 0:
         losses += ["listwise_rank"]
         
@@ -1874,6 +2057,15 @@ def build_model(args):
         top1_rank_tau=getattr(args, "top1_rank_tau", 0.2),
         top1_rank_topk=getattr(args, "top1_rank_topk", 10),
         top1_rank_start_epoch=getattr(args, "top1_rank_start_epoch", 10),
+        metric_rank_r1_thresholds=getattr(args, "metric_rank_r1_thresholds", "0.3,0.5,0.7"),
+        metric_rank_gain_tau=getattr(args, "metric_rank_gain_tau", 0.05),
+        metric_rank_loss_tau=getattr(args, "metric_rank_loss_tau", 0.2),
+        metric_rank_topk=getattr(args, "metric_rank_topk", 10),
+        metric_rank_quality_topk=getattr(args, "metric_rank_quality_topk", 5),
+        metric_rank_min_gain_gap=getattr(args, "metric_rank_min_gain_gap", 0.05),
+        metric_rank_top1_guard_margin=getattr(args, "metric_rank_top1_guard_margin", 0.05),
+        metric_rank_top1_guard_threshold=getattr(args, "metric_rank_top1_guard_threshold", 0.5),
+        metric_rank_start_epoch=getattr(args, "metric_rank_start_epoch", 20),
         listwise_rank_score_tau=getattr(args, "listwise_rank_score_tau", 0.2),
         listwise_rank_quality_tau=getattr(args, "listwise_rank_quality_tau", 0.1),
         listwise_rank_min_quality=getattr(args, "listwise_rank_min_quality", 0.3),
