@@ -4,7 +4,6 @@ Modules to compute the matching cost and solve the corresponding LSAP.
 """
 import torch
 from torch import nn
-import torch.nn.functional as F
 from vmr_detr.ops.span_utils import generalized_temporal_iou, span_cxw_to_xx, temporal_iou
 
 try:
@@ -40,6 +39,13 @@ except ImportError:
         return list(row_idx), list(best_cols)
 
 
+def _foreground_prob(outputs):
+    logits = outputs["pred_logits"]
+    if logits.shape[-1] != 1:
+        raise ValueError("pred_logits must have shape (batch_size, num_queries, 1).")
+    return logits.squeeze(-1).sigmoid()
+
+
 class HungarianMatcher(nn.Module):
     """This class computes an assignment between the targets and the predictions of the network
 
@@ -71,18 +77,14 @@ class HungarianMatcher(nn.Module):
         if sum(sizes) == 0:
             return outputs["pred_spans"].new_empty((bs, num_queries, 0)).cpu(), sizes
 
-        # Also concat the target labels and spans
-        out_prob = outputs["pred_logits"].flatten(0, 1).softmax(-1)  # [batch_size * num_queries, num_classes]
+        # Also concat the target spans
+        out_prob = _foreground_prob(outputs).flatten(0, 1)  # [batch_size * num_queries]
         tgt_spans = torch.cat([v["spans"] for v in targets])  # [num_target_spans in batch, 2]
-        tgt_ids = torch.full(
-            [len(tgt_spans)], self.foreground_label,
-            dtype=torch.int64, device=out_prob.device
-        )   # [total #spans in the batch]
 
         # Compute the classification cost. Contrary to the loss, we don't use the NLL,
         # but approximate it in 1 - prob[target class].
         # The 1 is a constant that doesn't change the matching, it can be omitted.
-        cost_class = -out_prob[:, tgt_ids]  # [batch_size * num_queries, total #spans in the batch]
+        cost_class = -out_prob[:, None].expand(-1, len(tgt_spans))
 
         if self.span_loss_type in ("l1", "dfl", "fdr"):
             # We flatten to compute the cost matrices in a batch
@@ -122,7 +124,7 @@ class HungarianMatcher(nn.Module):
             outputs: This is a dict that contains at least these entries:
                  "pred_spans": Tensor of dim [batch_size, num_queries, 2] with the predicted span coordinates,
                     in normalized (cx, w) format
-                 ""pred_logits": Tensor of dim [batch_size, num_queries, num_classes] with the classification logits
+                 ""pred_logits": Tensor of dim [batch_size, num_queries, 1] with the foreground logits
 
             targets: This is a list of targets (len(targets) = batch_size), where each target is a dict containing:
                  "spans": Tensor of dim [num_target_spans, 2] containing the target span coordinates. The spans are
@@ -225,7 +227,7 @@ class TaskAlignedMatcher(nn.Module):
         empty = torch.empty(0, dtype=torch.int64)
         indices = []
 
-        pred_scores = outputs["pred_logits"].softmax(-1)[..., self.foreground_label]
+        pred_scores = _foreground_prob(outputs)
         pred_spans_xx = span_cxw_to_xx(outputs["pred_spans"])
 
         for batch_idx in range(bs):

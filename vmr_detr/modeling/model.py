@@ -11,7 +11,6 @@ from vmr_detr.ops.span_utils import generalized_temporal_iou, span_cxw_to_xx, sp
 from vmr_detr.modeling.matcher import build_matcher, build_hungarian_matcher, build_one_to_many_matcher
 from vmr_detr.modeling.transformer import build_transformer
 from vmr_detr.modeling.position_encoding import build_position_encoding
-from vmr_detr.ops.misc import accuracy
 import numpy as np
 
 def inverse_sigmoid(x, eps=1e-3):
@@ -246,7 +245,7 @@ class VMRDETR(nn.Module):
         if span_loss_type == "fdr":
             nn.init.constant_(self.span_embed.layers[-1].weight, 0)
             nn.init.constant_(self.span_embed.layers[-1].bias, 0)
-        self.class_embed = nn.Linear(hidden_dim, 2)  # 0: foreground, 1: background
+        self.class_embed = nn.Linear(hidden_dim, 1)
         self.use_txt_pos = use_txt_pos
         self.n_input_proj = n_input_proj
         # self.foreground_thd = foreground_thd
@@ -447,7 +446,7 @@ class VMRDETR(nn.Module):
             src_vid, src_vid_mask, src_txt, src_txt_mask
         )
 
-        outputs_class = self.class_embed(hs)  # (#layers, batch_size, #queries, #classes)
+        outputs_class = self.class_embed(hs)  # (#layers, batch_size, #queries, 1 foreground logit)
         reference_before_sigmoid = inverse_sigmoid(reference)
         tmp = self.span_embed(hs)
         if self.span_loss_type == "l1":
@@ -550,6 +549,7 @@ class SetCriterion(nn.Module):
                  contrastive_decay_epoch=-1, contrastive_decay_coef=0.0,
                  aux_matcher=None, aux_matching_type="hungarian",
                  matching_type="hungarian", tal_alpha=1.0, tal_beta=6.0,
+                 label_loss_type="ce", vfl_alpha=0.75, vfl_gamma=2.0,
                  width_loss_type="none",
                  quality_label_loss=False, quality_label_strength=0.5,
                  quality_label_iou_gamma=1.0,
@@ -589,6 +589,9 @@ class SetCriterion(nn.Module):
             fdr_min_ref_width: float
             saliency_margin: float
             width_loss_type: str, one of [none, l1, log]
+            label_loss_type: str, one of [ce, quality, vfl]
+            vfl_alpha: float, negative sample weight for Varifocal Loss
+            vfl_gamma: float, focusing exponent for Varifocal Loss
             quality_label_loss: bool, use matched IoU as Hungarian foreground target
             quality_label_strength: float, strength for softening matched IoU targets
             quality_label_iou_gamma: float, exponent applied to matched IoU targets
@@ -622,8 +625,18 @@ class SetCriterion(nn.Module):
         self.matcher = matcher
         assert aux_matching_type in ("hungarian", "one_to_many")
         assert matching_type in ("hungarian", "tal")
+        if quality_label_loss and label_loss_type == "ce":
+            label_loss_type = "quality"
+        if quality_label_loss and label_loss_type != "quality":
+            raise ValueError("quality_label_loss is only compatible with label_loss_type='quality'.")
+        if label_loss_type not in ("ce", "quality", "vfl"):
+            raise ValueError("label_loss_type must be one of ce, quality, or vfl.")
         assert width_loss_type in ("none", "l1", "log")
         assert rank_quality_type in ("length_aware", "raw_iou")
+        if vfl_alpha < 0:
+            raise ValueError("vfl_alpha must be >= 0.")
+        if vfl_gamma < 0:
+            raise ValueError("vfl_gamma must be >= 0.")
         if width_loss_type != "none" and span_loss_type not in ("l1", "dfl", "fdr"):
             raise ValueError("width_loss_type l1/log requires span_loss_type to be 'l1', 'dfl', or 'fdr'.")
         if quality_label_warmup_epoch < 0:
@@ -634,10 +647,10 @@ class SetCriterion(nn.Module):
             raise ValueError("quality_label_strength must be in [0, 1].")
         if quality_label_iou_gamma <= 0:
             raise ValueError("quality_label_iou_gamma must be > 0.")
-        if quality_label_loss and matching_type != "hungarian":
-            raise ValueError("quality_label_loss is only supported with Hungarian matching.")
-        if quality_label_loss and span_loss_type not in ("l1", "dfl", "fdr"):
-            raise ValueError("quality_label_loss requires span_loss_type to be 'l1', 'dfl', or 'fdr'.")
+        if label_loss_type in ("quality", "vfl") and matching_type != "hungarian":
+            raise ValueError("label_loss_type quality/vfl is only supported with Hungarian matching.")
+        if label_loss_type in ("quality", "vfl") and span_loss_type not in ("l1", "dfl", "fdr"):
+            raise ValueError("label_loss_type quality/vfl requires span_loss_type to be 'l1', 'dfl', or 'fdr'.")
         if go_lsd_temperature <= 0:
             raise ValueError("go_lsd_temperature must be > 0.")
         if go_lsd_start_epoch < 0:
@@ -740,7 +753,10 @@ class SetCriterion(nn.Module):
         self.span_loss_type = span_loss_type
         self.max_v_l = max_v_l
         self.width_loss_type = width_loss_type
-        self.quality_label_loss = quality_label_loss
+        self.label_loss_type = label_loss_type
+        self.vfl_alpha = vfl_alpha
+        self.vfl_gamma = vfl_gamma
+        self.quality_label_loss = label_loss_type == "quality"
         self.quality_label_strength = quality_label_strength
         self.quality_label_iou_gamma = quality_label_iou_gamma
         self.quality_label_warmup_epoch = quality_label_warmup_epoch
@@ -801,13 +817,9 @@ class SetCriterion(nn.Module):
         self.fdr_min_ref_width = fdr_min_ref_width
         self.saliency_margin = saliency_margin
 
-        # foreground and background classification
+        # Binary foreground classification.
         self.foreground_label = 0
-        self.background_label = 1
         self.eos_coef = eos_coef
-        empty_weight = torch.ones(2)
-        empty_weight[-1] = self.eos_coef  # lower weight for background (index 1, foreground index 0)
-        self.register_buffer('empty_weight', empty_weight)
         
         # for tvsum,
         self.use_matcher = use_matcher
@@ -949,6 +961,20 @@ class SetCriterion(nn.Module):
             or self.rank_loss_ramp_epoch > 0
         )
 
+    @staticmethod
+    def _foreground_logits(outputs):
+        logits = outputs["pred_logits"]
+        if logits.shape[-1] != 1:
+            raise ValueError("pred_logits must have shape (batch_size, num_queries, 1).")
+        return logits.squeeze(-1)
+
+    def _binary_class_error(self, fg_logits, indices):
+        idx = self._get_src_permutation_idx(indices)
+        if len(idx[0]) == 0:
+            return fg_logits.new_tensor(100.)
+        correct = (fg_logits[idx] > 0).to(fg_logits.dtype).mean() * 100
+        return 100 - correct
+
     @torch.no_grad()
     def _query_matched_mask(self, outputs, indices):
         bsz, num_queries = outputs["pred_logits"].shape[:2]
@@ -1051,7 +1077,7 @@ class SetCriterion(nn.Module):
             }
 
         src_logits = outputs["pred_logits"]
-        rank_scores = src_logits[..., self.foreground_label] - src_logits[..., self.background_label]
+        rank_scores = self._foreground_logits(outputs)
         quality = self._pairwise_rank_quality_targets(outputs, targets).detach()
         matched_mask = self._rank_matched_query_mask(outputs, indices)
         bsz, num_queries = rank_scores.shape
@@ -1117,7 +1143,7 @@ class SetCriterion(nn.Module):
             }
 
         src_logits = outputs["pred_logits"]
-        rank_scores = src_logits[..., self.foreground_label] - src_logits[..., self.background_label]
+        rank_scores = self._foreground_logits(outputs)
         quality = self._pairwise_rank_quality_targets(outputs, targets).detach()
         matched_mask = self._rank_matched_query_mask(outputs, indices)
         bsz, num_queries = rank_scores.shape
@@ -1181,7 +1207,7 @@ class SetCriterion(nn.Module):
             }
 
         src_logits = outputs["pred_logits"]
-        rank_scores = src_logits[..., self.foreground_label] - src_logits[..., self.background_label]
+        rank_scores = self._foreground_logits(outputs)
         ious = self._metric_rank_iou_targets(outputs, targets).detach()
         gains = self._metric_rank_gain(ious).detach()
         matched_mask = self._query_matched_mask(outputs, indices)
@@ -1246,7 +1272,7 @@ class SetCriterion(nn.Module):
             }
 
         src_logits = outputs["pred_logits"]
-        rank_scores = src_logits[..., self.foreground_label] - src_logits[..., self.background_label]
+        rank_scores = self._foreground_logits(outputs)
         quality = self._pairwise_rank_quality_targets(outputs, targets).detach()
         matched_mask = self._rank_matched_query_mask(outputs, indices)
         bsz, num_queries = rank_scores.shape
@@ -1348,7 +1374,7 @@ class SetCriterion(nn.Module):
             return student_logits.sum() * 0
 
         teacher_logits = teacher_outputs["pred_span_logits"].detach()
-        teacher_scores = teacher_outputs["pred_logits"].detach().softmax(-1)[..., self.foreground_label]
+        teacher_scores = torch.sigmoid(self._foreground_logits(teacher_outputs).detach())
         targets = targets["span_labels"]
         bsz, num_queries = student_logits.shape[:2]
         temperature = self.go_lsd_temperature
@@ -1458,7 +1484,7 @@ class SetCriterion(nn.Module):
         src_logits = outputs['pred_logits']
         target_quality = src_logits.new_zeros(src_logits.shape[:2])
         targets = targets["span_labels"]
-        pred_scores = src_logits.softmax(-1)[..., self.foreground_label]
+        pred_scores = torch.sigmoid(self._foreground_logits(outputs))
         pred_spans_xx = span_cxw_to_xx(outputs["pred_spans"])
 
         with torch.no_grad():
@@ -1487,17 +1513,14 @@ class SetCriterion(nn.Module):
     def _loss_labels_tal(self, outputs, targets, indices, log=True):
         src_logits = outputs['pred_logits']
         target_quality = self._tal_quality_targets(outputs, targets, indices)
-        fg_logits = src_logits[..., self.foreground_label] - src_logits[..., self.background_label]
+        fg_logits = self._foreground_logits(outputs)
         loss_bce = F.binary_cross_entropy_with_logits(fg_logits, target_quality, reduction="none")
         loss_weight = torch.full_like(target_quality, self.eos_coef)
         loss_weight = torch.where(target_quality > 0, torch.ones_like(loss_weight), loss_weight)
         losses = {'loss_label': (loss_bce * loss_weight).mean()}
 
-        idx = self._get_src_permutation_idx(indices)
-        if log and len(idx[0]) > 0:
-            losses['class_error'] = 100 - accuracy(src_logits[idx], self.foreground_label)[0]
-        elif log:
-            losses['class_error'] = src_logits.new_tensor(100.)
+        if log:
+            losses['class_error'] = self._binary_class_error(fg_logits, indices)
         return losses
 
     def _quality_label_ramp(self):
@@ -1536,7 +1559,7 @@ class SetCriterion(nn.Module):
     def _loss_labels_hungarian_quality(self, outputs, targets, indices, log=True):
         src_logits = outputs['pred_logits']
         target_quality = self._hungarian_quality_targets(outputs, targets, indices)
-        fg_logits = src_logits[..., self.foreground_label] - src_logits[..., self.background_label]
+        fg_logits = self._foreground_logits(outputs)
         loss_bce = F.binary_cross_entropy_with_logits(fg_logits, target_quality, reduction="none")
         loss_weight = torch.full_like(target_quality, self.eos_coef)
 
@@ -1545,14 +1568,46 @@ class SetCriterion(nn.Module):
             loss_weight[idx] = 1.0
         losses = {'loss_label': (loss_bce * loss_weight).mean()}
 
-        if log and len(idx[0]) > 0:
-            losses['class_error'] = 100 - accuracy(src_logits[idx], self.foreground_label)[0]
-        elif log:
-            losses['class_error'] = src_logits.new_tensor(100.)
+        if log:
+            losses['class_error'] = self._binary_class_error(fg_logits, indices)
+        return losses
+
+    def _loss_labels_vfl(self, outputs, targets, indices, log=True):
+        src_logits = outputs['pred_logits']
+        target_score = src_logits.new_zeros(src_logits.shape[:2])
+        positive = torch.zeros_like(target_score, dtype=torch.bool)
+        span_targets = targets["span_labels"]
+
+        with torch.no_grad():
+            pred_spans_xx = span_cxw_to_xx(outputs["pred_spans"].detach())
+            for batch_idx, (src_idx, tgt_idx) in enumerate(indices):
+                if len(src_idx) == 0:
+                    continue
+                src_idx = src_idx.to(src_logits.device)
+                tgt_idx = tgt_idx.to(src_logits.device)
+                tgt_spans = span_targets[batch_idx]["spans"].to(src_logits.device)
+                tgt_spans_xx = span_cxw_to_xx(tgt_spans)
+                matched_ious = torch.diag(
+                    temporal_iou(pred_spans_xx[batch_idx, src_idx], tgt_spans_xx[tgt_idx])[0]
+                ).clamp(0, 1)
+                target_score[batch_idx, src_idx] = matched_ious.to(target_score.dtype)
+                positive[batch_idx, src_idx] = True
+
+        fg_logits = self._foreground_logits(outputs)
+        src_score = torch.sigmoid(fg_logits.detach())
+        negative_weight = self.vfl_alpha * src_score.pow(self.vfl_gamma)
+        weight = negative_weight * (~positive).to(fg_logits.dtype) + target_score
+        loss_vfl = F.binary_cross_entropy_with_logits(
+            fg_logits, target_score, weight=weight, reduction="none"
+        )
+        losses = {'loss_label': loss_vfl.mean()}
+
+        if log:
+            losses['class_error'] = self._binary_class_error(fg_logits, indices)
         return losses
 
     def loss_labels(self, outputs, targets, indices, log=True, matching_type=None,
-                    use_quality_label_loss=None):
+                    label_loss_type=None, use_quality_label_loss=None):
         """Classification loss (NLL)
         targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
         """
@@ -1562,25 +1617,32 @@ class SetCriterion(nn.Module):
         if matching_type == "tal":
             return self._loss_labels_tal(outputs, targets, indices, log=log)
         if use_quality_label_loss is None:
-            use_quality_label_loss = self.quality_label_loss
-        if use_quality_label_loss:
+            label_loss_type = self.label_loss_type if label_loss_type is None else label_loss_type
+        else:
+            label_loss_type = "quality" if use_quality_label_loss else "ce"
+        if label_loss_type == "quality":
             return self._loss_labels_hungarian_quality(outputs, targets, indices, log=log)
+        if label_loss_type == "vfl":
+            return self._loss_labels_vfl(outputs, targets, indices, log=log)
+        if label_loss_type != "ce":
+            raise ValueError("label_loss_type must be one of ce, quality, or vfl.")
 
-        src_logits = outputs['pred_logits']  # (batch_size, #queries, #classes=2)
+        src_logits = outputs['pred_logits']
+        fg_logits = self._foreground_logits(outputs)
         # idx is a tuple of two 1D tensors (batch_idx, src_idx), of the same length == #objects in batch
         idx = self._get_src_permutation_idx(indices)
-        target_classes = torch.full(src_logits.shape[:2], self.background_label,
-                                    dtype=torch.int64, device=src_logits.device)  # (batch_size, #queries)
-        target_classes[idx] = self.foreground_label
+        target_classes = torch.zeros_like(fg_logits)
+        if len(idx[0]) > 0:
+            target_classes[idx] = 1.0
 
-        loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, self.empty_weight, reduction="none")
-        losses = {'loss_label': loss_ce.mean()}
+        loss_ce = F.binary_cross_entropy_with_logits(fg_logits, target_classes, reduction="none")
+        loss_weight = torch.full_like(target_classes, self.eos_coef)
+        if len(idx[0]) > 0:
+            loss_weight[idx] = 1.0
+        losses = {'loss_label': (loss_ce * loss_weight).mean()}
 
-        if log and len(idx[0]) > 0:
-            # TODO this should probably be a separate loss, not hacked in this one here
-            losses['class_error'] = 100 - accuracy(src_logits[idx], self.foreground_label)[0]
-        elif log:
-            losses['class_error'] = src_logits.new_tensor(100.)
+        if log:
+            losses['class_error'] = self._binary_class_error(fg_logits, indices)
         return losses
 
     def loss_saliency(self, outputs, targets, indices, log=True):
@@ -1805,7 +1867,7 @@ class SetCriterion(nn.Module):
                     kwargs = {}
                     if loss == "labels":
                         kwargs["matching_type"] = "hungarian"
-                        kwargs["use_quality_label_loss"] = False
+                        kwargs["label_loss_type"] = "ce"
                     loss_indices = indices_go if go_lsd_active and loss == "spans" else aux_indices
                     l_dict = self.get_loss(loss, aux_outputs, targets, loss_indices, **kwargs)
                     l_dict = {k + f'_{i}': v for k, v in l_dict.items()}
@@ -2034,6 +2096,12 @@ def build_model(args):
         matching_type=matching_type,
         tal_alpha=getattr(args, "tal_alpha", 1.0),
         tal_beta=getattr(args, "tal_beta", 6.0),
+        label_loss_type=getattr(
+            args, "label_loss_type",
+            "quality" if getattr(args, "quality_label_loss", False) else "ce"
+        ),
+        vfl_alpha=getattr(args, "vfl_alpha", 0.75),
+        vfl_gamma=getattr(args, "vfl_gamma", 2.0),
         width_loss_type=width_loss_type if width_loss_coef > 0 else "none",
         quality_label_loss=getattr(args, "quality_label_loss", False),
         quality_label_strength=getattr(args, "quality_label_strength", 0.5),

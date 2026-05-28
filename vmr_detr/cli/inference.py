@@ -204,9 +204,8 @@ def compute_mr_results(model, eval_loader, opt, epoch_i=None, criterion=None, tb
         else:
             model_inputs, targets = prepare_batch_inputs_audio(batch[1], opt.device, non_blocking=opt.pin_memory)
         outputs = model(**model_inputs)
-        prob = F.softmax(outputs["pred_logits"], -1)  # (batch_size, #queries, #classes=2)
+        scores = outputs["pred_logits"].squeeze(-1).sigmoid()  # (batch_size, #queries)
         if opt.span_loss_type in ("l1", "dfl", "fdr"):
-            scores = prob[..., 0]  # * (batch_size, #queries)  foreground label is 0, we directly take it
             pred_spans = outputs["pred_spans"]  # (bsz, #queries, 2)
             _saliency_scores = outputs["saliency_scores"].half()  # (bsz, L)
             saliency_scores = []

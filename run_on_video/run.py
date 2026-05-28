@@ -56,8 +56,7 @@ class VMRDETRPredictor:
         # decode outputs
         outputs = self.model(**model_inputs)
         # #moment_queries refers to the positional embeddings in VMRDETR's decoder, not the input text query
-        prob = F.softmax(outputs["pred_logits"], -1)  # (batch_size, #moment_queries=10, #classes=2)
-        scores = prob[..., 0]  # * (batch_size, #moment_queries)  foreground label is 0, we directly take it
+        scores = outputs["pred_logits"].squeeze(-1).sigmoid()  # (batch_size, #moment_queries=10)
         pred_spans = outputs["pred_spans"]  # (bsz, #moment_queries, 2)
         _saliency_scores = outputs["saliency_scores"].half()  # (bsz, L)
         saliency_scores = []

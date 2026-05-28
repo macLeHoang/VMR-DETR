@@ -281,8 +281,15 @@ class BaseOptions(object):
         parser.add_argument("--width_loss_type", default="log", choices=["none", "l1", "log"],
                             help="Width regularization type. 'log' penalizes relative width errors.")
         parser.add_argument('--label_loss_coef', default=4, type=float)
+        parser.add_argument("--label_loss_type", default="ce", choices=["ce", "quality", "vfl"],
+                            help="Label loss type: ce uses hard foreground/background labels; quality uses "
+                                 "Hungarian matched IoU-softened labels; vfl uses Varifocal Loss.")
+        parser.add_argument("--vfl_alpha", default=0.75, type=float,
+                            help="Negative sample weight for --label_loss_type vfl.")
+        parser.add_argument("--vfl_gamma", default=2.0, type=float,
+                            help="Focusing exponent for --label_loss_type vfl.")
         parser.add_argument("--quality_label_loss", action="store_true",
-                            help="Use softened matched IoU as the Hungarian foreground label target.")
+                            help="Deprecated. Use --label_loss_type quality.")
         parser.add_argument("--quality_label_strength", default=0.5, type=float,
                             help="Strength for softening matched IoU label targets. 0 keeps hard positives; "
                                  "1 uses raw IoU after ramp.")
@@ -349,6 +356,7 @@ class BaseOptions(object):
                 raise ValueError("--dfl_num_bins must be >= 2.")
             if opt.dfl_ref_prior_sigma <= 0:
                 raise ValueError("--dfl_ref_prior_sigma must be > 0.")
+            self._validate_label_loss_options(opt)
             self._validate_fdr_options(opt)
             self._validate_tal_options(opt)
         else:
@@ -356,6 +364,7 @@ class BaseOptions(object):
                 raise ValueError("--dfl_num_bins must be >= 2.")
             if opt.dfl_ref_prior_sigma <= 0:
                 raise ValueError("--dfl_ref_prior_sigma must be > 0.")
+            self._validate_label_loss_options(opt)
             self._validate_fdr_options(opt)
             self._validate_tal_options(opt)
             if opt.exp_id is None:
@@ -397,6 +406,29 @@ class BaseOptions(object):
 
         self.opt = opt
         return opt
+
+    @staticmethod
+    def _validate_label_loss_options(opt):
+        if not hasattr(opt, "label_loss_type"):
+            opt.label_loss_type = "ce"
+        if not hasattr(opt, "vfl_alpha"):
+            opt.vfl_alpha = 0.75
+        if not hasattr(opt, "vfl_gamma"):
+            opt.vfl_gamma = 2.0
+        if getattr(opt, "quality_label_loss", False):
+            if opt.label_loss_type not in ("ce", "quality"):
+                raise ValueError("--quality_label_loss is only compatible with --label_loss_type quality.")
+            opt.label_loss_type = "quality"
+        if opt.label_loss_type not in ("ce", "quality", "vfl"):
+            raise ValueError("--label_loss_type must be one of ce, quality, or vfl.")
+        if opt.vfl_alpha < 0:
+            raise ValueError("--vfl_alpha must be >= 0.")
+        if opt.vfl_gamma < 0:
+            raise ValueError("--vfl_gamma must be >= 0.")
+        if opt.label_loss_type in ("quality", "vfl") and opt.matching_type != "hungarian":
+            raise ValueError("--label_loss_type quality/vfl is only supported with --matching_type hungarian.")
+        if opt.label_loss_type in ("quality", "vfl") and opt.span_loss_type == "ce":
+            raise ValueError("--label_loss_type quality/vfl requires --span_loss_type l1, dfl, or fdr.")
 
     @staticmethod
     def _validate_tal_options(opt):
@@ -525,11 +557,6 @@ class BaseOptions(object):
             raise ValueError("--quality_label_strength must be in [0, 1].")
         if opt.quality_label_iou_gamma <= 0:
             raise ValueError("--quality_label_iou_gamma must be > 0.")
-        if opt.quality_label_loss and opt.matching_type != "hungarian":
-            raise ValueError("--quality_label_loss is only supported with --matching_type hungarian.")
-        if opt.quality_label_loss and opt.span_loss_type == "ce":
-            raise ValueError("--quality_label_loss requires --span_loss_type l1, dfl, or fdr.")
-
 
 class TestOptions(BaseOptions):
     """add additional options for evaluating"""

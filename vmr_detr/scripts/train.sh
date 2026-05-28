@@ -70,8 +70,10 @@ width_loss_type=log
 width_loss_coef=0.5
 label_loss_coef=4.0
 
-# Losses: Hungarian quality labels
-quality_label_loss_flag=--quality_label_loss
+# Losses: label supervision
+label_loss_type=vfl
+vfl_alpha=0.75
+vfl_gamma=2.0
 quality_label_strength=0.5
 quality_label_iou_gamma=1.0
 quality_label_warmup_epoch=10
@@ -177,7 +179,9 @@ PYTHONPATH="${PYTHONPATH}:." python vmr_detr/cli/train.py \
   --width_loss_type "${width_loss_type}" \
   --width_loss_coef "${width_loss_coef}" \
   --label_loss_coef "${label_loss_coef}" \
-  ${quality_label_loss_flag} \
+  --label_loss_type "${label_loss_type}" \
+  --vfl_alpha "${vfl_alpha}" \
+  --vfl_gamma "${vfl_gamma}" \
   --quality_label_strength "${quality_label_strength}" \
   --quality_label_iou_gamma "${quality_label_iou_gamma}" \
   --quality_label_warmup_epoch "${quality_label_warmup_epoch}" \

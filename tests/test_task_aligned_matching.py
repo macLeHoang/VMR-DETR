@@ -15,9 +15,7 @@ from vmr_detr.ops.span_utils import span_xx_to_cxw
 
 def _logits_from_fg_scores(scores):
     scores = torch.as_tensor(scores, dtype=torch.float32).clamp(1e-4, 1 - 1e-4)
-    fg_logits = torch.logit(scores)
-    bg_logits = torch.zeros_like(fg_logits)
-    return torch.stack([fg_logits, bg_logits], dim=-1)
+    return torch.logit(scores).unsqueeze(-1)
 
 
 def _cxw(windows):
@@ -184,7 +182,7 @@ class TaskAlignedCriterionTest(unittest.TestCase):
         criterion = self._criterion(
             HungarianMatcher(),
             "hungarian",
-            quality_label_loss=True,
+            label_loss_type="quality",
             quality_label_strength=0.5,
             quality_label_warmup_epoch=0,
             quality_label_ramp_epoch=0,
@@ -209,7 +207,7 @@ class TaskAlignedCriterionTest(unittest.TestCase):
         criterion = self._criterion(
             HungarianMatcher(),
             "hungarian",
-            quality_label_loss=True,
+            label_loss_type="quality",
             quality_label_strength=0.5,
             quality_label_iou_gamma=2.0,
             quality_label_warmup_epoch=0,
@@ -235,7 +233,7 @@ class TaskAlignedCriterionTest(unittest.TestCase):
         criterion = self._criterion(
             HungarianMatcher(),
             "hungarian",
-            quality_label_loss=True,
+            label_loss_type="quality",
             quality_label_strength=0.5,
             quality_label_iou_gamma=2.0,
             quality_label_warmup_epoch=0,
@@ -253,14 +251,14 @@ class TaskAlignedCriterionTest(unittest.TestCase):
 
     def test_hungarian_quality_labels_keep_eos_weight_for_unmatched_queries(self):
         outputs = {
-            "pred_logits": torch.zeros(1, 2, 2),
+            "pred_logits": torch.zeros(1, 2, 1),
             "pred_spans": _cxw([[0.2, 0.8], [0.8, 1.0]]).unsqueeze(0),
         }
         targets = {"span_labels": [dict(spans=_cxw([[0.2, 0.8]]))]}
         criterion = self._criterion(
             HungarianMatcher(),
             "hungarian",
-            quality_label_loss=True,
+            label_loss_type="quality",
             quality_label_strength=0.5,
             quality_label_warmup_epoch=0,
             quality_label_ramp_epoch=0,
@@ -278,7 +276,7 @@ class TaskAlignedCriterionTest(unittest.TestCase):
         self.assertTrue(torch.allclose(losses["loss_label"], expected))
 
     def test_hungarian_quality_labels_detach_iou_targets_from_span_gradients(self):
-        pred_logits = torch.zeros(1, 1, 2, requires_grad=True)
+        pred_logits = torch.zeros(1, 1, 1, requires_grad=True)
         pred_spans = torch.tensor([[[0.3, 0.6]]], requires_grad=True)
         outputs = {
             "pred_logits": pred_logits,
@@ -288,7 +286,7 @@ class TaskAlignedCriterionTest(unittest.TestCase):
         criterion = self._criterion(
             HungarianMatcher(),
             "hungarian",
-            quality_label_loss=True,
+            label_loss_type="quality",
             quality_label_strength=0.5,
             quality_label_warmup_epoch=0,
             quality_label_ramp_epoch=0,
@@ -314,7 +312,7 @@ class TaskAlignedCriterionTest(unittest.TestCase):
         criterion = self._criterion(
             HungarianMatcher(),
             "hungarian",
-            quality_label_loss=True,
+            label_loss_type="quality",
             quality_label_strength=0.5,
             quality_label_warmup_epoch=10,
             quality_label_ramp_epoch=30,
@@ -341,7 +339,7 @@ class TaskAlignedCriterionTest(unittest.TestCase):
         criterion = self._criterion(
             HungarianMatcher(),
             "hungarian",
-            quality_label_loss=True,
+            label_loss_type="quality",
             quality_label_strength=0.5,
             quality_label_iou_gamma=2.0,
             quality_label_warmup_epoch=10,
@@ -369,11 +367,11 @@ class TaskAlignedCriterionTest(unittest.TestCase):
             )
 
     def test_hungarian_quality_loss_rejects_tal_matching(self):
-        with self.assertRaisesRegex(ValueError, "quality_label_loss"):
+        with self.assertRaisesRegex(ValueError, "label_loss_type"):
             self._criterion(
                 TaskAlignedMatcher(),
                 "tal",
-                quality_label_loss=True,
+                label_loss_type="quality",
             )
 
     def test_hungarian_quality_labels_keep_auxiliary_outputs_hard_labeled(self):
@@ -398,7 +396,7 @@ class TaskAlignedCriterionTest(unittest.TestCase):
             span_loss_type="l1",
             max_v_l=75,
             matching_type="hungarian",
-            quality_label_loss=True,
+            label_loss_type="quality",
             quality_label_strength=0.5,
             quality_label_warmup_epoch=0,
             quality_label_ramp_epoch=0,
@@ -407,18 +405,172 @@ class TaskAlignedCriterionTest(unittest.TestCase):
 
         losses = criterion(outputs, targets)
 
-        fg_logit = logits[..., 0] - logits[..., 1]
+        fg_logit = logits.squeeze(-1)
         expected_final = torch.nn.functional.binary_cross_entropy_with_logits(
             fg_logit,
             torch.full_like(fg_logit, 0.75),
         )
-        expected_aux = torch.nn.functional.cross_entropy(
-            logits.transpose(1, 2),
-            torch.zeros(1, 1, dtype=torch.int64),
-            criterion.empty_weight,
+        expected_aux = torch.nn.functional.binary_cross_entropy_with_logits(
+            fg_logit,
+            torch.ones_like(fg_logit),
         )
         self.assertTrue(torch.allclose(losses["loss_label"], expected_final))
         self.assertTrue(torch.allclose(losses["loss_label_0"], expected_aux))
+
+    def test_vfl_label_loss_uses_iou_targets_and_focal_negative_weight(self):
+        outputs = {
+            "pred_logits": torch.zeros(1, 2, 1),
+            "pred_spans": _cxw([[0.2, 0.8], [0.8, 1.0]]).unsqueeze(0),
+        }
+        targets = {"span_labels": [dict(spans=_cxw([[0.2, 0.8]]))]}
+        criterion = self._criterion(
+            HungarianMatcher(),
+            "hungarian",
+            label_loss_type="vfl",
+            vfl_alpha=0.75,
+            vfl_gamma=2.0,
+        )
+        criterion.eos_coef = 0.25
+
+        losses = criterion.loss_labels(
+            outputs,
+            targets,
+            [(torch.tensor([0]), torch.tensor([0]))],
+        )
+
+        expected_negative_weight = 0.75 * 0.5 ** 2
+        expected = torch.log(torch.tensor(2.0)) * (1.0 + expected_negative_weight) / 2.0
+        self.assertTrue(torch.allclose(losses["loss_label"], expected))
+
+    def test_vfl_label_loss_uses_raw_matched_iou_for_partial_overlap(self):
+        outputs = {
+            "pred_logits": torch.zeros(1, 1, 1),
+            "pred_spans": _cxw([[0.0, 0.6]]).unsqueeze(0),
+        }
+        targets = {"span_labels": [dict(spans=_cxw([[0.2, 0.8]]))]}
+        criterion = self._criterion(
+            HungarianMatcher(),
+            "hungarian",
+            label_loss_type="vfl",
+        )
+
+        losses = criterion.loss_labels(
+            outputs,
+            targets,
+            [(torch.tensor([0]), torch.tensor([0]))],
+        )
+
+        expected = torch.log(torch.tensor(2.0)) * 0.5
+        self.assertTrue(torch.allclose(losses["loss_label"], expected))
+
+    def test_vfl_label_loss_detaches_iou_targets_from_span_gradients(self):
+        pred_logits = torch.zeros(1, 1, 1, requires_grad=True)
+        pred_spans = torch.tensor([[[0.3, 0.6]]], requires_grad=True)
+        outputs = {
+            "pred_logits": pred_logits,
+            "pred_spans": pred_spans,
+        }
+        targets = {"span_labels": [dict(spans=torch.tensor([[0.5, 0.6]]))]}
+        criterion = self._criterion(
+            HungarianMatcher(),
+            "hungarian",
+            label_loss_type="vfl",
+        )
+
+        losses = criterion.loss_labels(
+            outputs,
+            targets,
+            [(torch.tensor([0]), torch.tensor([0]))],
+        )
+        losses["loss_label"].backward()
+
+        self.assertIsNotNone(pred_logits.grad)
+        self.assertIsNone(pred_spans.grad)
+
+    def test_vfl_label_loss_handles_empty_matches_as_negatives(self):
+        outputs = {
+            "pred_logits": torch.zeros(1, 2, 1),
+            "pred_spans": _cxw([[0.2, 0.8], [0.8, 1.0]]).unsqueeze(0),
+        }
+        targets = {"span_labels": [dict(spans=torch.empty(0, 2))]}
+        criterion = self._criterion(
+            HungarianMatcher(),
+            "hungarian",
+            label_loss_type="vfl",
+            vfl_alpha=0.75,
+            vfl_gamma=2.0,
+        )
+
+        losses = criterion.loss_labels(
+            outputs,
+            targets,
+            [(torch.empty(0, dtype=torch.int64), torch.empty(0, dtype=torch.int64))],
+        )
+
+        expected = torch.log(torch.tensor(2.0)) * 0.75 * 0.5 ** 2
+        self.assertTrue(torch.allclose(losses["loss_label"], expected))
+
+    def test_vfl_label_loss_keeps_auxiliary_outputs_hard_labeled(self):
+        logits = _logits_from_fg_scores([0.80]).unsqueeze(0)
+        outputs = {
+            "pred_logits": logits,
+            "pred_spans": _cxw([[0.0, 0.6]]).unsqueeze(0),
+            "aux_outputs": [
+                {
+                    "pred_logits": logits,
+                    "pred_spans": _cxw([[0.0, 0.6]]).unsqueeze(0),
+                }
+            ],
+        }
+        targets = {"span_labels": [dict(spans=_cxw([[0.2, 0.8]]))]}
+        criterion = SetCriterion(
+            matcher=HungarianMatcher(),
+            weight_dict={"loss_label": 1.0, "loss_label_0": 1.0},
+            eos_coef=0.1,
+            losses=["labels"],
+            temperature=0.07,
+            span_loss_type="l1",
+            max_v_l=75,
+            matching_type="hungarian",
+            label_loss_type="vfl",
+        )
+
+        losses = criterion(outputs, targets)
+
+        fg_logit = logits.squeeze(-1)
+        target_score = torch.full_like(fg_logit, 0.5)
+        expected_final = torch.nn.functional.binary_cross_entropy_with_logits(
+            fg_logit,
+            target_score,
+            weight=target_score,
+        )
+        expected_aux = torch.nn.functional.binary_cross_entropy_with_logits(
+            fg_logit,
+            torch.ones_like(fg_logit),
+        )
+        self.assertTrue(torch.allclose(losses["loss_label"], expected_final))
+        self.assertTrue(torch.allclose(losses["loss_label_0"], expected_aux))
+
+    def test_vfl_label_loss_rejects_tal_matching(self):
+        with self.assertRaisesRegex(ValueError, "label_loss_type"):
+            self._criterion(
+                TaskAlignedMatcher(),
+                "tal",
+                label_loss_type="vfl",
+            )
+
+    def test_vfl_label_loss_rejects_discrete_ce_spans(self):
+        with self.assertRaisesRegex(ValueError, "label_loss_type"):
+            SetCriterion(
+                matcher=HungarianMatcher(span_loss_type="ce"),
+                weight_dict={"loss_label": 1.0},
+                eos_coef=0.1,
+                losses=["labels"],
+                temperature=0.07,
+                span_loss_type="ce",
+                max_v_l=75,
+                label_loss_type="vfl",
+            )
 
     def test_tal_mode_returns_finite_losses_and_backpropagates(self):
         pred_logits = _logits_from_fg_scores([0.80, 0.70, 0.20]).unsqueeze(0).requires_grad_()
@@ -1040,7 +1192,7 @@ class TaskAlignedCriterionTest(unittest.TestCase):
             metric_rank_quality_topk=1,
         )
         ious = criterion._metric_rank_iou_targets(outputs, targets)[0]
-        rank_scores = outputs["pred_logits"][0, :, 0] - outputs["pred_logits"][0, :, 1]
+        rank_scores = outputs["pred_logits"][0, :, 0]
 
         selected = criterion._metric_rank_candidate_indices(rank_scores, ious)
 
@@ -1246,6 +1398,7 @@ class TemporalFDRTest(unittest.TestCase):
 
         span_logits = model.span_embed(torch.randn(3, 1, 2, 4))
 
+        self.assertEqual(model.class_embed.out_features, 1)
         self.assertTrue(torch.allclose(span_logits, torch.zeros_like(span_logits)))
 
     def test_boundary_offsets_expand_reference_span(self):
