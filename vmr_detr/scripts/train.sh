@@ -105,7 +105,7 @@ top1_rank_topk=10
 top1_rank_start_epoch=25
 
 # Losses: metric-aware LambdaRank with Top1 Guard for R1
-metric_rank_loss_coef=0.1
+metric_rank_loss_coef=0.0
 metric_rank_r1_thresholds=0.3,0.5,0.7
 metric_rank_gain_tau=0.05
 metric_rank_loss_tau=0.2

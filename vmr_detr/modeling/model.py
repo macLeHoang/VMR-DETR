@@ -131,17 +131,20 @@ class ResidualMultiScaleTemporalAdapter(nn.Module):
         super().__init__()
         self.text_conditioned = text_conditioned
         self.branch_k3 = nn.Conv1d(
-            hidden_dim, hidden_dim, kernel_size=3, padding=1, groups=hidden_dim, bias=False
+            hidden_dim, hidden_dim, kernel_size=3, dilation=1, padding=1, groups=hidden_dim, bias=False
         )
         self.branch_k5 = nn.Conv1d(
-            hidden_dim, hidden_dim, kernel_size=5, padding=2, groups=hidden_dim, bias=False
+            hidden_dim, hidden_dim, kernel_size=3, dilation=2, padding=2, groups=hidden_dim, bias=False
+        )
+        self.branch_k7 = nn.Conv1d(
+            hidden_dim, hidden_dim, kernel_size=3, dilation=3, padding=3, groups=hidden_dim, bias=False
         )
 
-        gate_input_dim = hidden_dim * (4 if text_conditioned else 3)
+        gate_input_dim = hidden_dim * (5 if text_conditioned else 4)
         self.gate_mlp = nn.Sequential(
             nn.Linear(gate_input_dim, hidden_dim),
             nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, hidden_dim * 3)
+            nn.Linear(hidden_dim, hidden_dim * 4)
         )
         self.residual_norm = nn.LayerNorm(hidden_dim)
         self.dropout = nn.Dropout(dropout)
@@ -157,16 +160,17 @@ class ResidualMultiScaleTemporalAdapter(nn.Module):
 
         b3 = self.branch_k3(x_t).transpose(1, 2) * mask
         b5 = self.branch_k5(x_t).transpose(1, 2) * mask
+        b7 = self.branch_k7(x_t).transpose(1, 2) * mask
 
-        gate_inputs = [x_masked, b3, b5]
+        gate_inputs = [x_masked, b3, b5, b7]
         if self.text_conditioned:
             text_global_expanded = text_global.unsqueeze(1).expand(-1, x.shape[1], -1)
             gate_inputs.append(text_global_expanded)
         gate_input = torch.cat(gate_inputs, dim=-1)
-        gate = self.gate_mlp(gate_input).view(x.shape[0], x.shape[1], 3, x.shape[2])
+        gate = self.gate_mlp(gate_input).view(x.shape[0], x.shape[1], 4, x.shape[2])
         gate = torch.softmax(gate, dim=2)
 
-        branches = torch.stack([x_masked, b3, b5], dim=2)
+        branches = torch.stack([x_masked, b3, b5, b7], dim=2)
         refined = (gate * branches).sum(dim=2)
         residual = self.residual_norm(refined - x_masked)
         residual = self.dropout(residual) * self.residual_scale.view(1, 1, -1)
