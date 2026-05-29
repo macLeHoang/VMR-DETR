@@ -139,6 +139,12 @@ class BaseOptions(object):
                             help="Enable a same-length residual multi-scale temporal adapter on CLIP before late fusion.")
         parser.add_argument("--multiscale_adapter_dropout", type=float, default=0.05,
                             help="Dropout used inside the residual multi-scale temporal adapter.")
+        parser.add_argument("--multiscale_adapter_dilations", type=str, default="1,2,3",
+                            help="Comma-separated positive integer dilations for the residual multi-scale "
+                                 "temporal adapter, e.g. 1,3,7 or 1,3,7,9.")
+        parser.add_argument("--multiscale_adapter_kernel_size", type=int, default=3,
+                            help="Positive odd Conv1d kernel size for every residual multi-scale "
+                                 "temporal adapter branch.")
         parser.add_argument("--slowfast_dim", type=int, default=2304,
                             help="SlowFast feature dim inside concatenated video features.")
         parser.add_argument("--clip_dim", type=int, default=512,
@@ -208,73 +214,6 @@ class BaseOptions(object):
                             help="Temperature for GO-LSD distribution KL.")
         parser.add_argument("--go_lsd_start_epoch", default=0, type=int,
                             help="1-based epoch to start GO-LSD. 0 enables it from the beginning.")
-        parser.add_argument("--pairwise_rank_loss_coef", default=0.0, type=float,
-                            help="Weight for length-aware pairwise query ranking loss. 0 disables it.")
-        parser.add_argument("--pairwise_rank_iou_margin", default=0.1, type=float,
-                            help="Minimum length-aware quality gap required to rank a query pair.")
-        parser.add_argument("--pairwise_rank_tau", default=0.2, type=float,
-                            help="Temperature for length-aware pairwise ranking softplus loss.")
-        parser.add_argument("--pairwise_rank_score_margin", default=1.0, type=float,
-                            help="Logit-margin multiplier for pairwise ranking comparisons.")
-        parser.add_argument("--pairwise_rank_length_lambda", default=0.5, type=float,
-                            help="Strength of the log-width penalty inside length-aware quality.")
-        parser.add_argument("--pairwise_rank_min_quality", default=0.0, type=float,
-                            help="Minimum better-query quality for a valid pairwise ranking comparison.")
-        parser.add_argument("--pairwise_rank_topk", default=10, type=int,
-                            help="Compare only the top-K queries by foreground logit margin.")
-        parser.add_argument("--pairwise_rank_start_epoch", default=5, type=int,
-                            help="1-based epoch to start pairwise ranking loss. 0 enables it from the beginning.")
-        parser.add_argument("--pairwise_rank_aux", action="store_true",
-                            help="Also apply pairwise ranking loss to auxiliary decoder outputs.")
-        parser.add_argument("--rank_quality_type", default="length_aware",
-                            choices=["length_aware", "raw_iou"],
-                            help="Quality target used by query ranking losses.")
-        parser.add_argument("--rank_anchor_matched_only", action="store_true",
-                            help="Only promote matcher-supervised queries in pairwise/top1 ranking losses.")
-        parser.add_argument("--rank_loss_ramp_epoch", default=0, type=int,
-                            help="Linearly ramp rank loss weights over this many epochs after each rank loss starts.")
-        parser.add_argument("--top1_rank_loss_coef", default=0.0, type=float,
-                            help="Weight for top1-focused query ranking loss. 0 disables it.")
-        parser.add_argument("--top1_rank_quality_margin", default=0.15, type=float,
-                            help="Minimum length-aware quality gap between best-quality and top-score queries.")
-        parser.add_argument("--top1_rank_tau", default=0.2, type=float,
-                            help="Temperature for top1-focused ranking softplus loss.")
-        parser.add_argument("--top1_rank_topk", default=10, type=int,
-                            help="Choose current top-score and best-quality queries inside top-K by foreground logit margin.")
-        parser.add_argument("--top1_rank_start_epoch", default=10, type=int,
-                            help="1-based epoch to start top1-focused ranking loss. 0 enables it from the beginning.")
-        parser.add_argument("--metric_rank_loss_coef", default=0.0, type=float,
-                            help="Weight for metric-aware LambdaRank query ranking loss. 0 disables it.")
-        parser.add_argument("--metric_rank_r1_thresholds", default="0.3,0.5,0.7", type=str,
-                            help="Comma-separated IoU thresholds used for soft R1 gain.")
-        parser.add_argument("--metric_rank_gain_tau", default=0.05, type=float,
-                            help="Temperature for soft R1 threshold gains in metric-aware ranking.")
-        parser.add_argument("--metric_rank_loss_tau", default=0.2, type=float,
-                            help="Temperature for metric-aware LambdaRank pairwise loss.")
-        parser.add_argument("--metric_rank_topk", default=10, type=int,
-                            help="Score-topK candidates used by metric-aware ranking.")
-        parser.add_argument("--metric_rank_quality_topk", default=5, type=int,
-                            help="IoU-topK candidates added to metric-aware ranking.")
-        parser.add_argument("--metric_rank_min_gain_gap", default=0.05, type=float,
-                            help="Minimum soft R1 gain gap required for a metric-aware ranking pair.")
-        parser.add_argument("--metric_rank_top1_guard_margin", default=0.05, type=float,
-                            help="Minimum IoU improvement needed to demote an already-valid top1 prediction.")
-        parser.add_argument("--metric_rank_top1_guard_threshold", default=0.5, type=float,
-                            help="Top1 IoU threshold at or above which metric-aware ranking protects current top1.")
-        parser.add_argument("--metric_rank_start_epoch", default=20, type=int,
-                            help="1-based epoch to start metric-aware ranking loss. 0 enables it from the beginning.")
-        parser.add_argument("--listwise_rank_loss_coef", default=0.0, type=float,
-                            help="Weight for listwise query ranking loss. 0 disables it.")
-        parser.add_argument("--listwise_rank_score_tau", default=0.2, type=float,
-                            help="Temperature applied to query score logits in listwise ranking.")
-        parser.add_argument("--listwise_rank_quality_tau", default=0.1, type=float,
-                            help="Temperature applied to detached quality targets in listwise ranking.")
-        parser.add_argument("--listwise_rank_min_quality", default=0.3, type=float,
-                            help="Minimum max query quality required for a listwise ranking sample.")
-        parser.add_argument("--listwise_rank_topk", default=10, type=int,
-                            help="Compare only the top-K queries by foreground logit margin in listwise ranking.")
-        parser.add_argument("--listwise_rank_start_epoch", default=20, type=int,
-                            help="1-based epoch to start listwise ranking loss. 0 enables it from the beginning.")
         parser.add_argument('--giou_loss_coef', default=1, type=float)
         parser.add_argument("--width_loss_coef", default=0.0, type=float,
                             help="Optional width regularization loss weight.")
@@ -356,6 +295,7 @@ class BaseOptions(object):
                 raise ValueError("--dfl_num_bins must be >= 2.")
             if opt.dfl_ref_prior_sigma <= 0:
                 raise ValueError("--dfl_ref_prior_sigma must be > 0.")
+            self._validate_multiscale_adapter_options(opt)
             self._validate_label_loss_options(opt)
             self._validate_fdr_options(opt)
             self._validate_tal_options(opt)
@@ -364,6 +304,7 @@ class BaseOptions(object):
                 raise ValueError("--dfl_num_bins must be >= 2.")
             if opt.dfl_ref_prior_sigma <= 0:
                 raise ValueError("--dfl_ref_prior_sigma must be > 0.")
+            self._validate_multiscale_adapter_options(opt)
             self._validate_label_loss_options(opt)
             self._validate_fdr_options(opt)
             self._validate_tal_options(opt)
@@ -406,6 +347,70 @@ class BaseOptions(object):
 
         self.opt = opt
         return opt
+
+    @staticmethod
+    def _parse_multiscale_adapter_dilations(value):
+        if isinstance(value, str):
+            if value.strip() == "":
+                raise ValueError("--multiscale_adapter_dilations must contain at least one dilation.")
+            values = value.split(",")
+            if any(item.strip() == "" for item in values):
+                raise ValueError("--multiscale_adapter_dilations must be comma-separated positive integers.")
+        else:
+            try:
+                values = list(value)
+            except TypeError as exc:
+                raise ValueError("--multiscale_adapter_dilations must be a sequence of positive integers.") from exc
+            if len(values) == 0:
+                raise ValueError("--multiscale_adapter_dilations must contain at least one dilation.")
+
+        dilations = []
+        for item in values:
+            if isinstance(item, str):
+                try:
+                    dilation = int(item.strip())
+                except ValueError as exc:
+                    raise ValueError(
+                        "--multiscale_adapter_dilations must be comma-separated positive integers."
+                    ) from exc
+            elif isinstance(item, int) and not isinstance(item, bool):
+                dilation = item
+            else:
+                raise ValueError("--multiscale_adapter_dilations must be positive integers.")
+            if dilation < 1:
+                raise ValueError("--multiscale_adapter_dilations must be positive integers.")
+            dilations.append(dilation)
+        return tuple(dilations)
+
+    @staticmethod
+    def _parse_multiscale_adapter_kernel_size(value):
+        if isinstance(value, str):
+            try:
+                kernel_size = int(value.strip())
+            except ValueError as exc:
+                raise ValueError("--multiscale_adapter_kernel_size must be a positive odd integer.") from exc
+        elif isinstance(value, int) and not isinstance(value, bool):
+            kernel_size = value
+        else:
+            raise ValueError("--multiscale_adapter_kernel_size must be a positive odd integer.")
+        if kernel_size < 1 or kernel_size % 2 == 0:
+            raise ValueError("--multiscale_adapter_kernel_size must be a positive odd integer.")
+        return kernel_size
+
+    @staticmethod
+    def _validate_multiscale_adapter_options(opt):
+        if not hasattr(opt, "multiscale_adapter_dilations"):
+            opt.multiscale_adapter_dilations = (1, 2, 3)
+        else:
+            opt.multiscale_adapter_dilations = BaseOptions._parse_multiscale_adapter_dilations(
+                opt.multiscale_adapter_dilations
+            )
+        if not hasattr(opt, "multiscale_adapter_kernel_size"):
+            opt.multiscale_adapter_kernel_size = 3
+        else:
+            opt.multiscale_adapter_kernel_size = BaseOptions._parse_multiscale_adapter_kernel_size(
+                opt.multiscale_adapter_kernel_size
+            )
 
     @staticmethod
     def _validate_label_loss_options(opt):
@@ -461,90 +466,6 @@ class BaseOptions(object):
             raise ValueError("--go_lsd_loss_coef > 0 requires auxiliary decoder losses.")
         if opt.go_lsd_loss_coef > 0 and opt.dset_name == "tvsum":
             raise ValueError("--go_lsd_loss_coef > 0 requires matcher-based VMR training.")
-        if opt.pairwise_rank_loss_coef < 0:
-            raise ValueError("--pairwise_rank_loss_coef must be >= 0.")
-        if opt.pairwise_rank_iou_margin < 0:
-            raise ValueError("--pairwise_rank_iou_margin must be >= 0.")
-        if opt.pairwise_rank_tau <= 0:
-            raise ValueError("--pairwise_rank_tau must be > 0.")
-        if opt.pairwise_rank_score_margin < 0:
-            raise ValueError("--pairwise_rank_score_margin must be >= 0.")
-        if opt.pairwise_rank_length_lambda < 0:
-            raise ValueError("--pairwise_rank_length_lambda must be >= 0.")
-        if opt.pairwise_rank_min_quality < 0 or opt.pairwise_rank_min_quality > 1:
-            raise ValueError("--pairwise_rank_min_quality must be in [0, 1].")
-        if opt.pairwise_rank_topk < 2:
-            raise ValueError("--pairwise_rank_topk must be >= 2.")
-        if opt.pairwise_rank_start_epoch < 0:
-            raise ValueError("--pairwise_rank_start_epoch must be >= 0.")
-        if opt.rank_loss_ramp_epoch < 0:
-            raise ValueError("--rank_loss_ramp_epoch must be >= 0.")
-        if opt.pairwise_rank_loss_coef > 0 and opt.span_loss_type == "ce":
-            raise ValueError("--pairwise_rank_loss_coef > 0 requires --span_loss_type l1, dfl, or fdr.")
-        if opt.pairwise_rank_loss_coef > 0 and opt.dset_name == "tvsum":
-            raise ValueError("--pairwise_rank_loss_coef > 0 requires matcher-based VMR training.")
-        if opt.top1_rank_loss_coef < 0:
-            raise ValueError("--top1_rank_loss_coef must be >= 0.")
-        if opt.top1_rank_quality_margin < 0:
-            raise ValueError("--top1_rank_quality_margin must be >= 0.")
-        if opt.top1_rank_tau <= 0:
-            raise ValueError("--top1_rank_tau must be > 0.")
-        if opt.top1_rank_topk < 2:
-            raise ValueError("--top1_rank_topk must be >= 2.")
-        if opt.top1_rank_start_epoch < 0:
-            raise ValueError("--top1_rank_start_epoch must be >= 0.")
-        if opt.top1_rank_loss_coef > 0 and opt.span_loss_type == "ce":
-            raise ValueError("--top1_rank_loss_coef > 0 requires --span_loss_type l1, dfl, or fdr.")
-        if opt.top1_rank_loss_coef > 0 and opt.dset_name == "tvsum":
-            raise ValueError("--top1_rank_loss_coef > 0 requires matcher-based VMR training.")
-        if opt.metric_rank_loss_coef < 0:
-            raise ValueError("--metric_rank_loss_coef must be >= 0.")
-        try:
-            metric_rank_thresholds = [
-                float(value.strip()) for value in opt.metric_rank_r1_thresholds.split(",") if value.strip()
-            ]
-        except ValueError as exc:
-            raise ValueError("--metric_rank_r1_thresholds must be comma-separated floats.") from exc
-        if len(metric_rank_thresholds) == 0:
-            raise ValueError("--metric_rank_r1_thresholds must contain at least one threshold.")
-        if any(thd < 0 or thd > 1 for thd in metric_rank_thresholds):
-            raise ValueError("--metric_rank_r1_thresholds values must be in [0, 1].")
-        if opt.metric_rank_gain_tau <= 0:
-            raise ValueError("--metric_rank_gain_tau must be > 0.")
-        if opt.metric_rank_loss_tau <= 0:
-            raise ValueError("--metric_rank_loss_tau must be > 0.")
-        if opt.metric_rank_topk < 1:
-            raise ValueError("--metric_rank_topk must be >= 1.")
-        if opt.metric_rank_quality_topk < 1:
-            raise ValueError("--metric_rank_quality_topk must be >= 1.")
-        if opt.metric_rank_min_gain_gap < 0:
-            raise ValueError("--metric_rank_min_gain_gap must be >= 0.")
-        if opt.metric_rank_top1_guard_margin < 0:
-            raise ValueError("--metric_rank_top1_guard_margin must be >= 0.")
-        if opt.metric_rank_top1_guard_threshold < 0 or opt.metric_rank_top1_guard_threshold > 1:
-            raise ValueError("--metric_rank_top1_guard_threshold must be in [0, 1].")
-        if opt.metric_rank_start_epoch < 0:
-            raise ValueError("--metric_rank_start_epoch must be >= 0.")
-        if opt.metric_rank_loss_coef > 0 and opt.span_loss_type == "ce":
-            raise ValueError("--metric_rank_loss_coef > 0 requires --span_loss_type l1, dfl, or fdr.")
-        if opt.metric_rank_loss_coef > 0 and opt.dset_name == "tvsum":
-            raise ValueError("--metric_rank_loss_coef > 0 requires matcher-based VMR training.")
-        if opt.listwise_rank_loss_coef < 0:
-            raise ValueError("--listwise_rank_loss_coef must be >= 0.")
-        if opt.listwise_rank_score_tau <= 0:
-            raise ValueError("--listwise_rank_score_tau must be > 0.")
-        if opt.listwise_rank_quality_tau <= 0:
-            raise ValueError("--listwise_rank_quality_tau must be > 0.")
-        if opt.listwise_rank_min_quality < 0 or opt.listwise_rank_min_quality > 1:
-            raise ValueError("--listwise_rank_min_quality must be in [0, 1].")
-        if opt.listwise_rank_topk < 2:
-            raise ValueError("--listwise_rank_topk must be >= 2.")
-        if opt.listwise_rank_start_epoch < 0:
-            raise ValueError("--listwise_rank_start_epoch must be >= 0.")
-        if opt.listwise_rank_loss_coef > 0 and opt.span_loss_type == "ce":
-            raise ValueError("--listwise_rank_loss_coef > 0 requires --span_loss_type l1, dfl, or fdr.")
-        if opt.listwise_rank_loss_coef > 0 and opt.dset_name == "tvsum":
-            raise ValueError("--listwise_rank_loss_coef > 0 requires matcher-based VMR training.")
         if opt.width_loss_coef < 0:
             raise ValueError("--width_loss_coef must be >= 0.")
         if opt.width_loss_coef > 0 and opt.width_loss_type != "none" and opt.span_loss_type == "ce":

@@ -61,6 +61,8 @@ aux_one_to_many_k=2
 use_late_gated_video_fusion_flag=--use_late_gated_video_fusion
 use_multiscale_stream_adapter_flag=--use_multiscale_stream_adapter
 multiscale_adapter_dropout=0.1
+multiscale_adapter_dilations=1,3,5,8,13
+multiscale_adapter_kernel_size=5
 
 # Losses: localization and labels
 span_loss_coef=1.0
@@ -80,49 +82,9 @@ quality_label_warmup_epoch=10
 quality_label_ramp_epoch=30
 
 # Losses: GO-LSD self-distillation, disabled by default here
-go_lsd_loss_coef=0.0
+go_lsd_loss_coef=0.3
 go_lsd_temperature=2.0
-go_lsd_start_epoch=10
-
-# Losses: legacy query ranking, disabled for clean metric-rank ablation
-pairwise_rank_loss_coef=0.0
-pairwise_rank_iou_margin=0.10
-pairwise_rank_tau=0.2
-pairwise_rank_score_margin=1.0
-pairwise_rank_length_lambda=0.5
-pairwise_rank_min_quality=0.35
-pairwise_rank_topk=10
-pairwise_rank_start_epoch=20
-rank_quality_type=length_aware
-rank_anchor_matched_only_flag=--rank_anchor_matched_only
-rank_loss_ramp_epoch=10
-
-# Losses: legacy top1-focused ranking inside top-K, disabled for clean metric-rank ablation
-top1_rank_loss_coef=0.0
-top1_rank_quality_margin=0.10
-top1_rank_tau=0.2
-top1_rank_topk=10
-top1_rank_start_epoch=25
-
-# Losses: metric-aware LambdaRank with Top1 Guard for R1
-metric_rank_loss_coef=0.0
-metric_rank_r1_thresholds=0.3,0.5,0.7
-metric_rank_gain_tau=0.05
-metric_rank_loss_tau=0.2
-metric_rank_topk=10
-metric_rank_quality_topk=5
-metric_rank_min_gain_gap=0.05
-metric_rank_top1_guard_margin=0.05
-metric_rank_top1_guard_threshold=0.5
-metric_rank_start_epoch=20
-
-# Losses: legacy listwise query ranking for score separation, disabled for clean metric-rank ablation
-listwise_rank_loss_coef=0.0
-listwise_rank_score_tau=0.2
-listwise_rank_quality_tau=0.1
-listwise_rank_min_quality=0.3
-listwise_rank_topk=10
-listwise_rank_start_epoch=20
+go_lsd_start_epoch=0
 
 # Losses: contrastive query/text alignment
 contrastive_align_loss_flag=--contrastive_align_loss
@@ -130,6 +92,10 @@ contrastive_align_loss_coef=0.3
 contrastive_start_epoch=10
 contrastive_decay_epoch=30
 contrastive_decay_coef=0.1
+
+# Losses: saliency
+lw_saliency=1.0
+saliency_margin=0.2
 
 # Optimization and evaluation
 bsz=32
@@ -189,38 +155,8 @@ PYTHONPATH="${PYTHONPATH}:." python vmr_detr/cli/train.py \
   --go_lsd_loss_coef "${go_lsd_loss_coef}" \
   --go_lsd_temperature "${go_lsd_temperature}" \
   --go_lsd_start_epoch "${go_lsd_start_epoch}" \
-  --pairwise_rank_loss_coef "${pairwise_rank_loss_coef}" \
-  --pairwise_rank_iou_margin "${pairwise_rank_iou_margin}" \
-  --pairwise_rank_tau "${pairwise_rank_tau}" \
-  --pairwise_rank_score_margin "${pairwise_rank_score_margin}" \
-  --pairwise_rank_length_lambda "${pairwise_rank_length_lambda}" \
-  --pairwise_rank_min_quality "${pairwise_rank_min_quality}" \
-  --pairwise_rank_topk "${pairwise_rank_topk}" \
-  --pairwise_rank_start_epoch "${pairwise_rank_start_epoch}" \
-  --rank_quality_type "${rank_quality_type}" \
-  ${rank_anchor_matched_only_flag} \
-  --rank_loss_ramp_epoch "${rank_loss_ramp_epoch}" \
-  --top1_rank_loss_coef "${top1_rank_loss_coef}" \
-  --top1_rank_quality_margin "${top1_rank_quality_margin}" \
-  --top1_rank_tau "${top1_rank_tau}" \
-  --top1_rank_topk "${top1_rank_topk}" \
-  --top1_rank_start_epoch "${top1_rank_start_epoch}" \
-  --metric_rank_loss_coef "${metric_rank_loss_coef}" \
-  --metric_rank_r1_thresholds "${metric_rank_r1_thresholds}" \
-  --metric_rank_gain_tau "${metric_rank_gain_tau}" \
-  --metric_rank_loss_tau "${metric_rank_loss_tau}" \
-  --metric_rank_topk "${metric_rank_topk}" \
-  --metric_rank_quality_topk "${metric_rank_quality_topk}" \
-  --metric_rank_min_gain_gap "${metric_rank_min_gain_gap}" \
-  --metric_rank_top1_guard_margin "${metric_rank_top1_guard_margin}" \
-  --metric_rank_top1_guard_threshold "${metric_rank_top1_guard_threshold}" \
-  --metric_rank_start_epoch "${metric_rank_start_epoch}" \
-  --listwise_rank_loss_coef "${listwise_rank_loss_coef}" \
-  --listwise_rank_score_tau "${listwise_rank_score_tau}" \
-  --listwise_rank_quality_tau "${listwise_rank_quality_tau}" \
-  --listwise_rank_min_quality "${listwise_rank_min_quality}" \
-  --listwise_rank_topk "${listwise_rank_topk}" \
-  --listwise_rank_start_epoch "${listwise_rank_start_epoch}" \
+  --lw_saliency "${lw_saliency}" \
+  --saliency_margin "${saliency_margin}" \
   ${contrastive_align_loss_flag} \
   --contrastive_align_loss_coef "${contrastive_align_loss_coef}" \
   --contrastive_start_epoch "${contrastive_start_epoch}" \
@@ -238,4 +174,6 @@ PYTHONPATH="${PYTHONPATH}:." python vmr_detr/cli/train.py \
   ${use_late_gated_video_fusion_flag} \
   ${use_multiscale_stream_adapter_flag} \
   --multiscale_adapter_dropout "${multiscale_adapter_dropout}" \
+  --multiscale_adapter_dilations "${multiscale_adapter_dilations}" \
+  --multiscale_adapter_kernel_size "${multiscale_adapter_kernel_size}" \
   "$@"
