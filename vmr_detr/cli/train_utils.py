@@ -1,10 +1,8 @@
+import math
 import re
 import random
 import numpy as np
 import torch
-
-from vmr_detr.data.start_end_dataset import StartEndDataset
-from vmr_detr.data.start_end_dataset_audio import StartEndDataset_audio
 
 
 MAIN_METRIC_ORDER = [
@@ -114,11 +112,18 @@ class ModelEMA(object):
         self.shadow_buffers = {}
         self.backup_params = None
         self.backup_buffers = None
+        self.reset(model)
+
+    def reset(self, model):
+        self.shadow_params = {}
+        self.shadow_buffers = {}
         for name, param in model.named_parameters():
             if param.requires_grad:
                 self.shadow_params[name] = param.detach().clone()
         for name, buf in model.named_buffers():
             self.shadow_buffers[name] = buf.detach().clone()
+        self.backup_params = None
+        self.backup_buffers = None
 
     def update(self, model):
         one_minus_decay = 1.0 - self.decay
@@ -180,7 +185,85 @@ class ModelEMA(object):
         self.shadow_buffers = {k: v.detach().clone() for k, v in state.get("shadow_buffers", {}).items()}
 
 
+class EMAScheduler(object):
+    def __init__(
+        self,
+        ema,
+        start_decay=0.99,
+        target_decay=0.999,
+        warmup_updates=2000,
+        update_every=1,
+        schedule="cosine",
+    ):
+        self.ema = ema
+        self.start_decay = float(start_decay)
+        self.target_decay = float(target_decay)
+        self.warmup_updates = max(int(warmup_updates), 1)
+        self.update_every = max(int(update_every), 1)
+        self.schedule = schedule
+        self.num_updates = 0
+        self.num_ema_updates = 0
+
+    def _progress(self):
+        if self.warmup_updates <= 1:
+            return 1.0
+        return min(max((self.num_ema_updates - 1) / (self.warmup_updates - 1), 0.0), 1.0)
+
+    def get_decay(self):
+        progress = self._progress()
+
+        if self.schedule == "linear":
+            decay = self.start_decay + progress * (self.target_decay - self.start_decay)
+        elif self.schedule == "cosine":
+            decay = self.target_decay - (
+                self.target_decay - self.start_decay
+            ) * (math.cos(math.pi * progress) + 1.0) / 2.0
+        else:
+            decay = self.target_decay
+
+        return decay
+
+    def step(self, model):
+        self.num_updates += 1
+
+        if self.num_updates % self.update_every != 0:
+            return None
+
+        self.num_ema_updates += 1
+        decay = self.get_decay()
+
+        self.ema.decay = decay ** self.update_every
+        self.ema.update(model)
+
+        return self.ema.decay
+
+    def state_dict(self):
+        return dict(
+            start_decay=self.start_decay,
+            target_decay=self.target_decay,
+            warmup_updates=self.warmup_updates,
+            update_every=self.update_every,
+            schedule=self.schedule,
+            num_updates=self.num_updates,
+            num_ema_updates=self.num_ema_updates,
+        )
+
+    def load_state_dict(self, state):
+        if state is None:
+            return
+        self.start_decay = float(state.get("start_decay", self.start_decay))
+        self.target_decay = float(state.get("target_decay", self.target_decay))
+        self.warmup_updates = max(int(state.get("warmup_updates", self.warmup_updates)), 1)
+        self.update_every = max(int(state.get("update_every", self.update_every)), 1)
+        self.schedule = state.get("schedule", self.schedule)
+        self.num_updates = int(state.get("num_updates", 0))
+        self.num_ema_updates = int(state.get("num_ema_updates", 0))
+
+
 def build_datasets(opt):
+    from vmr_detr.data.start_end_dataset import StartEndDataset
+    from vmr_detr.data.start_end_dataset_audio import StartEndDataset_audio
+
     if opt.a_feat_dir is None:
         dataset_config = dict(
             dset_name=opt.dset_name,

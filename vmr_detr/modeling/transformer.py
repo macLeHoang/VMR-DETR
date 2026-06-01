@@ -104,7 +104,7 @@ class Transformer(nn.Module):
                 nn.init.xavier_uniform_(p)
 
     # for tvsum, add video_length in argument
-    def forward(self, src, mask, query_embed, pos_embed, video_length=None):
+    def forward(self, src, mask, query_embed, pos_embed, video_length=None, level1_length=None):
         """
         Args:
             src: (batch_size, L, d)
@@ -117,6 +117,10 @@ class Transformer(nn.Module):
         """
         # flatten NxCxHxW to HWxNxC
         bs, l, d = src.shape
+        if video_length is None:
+            video_length = l - 1
+        if level1_length is None:
+            level1_length = video_length
         src = src.permute(1, 0, 2)  # (L, batch_size, d)
         pos_embed = pos_embed.permute(1, 0, 2)   # (L, batch_size, d)
         refpoint_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)  # (#queries, batch_size, d)
@@ -135,12 +139,12 @@ class Transformer(nn.Module):
         mask_local = mask[:, 1:]
         pos_embed_local = pos_embed[1:]
 
-        tgt = torch.zeros(refpoint_embed.shape[0], bs, d).cuda()
+        tgt = torch.zeros(refpoint_embed.shape[0], bs, d, device=src.device)
         hs, references = self.decoder(tgt, memory_local, memory_key_padding_mask=mask_local,
                           pos=pos_embed_local, refpoints_unsigmoid=refpoint_embed)  # (#layers, #queries, batch_size, d)
         # hs = hs.transpose(1, 2)  # (#layers, batch_size, #qeries, d)
         # memory = memory.permute(1, 2, 0)  # (batch_size, d, L)
-        memory_local = memory_local.transpose(0, 1)  # (batch_size, L, d)
+        memory_local = memory_local[:level1_length].transpose(0, 1)  # (batch_size, L_level1, d)
         txt_memory = txt_memory.transpose(0, 1)  # (batch_size, L_txt, d)
         return hs, references, memory_local, memory_global, txt_memory
 

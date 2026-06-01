@@ -54,6 +54,8 @@ fdr_num_bins=32
 fdr_reg_scale=1.5
 fdr_min_ref_width=0.01
 query_anchor_widths=0.08,0.22,0.48
+temporal_pyramid_flag=--use_temporal_pyramid
+temporal_pyramid_downsample=conv
 matching_type=hungarian
 aux_matching_type=hungarian
 aux_one_to_many_k=2
@@ -63,8 +65,8 @@ set_cost_class=8
 
 # Losses: localization and labels
 span_loss_coef=1.0
-span_xx_loss_coef=4.0
-fgl_loss_coef=1.0
+span_xx_loss_coef=5.0
+fgl_loss_coef=2.0
 giou_loss_coef=1.0
 width_loss_type=log
 width_loss_coef=0.5
@@ -73,19 +75,19 @@ label_loss_coef=4.0
 # Losses: label supervision
 label_loss_type=quality
 quality_label_strength=1.0
-quality_label_iou_gamma=1.5
-quality_label_warmup_epoch=0
+quality_label_iou_gamma=2.0
+quality_label_warmup_epoch=5
 quality_label_ramp_epoch=5
 
 # Losses: GO-LSD self-distillation, disabled by default here
 go_lsd_loss_coef=0.5
-go_lsd_temperature=4.0
-go_lsd_start_epoch=0
+go_lsd_temperature=2.0
+go_lsd_start_epoch=5
 
 # Losses: contrastive query/text alignment
 contrastive_align_loss_flag=--contrastive_align_loss
 contrastive_align_loss_coef=0.3
-contrastive_start_epoch=0
+contrastive_start_epoch=5
 contrastive_decay_epoch=30
 contrastive_decay_coef=0.1
 
@@ -104,6 +106,11 @@ lrf=0.01
 num_workers=2
 eval_every_epoch_after=40
 ema_decay=0.999
+ema_start_epoch=1
+ema_start_decay=0.99
+ema_warmup_updates=1000
+ema_update_every=1
+ema_schedule=cosine
 max_es_cnt=10
 best_metric=MR-full-R1@0.5+0.7
 
@@ -130,6 +137,8 @@ PYTHONPATH="${PYTHONPATH}:." python vmr_detr/cli/train.py \
   --exp_id "${exp_id}" \
   --query_init temporal_anchors \
   "${query_anchor_widths_args[@]}" \
+  ${temporal_pyramid_flag} \
+  --temporal_pyramid_downsample "${temporal_pyramid_downsample}" \
   --bsz "${bsz}" \
   --eval_bsz "${eval_bsz}" \
   --n_epoch "${n_epoch}" \
@@ -175,6 +184,12 @@ PYTHONPATH="${PYTHONPATH}:." python vmr_detr/cli/train.py \
   --num_workers "${num_workers}" \
   --eval_every_epoch_after "${eval_every_epoch_after}" \
   --ema_decay "${ema_decay}" \
+  --ema_scheduler \
+  --ema_start_epoch "${ema_start_epoch}" \
+  --ema_start_decay "${ema_start_decay}" \
+  --ema_warmup_updates "${ema_warmup_updates}" \
+  --ema_update_every "${ema_update_every}" \
+  --ema_schedule "${ema_schedule}" \
   --max_es_cnt "${max_es_cnt}" \
   --best_metric "${best_metric}" \
   "$@"

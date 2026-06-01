@@ -70,6 +70,16 @@ class BaseOptions(object):
                             help="EMA decay for model weights. Set <=0 to disable.")
         parser.add_argument("--ema_start_epoch", type=int, default=0,
                             help="Epoch index (1-based) to start EMA updates.")
+        parser.add_argument("--ema_scheduler", action="store_true",
+                            help="Enable scheduled EMA decay warmup. Disabled keeps fixed --ema_decay behavior.")
+        parser.add_argument("--ema_start_decay", type=float, default=0.99,
+                            help="Initial EMA decay when --ema_scheduler is enabled.")
+        parser.add_argument("--ema_warmup_updates", type=int, default=2000,
+                            help="Number of EMA updates to ramp from --ema_start_decay to --ema_decay.")
+        parser.add_argument("--ema_update_every", type=int, default=1,
+                            help="Run one EMA update every N optimizer updates.")
+        parser.add_argument("--ema_schedule", type=str, default="cosine", choices=["cosine", "linear", "constant"],
+                            help="EMA decay schedule used when --ema_scheduler is enabled.")
         parser.add_argument("--eval_epoch_interval", type=int, default=5,
                             help="Run validation every N epochs.")
         parser.add_argument("--eval_every_epoch_after", type=int, default=-1,
@@ -132,6 +142,10 @@ class BaseOptions(object):
                             help="Query reference initialization strategy.")
         parser.add_argument("--query_anchor_widths", default="", type=str,
                             help="Comma-separated normalized widths for temporal anchor query initialization.")
+        parser.add_argument("--use_temporal_pyramid", action="store_true",
+                            help="Use pooled multi-scale temporal video tokens in transformer memory.")
+        parser.add_argument("--temporal_pyramid_downsample", default="avg", choices=["avg", "conv"],
+                            help="Downsample method for temporal pyramid video tokens.")
         parser.add_argument('--pre_norm', action='store_true')
         # other model configs
         parser.add_argument("--n_input_proj", type=int, default=2, help="#layers to encoder input")

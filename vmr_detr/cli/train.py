@@ -20,6 +20,7 @@ from vmr_detr.cli.inference import eval_epoch, start_inference, setup_model
 from utils.basic_utils import AverageMeter
 from utils.model_utils import count_parameters
 from vmr_detr.cli.train_utils import (
+    EMAScheduler,
     ModelEMA,
     build_datasets,
     log_validation_summary,
@@ -37,7 +38,17 @@ COMPOSITE_BEST_METRICS = {
 }
 
 
-def train_epoch(model, criterion, train_loader, optimizer, opt, epoch_i, ema=None):
+def train_epoch(
+    model,
+    criterion,
+    train_loader,
+    optimizer,
+    opt,
+    epoch_i,
+    ema=None,
+    ema_scheduler=None,
+    ema_reset_pending=False,
+):
     logger.info(f"[Epoch {epoch_i+1}]")
     model.train()
     criterion.train()
@@ -74,8 +85,16 @@ def train_epoch(model, criterion, train_loader, optimizer, opt, epoch_i, ema=Non
         if opt.grad_clip > 0:
             nn.utils.clip_grad_norm_(model.parameters(), opt.grad_clip)
         optimizer.step()
+        latest_ema_decay = None
         if ema is not None and (epoch_i + 1) >= opt.ema_start_epoch:
-            ema.update(model)
+            if ema_reset_pending:
+                ema.reset(model)
+                ema_reset_pending = False
+            if ema_scheduler is not None:
+                latest_ema_decay = ema_scheduler.step(model)
+            else:
+                ema.update(model)
+                latest_ema_decay = ema.decay
         time_meters["model_backward_time"].update(time.time() - timer_start)
 
         loss_dict["loss_overall"] = losses.detach().item()  # for logging only
@@ -89,6 +108,8 @@ def train_epoch(model, criterion, train_loader, optimizer, opt, epoch_i, ema=Non
         
         display_stats = {k: v.item() if isinstance(v, torch.Tensor) else v 
                  for k, v in loss_dict.items()}
+        if latest_ema_decay is not None:
+            display_stats["ema_decay"] = latest_ema_decay
         pbar.set_postfix(display_stats)
 
     to_write = opt.train_log_txt_formatter.format(
@@ -102,6 +123,8 @@ def train_epoch(model, criterion, train_loader, optimizer, opt, epoch_i, ema=Non
     for name, meter in time_meters.items():
         d = {k: f"{getattr(meter, k):.4f}" for k in ["max", "min", "avg"]}
         logger.info(f"{name} ==> {d}")
+
+    return ema_reset_pending
 
 
 def get_stop_score(metrics, opt, fallback_metric):
@@ -123,6 +146,55 @@ def get_stop_score(metrics, opt, fallback_metric):
         available = ", ".join(brief.keys())
         raise KeyError(f"best metric '{opt.best_metric}' not found. Available metrics: {available}")
     return brief[metric_name], metric_name
+
+
+def setup_ema(model, opt):
+    if opt.ema_decay <= 0:
+        return None, None, False
+
+    ema = ModelEMA(model, opt.ema_decay)
+    ema_state_loaded = hasattr(opt, "_ema_state_dict")
+    if ema_state_loaded:
+        ema.load_state_dict(opt._ema_state_dict)
+        logger.info(f"Restored EMA state from checkpoint (decay={ema.decay:.6f}).")
+
+    ema_scheduler = None
+    if getattr(opt, "ema_scheduler", False):
+        ema_scheduler = EMAScheduler(
+            ema,
+            start_decay=opt.ema_start_decay,
+            target_decay=opt.ema_decay,
+            warmup_updates=opt.ema_warmup_updates,
+            update_every=opt.ema_update_every,
+            schedule=opt.ema_schedule,
+        )
+        if hasattr(opt, "_ema_scheduler_state_dict"):
+            ema_scheduler.load_state_dict(opt._ema_scheduler_state_dict)
+            logger.info("Restored EMA scheduler state from checkpoint.")
+        elif ema_state_loaded:
+            logger.info("EMA scheduler state missing from checkpoint; starting scheduler counters from zero.")
+        logger.info(
+            "EMA scheduler enabled "
+            f"(start_decay={ema_scheduler.start_decay:.6f}, "
+            f"target_decay={ema_scheduler.target_decay:.6f}, "
+            f"warmup_updates={ema_scheduler.warmup_updates}, "
+            f"update_every={ema_scheduler.update_every}, "
+            f"schedule={ema_scheduler.schedule}, "
+            f"start_epoch={opt.ema_start_epoch})."
+        )
+    else:
+        logger.info(f"EMA enabled with fixed decay={ema.decay:.6f}, start_epoch={opt.ema_start_epoch}.")
+
+    ema_reset_pending = opt.ema_start_epoch > 1 and not ema_state_loaded
+    return ema, ema_scheduler, ema_reset_pending
+
+
+def add_ema_checkpoint_state(checkpoint, ema, ema_scheduler):
+    if ema is None:
+        return
+    checkpoint["ema_state"] = ema.state_dict()
+    if ema_scheduler is not None:
+        checkpoint["ema_scheduler_state"] = ema_scheduler.state_dict()
 
 
 def train(model, criterion, optimizer, lr_scheduler, train_dataset, val_dataset, opt):
@@ -154,13 +226,7 @@ def train(model, criterion, optimizer, lr_scheduler, train_dataset, val_dataset,
 
     prev_best_score = 0.
     es_cnt = 0
-    use_ema = opt.ema_decay > 0
-    ema = ModelEMA(model, opt.ema_decay) if use_ema else None
-    if ema is not None and hasattr(opt, "_ema_state_dict"):
-        ema.load_state_dict(opt._ema_state_dict)
-        logger.info(f"Restored EMA state from checkpoint (decay={ema.decay:.6f}).")
-    if ema is not None:
-        logger.info(f"EMA enabled with decay={ema.decay:.6f}, start_epoch={opt.ema_start_epoch}.")
+    ema, ema_scheduler, ema_reset_pending = setup_ema(model, opt)
     # start_epoch = 0
     if opt.start_epoch is None:
         start_epoch = -1 if opt.eval_untrained else 0
@@ -170,7 +236,17 @@ def train(model, criterion, optimizer, lr_scheduler, train_dataset, val_dataset,
 
     for epoch_i in range(start_epoch, opt.n_epoch):
         if epoch_i > -1:
-            train_epoch(model, criterion, train_loader, optimizer, opt, epoch_i, ema=ema)
+            ema_reset_pending = train_epoch(
+                model,
+                criterion,
+                train_loader,
+                optimizer,
+                opt,
+                epoch_i,
+                ema=ema,
+                ema_scheduler=ema_scheduler,
+                ema_reset_pending=ema_reset_pending,
+            )
             lr_scheduler.step()
 
         if opt.eval_path is not None and should_run_eval(opt, epoch_i):
@@ -215,8 +291,7 @@ def train(model, criterion, optimizer, lr_scheduler, train_dataset, val_dataset,
                     "epoch": epoch_i,
                     "opt": opt
                 }
-                if ema is not None:
-                    checkpoint["ema_state"] = ema.state_dict()
+                add_ema_checkpoint_state(checkpoint, ema, ema_scheduler)
                 torch.save(checkpoint, opt.ckpt_filepath.replace(".ckpt", "_best.ckpt"))
 
                 best_file_paths = [e.replace("latest", "best") for e in latest_file_paths]
@@ -240,8 +315,7 @@ def train(model, criterion, optimizer, lr_scheduler, train_dataset, val_dataset,
                 "epoch": epoch_i,
                 "opt": opt
             }
-            if ema is not None:
-                checkpoint["ema_state"] = ema.state_dict()
+            add_ema_checkpoint_state(checkpoint, ema, ema_scheduler)
             torch.save(checkpoint, opt.ckpt_filepath.replace(".ckpt", "_latest.ckpt"))
 
         save_interval = 10 if "subs_train" in opt.train_path else 50  # smaller for pretrain
@@ -261,8 +335,7 @@ def train(model, criterion, optimizer, lr_scheduler, train_dataset, val_dataset,
                 "epoch": epoch_i,
                 "opt": opt
             }
-            if ema is not None:
-                checkpoint["ema_state"] = ema.state_dict()
+            add_ema_checkpoint_state(checkpoint, ema, ema_scheduler)
             torch.save(checkpoint, opt.ckpt_filepath.replace(".ckpt", f"_e{epoch_i:04d}.ckpt"))
 
         if opt.debug:
@@ -287,13 +360,7 @@ def train_hl(model, criterion, optimizer, lr_scheduler, train_dataset, val_datas
 
     prev_best_score = 0.
     es_cnt = 0
-    use_ema = opt.ema_decay > 0
-    ema = ModelEMA(model, opt.ema_decay) if use_ema else None
-    if ema is not None and hasattr(opt, "_ema_state_dict"):
-        ema.load_state_dict(opt._ema_state_dict)
-        logger.info(f"Restored EMA state from checkpoint (decay={ema.decay:.6f}).")
-    if ema is not None:
-        logger.info(f"EMA enabled with decay={ema.decay:.6f}, start_epoch={opt.ema_start_epoch}.")
+    ema, ema_scheduler, ema_reset_pending = setup_ema(model, opt)
     # start_epoch = 0
     if opt.start_epoch is None:
         start_epoch = -1 if opt.eval_untrained else 0
@@ -302,7 +369,17 @@ def train_hl(model, criterion, optimizer, lr_scheduler, train_dataset, val_datas
     save_submission_filename = "latest_{}_{}_preds.jsonl".format(opt.dset_name, opt.eval_split_name)
     for epoch_i in trange(start_epoch, opt.n_epoch, desc="Epoch"):
         if epoch_i > -1:
-            train_epoch(model, criterion, train_loader, optimizer, opt, epoch_i, ema=ema)
+            ema_reset_pending = train_epoch(
+                model,
+                criterion,
+                train_loader,
+                optimizer,
+                opt,
+                epoch_i,
+                ema=ema,
+                ema_scheduler=ema_scheduler,
+                ema_reset_pending=ema_reset_pending,
+            )
             lr_scheduler.step()
         if opt.eval_path is not None and should_run_eval(opt, epoch_i):
             using_ema_eval = ema is not None and (epoch_i + 1) >= opt.ema_start_epoch
@@ -346,8 +423,7 @@ def train_hl(model, criterion, optimizer, lr_scheduler, train_dataset, val_datas
                     "epoch": epoch_i,
                     "opt": opt
                 }
-                if ema is not None:
-                    checkpoint["ema_state"] = ema.state_dict()
+                add_ema_checkpoint_state(checkpoint, ema, ema_scheduler)
                 torch.save(checkpoint, opt.ckpt_filepath.replace(".ckpt", "_best.ckpt"))
 
                 best_file_paths = [e.replace("latest", "best") for e in latest_file_paths]
@@ -370,6 +446,7 @@ def train_hl(model, criterion, optimizer, lr_scheduler, train_dataset, val_datas
                 "epoch": epoch_i,
                 "opt": opt
             }
+            add_ema_checkpoint_state(checkpoint, ema, ema_scheduler)
             # torch.save(checkpoint, opt.ckpt_filepath.replace(".ckpt", "_latest.ckpt"))
 
         save_interval = 10 if "subs_train" in opt.train_path else 50  # smaller for pretrain
@@ -380,6 +457,7 @@ def train_hl(model, criterion, optimizer, lr_scheduler, train_dataset, val_datas
                 "epoch": epoch_i,
                 "opt": opt
             }
+            add_ema_checkpoint_state(checkpoint, ema, ema_scheduler)
             # torch.save(checkpoint, opt.ckpt_filepath.replace(".ckpt", f"_e{epoch_i:04d}.ckpt"))
 
         if opt.debug:

@@ -365,6 +365,8 @@ def setup_model(opt):
         model.load_state_dict(state_dict)
         if "ema_state" in checkpoint:
             setattr(opt, "_ema_state_dict", checkpoint["ema_state"])
+        if "ema_scheduler_state" in checkpoint:
+            setattr(opt, "_ema_scheduler_state_dict", checkpoint["ema_scheduler_state"])
         if opt.resume_all:
             optimizer.load_state_dict(checkpoint['optimizer'])
             lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])

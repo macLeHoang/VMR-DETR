@@ -26,9 +26,9 @@ def build_inference_model(ckpt_path, **kwargs):
         span_loss_type=args.span_loss_type,
         use_txt_pos=args.use_txt_pos,
         n_input_proj=args.n_input_proj,
+        use_temporal_pyramid=getattr(args, "use_temporal_pyramid", False),
+        temporal_pyramid_downsample=getattr(args, "temporal_pyramid_downsample", "avg"),
     )
 
     model.load_state_dict(ckpt["model"])
     return model
-
-

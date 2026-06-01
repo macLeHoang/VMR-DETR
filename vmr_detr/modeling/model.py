@@ -151,7 +151,8 @@ class VMRDETR(nn.Module):
                  max_v_l=75, span_loss_type="l1", use_txt_pos=False, n_input_proj=2, aud_dim=0,
                  dfl_num_bins=16, dfl_ref_prior_sigma=2.0,
                  fdr_num_bins=32, fdr_reg_scale=1.5, fdr_min_ref_width=None,
-                 query_init="random", query_anchor_widths=None):
+                 query_init="random", query_anchor_widths=None,
+                 use_temporal_pyramid=False, temporal_pyramid_downsample="avg"):
         """ Initializes the model.
         Parameters:
             transformer: torch module of the transformer architecture. See transformer.py
@@ -173,6 +174,8 @@ class VMRDETR(nn.Module):
                 dfl: start/end boundary distributions with expectation decoding.
                 fdr: residual start/end boundary-offset distributions around decoder references.
             query_anchor_widths: optional normalized widths for temporal anchor query initialization.
+            use_temporal_pyramid: if true, decoder attends to pooled temporal levels in addition to level 1.
+            temporal_pyramid_downsample: temporal pyramid downsample method, one of [avg, conv].
             # foreground_thd: float, intersection over prediction >= foreground_thd: labeled as foreground
             # background_thd: float, intersection over prediction <= background_thd: labeled background
         """
@@ -184,6 +187,10 @@ class VMRDETR(nn.Module):
         hidden_dim = transformer.d_model
         self.span_loss_type = span_loss_type
         self.max_v_l = max_v_l
+        self.use_temporal_pyramid = use_temporal_pyramid
+        if temporal_pyramid_downsample not in ("avg", "conv"):
+            raise ValueError("temporal_pyramid_downsample must be one of ['avg', 'conv'].")
+        self.temporal_pyramid_downsample = temporal_pyramid_downsample
         if dfl_num_bins < 2:
             raise ValueError("dfl_num_bins must be >= 2.")
         if dfl_ref_prior_sigma <= 0:
@@ -252,15 +259,107 @@ class VMRDETR(nn.Module):
         self.hidden_dim = hidden_dim
         self.global_rep_token = torch.nn.Parameter(torch.randn(hidden_dim))
         self.global_rep_pos = torch.nn.Parameter(torch.randn(hidden_dim))
+        self.video_level_embed = nn.Embedding(3, hidden_dim) if use_temporal_pyramid else None
+        if use_temporal_pyramid and temporal_pyramid_downsample == "conv":
+            self.temporal_downsample = nn.ModuleList([
+                nn.Identity(),
+                self._make_temporal_downsample(hidden_dim, kernel_size=3, stride=2, padding=1),
+                self._make_temporal_downsample(hidden_dim, kernel_size=5, stride=4, padding=2),
+            ])
+        else:
+            self.temporal_downsample = None
 
     def _validate_text_mask(self, src_txt, src_txt_mask):
         if src_txt.shape[1] == 0 or not src_txt_mask.bool().any(dim=1).all():
             raise ValueError("Each sample must contain at least one valid text token.")
 
+    @staticmethod
+    def _make_temporal_downsample(hidden_dim, kernel_size, stride, padding):
+        depthwise = nn.Conv1d(
+            hidden_dim, hidden_dim, kernel_size=kernel_size, stride=stride,
+            padding=padding, groups=hidden_dim, bias=False
+        )
+        pointwise = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=1, bias=False)
+        with torch.no_grad():
+            depthwise.weight.fill_(1.0 / float(kernel_size))
+            pointwise.weight.zero_()
+            idx = torch.arange(hidden_dim)
+            pointwise.weight[idx, idx, 0] = 1.0
+        return nn.Sequential(depthwise, pointwise)
+
+    @staticmethod
+    def _masked_temporal_pool(x, valid_mask, kernel_size, stride):
+        valid_mask = valid_mask.bool()
+        valid = valid_mask.to(dtype=x.dtype).unsqueeze(-1)
+        x = x * valid
+
+        pooled_x = F.avg_pool1d(
+            x.transpose(1, 2),
+            kernel_size=kernel_size,
+            stride=stride,
+            ceil_mode=True,
+            count_include_pad=False,
+        ).transpose(1, 2)
+        pooled_valid = F.avg_pool1d(
+            valid.transpose(1, 2),
+            kernel_size=kernel_size,
+            stride=stride,
+            ceil_mode=True,
+            count_include_pad=False,
+        ).transpose(1, 2)
+
+        pooled_mask = pooled_valid.squeeze(-1) > 0
+        pooled_x = pooled_x / pooled_valid.clamp_min(1e-6)
+        pooled_x = pooled_x * pooled_mask.to(dtype=x.dtype).unsqueeze(-1)
+        return pooled_x, pooled_mask
+
+    @staticmethod
+    def _temporal_conv_mask(valid_mask, kernel_size, stride, padding):
+        valid = valid_mask.bool().float().unsqueeze(1)
+        pooled = F.max_pool1d(valid, kernel_size=kernel_size, stride=stride, padding=padding)
+        return pooled.squeeze(1).bool()
+
+    def _masked_temporal_conv(self, x, valid_mask, level_idx, kernel_size, stride, padding):
+        valid_mask = valid_mask.bool()
+        x = x * valid_mask.to(dtype=x.dtype).unsqueeze(-1)
+        pooled_x = self.temporal_downsample[level_idx](x.transpose(1, 2)).transpose(1, 2)
+        pooled_mask = self._temporal_conv_mask(valid_mask, kernel_size, stride, padding)
+        pooled_x = pooled_x * pooled_mask.to(dtype=x.dtype).unsqueeze(-1)
+        return pooled_x, pooled_mask
+
+    def _build_temporal_pyramid(self, src_vid, src_vid_mask):
+        v1 = src_vid
+        m1 = src_vid_mask.bool()
+        pos1 = self.position_embed(v1, m1)
+
+        if not self.use_temporal_pyramid:
+            return v1, m1, pos1, v1.shape[1]
+
+        if self.temporal_pyramid_downsample == "conv":
+            v2, m2 = self._masked_temporal_conv(v1, m1, level_idx=1, kernel_size=3, stride=2, padding=1)
+            v3, m3 = self._masked_temporal_conv(v1, m1, level_idx=2, kernel_size=5, stride=4, padding=2)
+        else:
+            v2, m2 = self._masked_temporal_pool(v1, m1, kernel_size=2, stride=2)
+            v3, m3 = self._masked_temporal_pool(v1, m1, kernel_size=4, stride=4)
+        pos2 = self.position_embed(v2, m2)
+        pos3 = self.position_embed(v3, m3)
+
+        level_embed = self.video_level_embed.weight
+        pos1 = pos1 + level_embed[0].view(1, 1, -1)
+        pos2 = pos2 + level_embed[1].view(1, 1, -1)
+        pos3 = pos3 + level_embed[2].view(1, 1, -1)
+
+        src_vid_pyr = torch.cat([v1, v2, v3], dim=1)
+        src_vid_pyr_mask = torch.cat([m1, m2, m3], dim=1)
+        pos_vid_pyr = torch.cat([pos1, pos2, pos3], dim=1)
+        return src_vid_pyr, src_vid_pyr_mask, pos_vid_pyr, v1.shape[1]
+
     def _run_text_video_transformer(self, src_vid, src_vid_mask, src_txt, src_txt_mask):
+        src_vid, src_vid_mask_for_transformer, pos_vid, level1_length = self._build_temporal_pyramid(
+            src_vid, src_vid_mask
+        )
         src = torch.cat([src_vid, src_txt], dim=1)  # (bsz, L_vid+L_txt, d)
-        mask = torch.cat([src_vid_mask, src_txt_mask], dim=1).bool()  # (bsz, L_vid+L_txt)
-        pos_vid = self.position_embed(src_vid, src_vid_mask)  # (bsz, L_vid, d)
+        mask = torch.cat([src_vid_mask_for_transformer, src_txt_mask.bool()], dim=1)  # (bsz, L_vid+L_txt)
         pos_txt = self.txt_position_embed(src_txt) if self.use_txt_pos else torch.zeros_like(src_txt)
         pos = torch.cat([pos_vid, pos_txt], dim=1)
 
@@ -272,7 +371,8 @@ class VMRDETR(nn.Module):
         pos = torch.cat([pos_global, pos], dim=1)
 
         return self.transformer(
-            src, ~mask, self.query_embed.weight, pos, video_length=src_vid.shape[1]
+            src, ~mask, self.query_embed.weight, pos,
+            video_length=src_vid.shape[1], level1_length=level1_length
         )
 
     def forward(self, src_txt, src_txt_mask, src_vid, src_vid_mask, src_aud=None, src_aud_mask=None):
@@ -1249,6 +1349,8 @@ def build_model(args):
     fdr_min_ref_width = getattr(args, "fdr_min_ref_width", None)
     query_init = getattr(args, "query_init", "random")
     query_anchor_widths = getattr(args, "query_anchor_widths", None)
+    use_temporal_pyramid = getattr(args, "use_temporal_pyramid", False)
+    temporal_pyramid_downsample = getattr(args, "temporal_pyramid_downsample", "avg")
     if fdr_min_ref_width is not None and fdr_min_ref_width <= 0:
         fdr_min_ref_width = 1.0 / float(args.max_v_l)
 
@@ -1275,6 +1377,8 @@ def build_model(args):
             n_input_proj=args.n_input_proj,
             query_init=query_init,
             query_anchor_widths=query_anchor_widths,
+            use_temporal_pyramid=use_temporal_pyramid,
+            temporal_pyramid_downsample=temporal_pyramid_downsample,
         )
     else:
         model = VMRDETR(
@@ -1300,6 +1404,8 @@ def build_model(args):
             n_input_proj=args.n_input_proj,
             query_init=query_init,
             query_anchor_widths=query_anchor_widths,
+            use_temporal_pyramid=use_temporal_pyramid,
+            temporal_pyramid_downsample=temporal_pyramid_downsample,
         )
 
     matching_type = getattr(args, "matching_type", "hungarian")
