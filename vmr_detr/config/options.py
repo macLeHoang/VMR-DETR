@@ -128,29 +128,13 @@ class BaseOptions(object):
                             help="Number of attention heads inside the transformer's attentions")
         parser.add_argument('--num_queries', default=10, type=int,
                             help="Number of query slots")
+        parser.add_argument("--query_init", default="random", choices=["random", "temporal_anchors"],
+                            help="Query reference initialization strategy.")
+        parser.add_argument("--query_anchor_widths", default="", type=str,
+                            help="Comma-separated normalized widths for temporal anchor query initialization.")
         parser.add_argument('--pre_norm', action='store_true')
         # other model configs
         parser.add_argument("--n_input_proj", type=int, default=2, help="#layers to encoder input")
-        parser.add_argument("--use_gated_video_fusion", action="store_true",
-                            help="Enable early text-conditioned gated fusion for SlowFast/CLIP video features.")
-        parser.add_argument("--use_late_gated_video_fusion", action="store_true",
-                            help="Enable late stream-aware gated fusion for SlowFast/CLIP video features.")
-        parser.add_argument("--use_multiscale_stream_adapter", action="store_true",
-                            help="Enable a same-length residual multi-scale temporal adapter on CLIP before late fusion.")
-        parser.add_argument("--multiscale_adapter_dropout", type=float, default=0.05,
-                            help="Dropout used inside the residual multi-scale temporal adapter.")
-        parser.add_argument("--multiscale_adapter_dilations", type=str, default="1,2,3",
-                            help="Comma-separated positive integer dilations for the residual multi-scale "
-                                 "temporal adapter, e.g. 1,3,7 or 1,3,7,9.")
-        parser.add_argument("--multiscale_adapter_kernel_size", type=int, default=3,
-                            help="Positive odd Conv1d kernel size for every residual multi-scale "
-                                 "temporal adapter branch.")
-        parser.add_argument("--slowfast_dim", type=int, default=2304,
-                            help="SlowFast feature dim inside concatenated video features.")
-        parser.add_argument("--clip_dim", type=int, default=512,
-                            help="CLIP video feature dim inside concatenated video features.")
-        parser.add_argument("--tef_dim", type=int, default=2,
-                            help="TEF feature dim appended to video features when ctx_mode includes tef.")
         parser.add_argument("--contrastive_hdim", type=int, default=64, help="dim for contrastive embeddings")
         parser.add_argument("--temperature", type=float, default=0.07, help="temperature nce contrastive_align_loss")
         # Loss
@@ -206,6 +190,8 @@ class BaseOptions(object):
 
         # * Loss coefficients
         parser.add_argument('--span_loss_coef', default=10, type=float)
+        parser.add_argument("--span_xx_loss_coef", default=0.0, type=float,
+                            help="Optional L1 loss weight on normalized start/end span boundaries.")
         parser.add_argument("--fgl_loss_coef", default=None, type=float,
                             help="FGL loss weight for --span_loss_type fdr. Defaults to span_loss_coef.")
         parser.add_argument("--go_lsd_loss_coef", default=0.0, type=float,
@@ -291,20 +277,20 @@ class BaseOptions(object):
             # opt.no_core_driver = True
             if opt.eval_results_dir is not None:
                 opt.results_dir = opt.eval_results_dir
+            self._normalize_query_anchor_widths(opt)
             if opt.dfl_num_bins < 2:
                 raise ValueError("--dfl_num_bins must be >= 2.")
             if opt.dfl_ref_prior_sigma <= 0:
                 raise ValueError("--dfl_ref_prior_sigma must be > 0.")
-            self._validate_multiscale_adapter_options(opt)
             self._validate_label_loss_options(opt)
             self._validate_fdr_options(opt)
             self._validate_tal_options(opt)
         else:
+            self._normalize_query_anchor_widths(opt)
             if opt.dfl_num_bins < 2:
                 raise ValueError("--dfl_num_bins must be >= 2.")
             if opt.dfl_ref_prior_sigma <= 0:
                 raise ValueError("--dfl_ref_prior_sigma must be > 0.")
-            self._validate_multiscale_adapter_options(opt)
             self._validate_label_loss_options(opt)
             self._validate_fdr_options(opt)
             self._validate_tal_options(opt)
@@ -349,68 +335,17 @@ class BaseOptions(object):
         return opt
 
     @staticmethod
-    def _parse_multiscale_adapter_dilations(value):
-        if isinstance(value, str):
-            if value.strip() == "":
-                raise ValueError("--multiscale_adapter_dilations must contain at least one dilation.")
-            values = value.split(",")
-            if any(item.strip() == "" for item in values):
-                raise ValueError("--multiscale_adapter_dilations must be comma-separated positive integers.")
-        else:
-            try:
-                values = list(value)
-            except TypeError as exc:
-                raise ValueError("--multiscale_adapter_dilations must be a sequence of positive integers.") from exc
-            if len(values) == 0:
-                raise ValueError("--multiscale_adapter_dilations must contain at least one dilation.")
-
-        dilations = []
-        for item in values:
-            if isinstance(item, str):
-                try:
-                    dilation = int(item.strip())
-                except ValueError as exc:
-                    raise ValueError(
-                        "--multiscale_adapter_dilations must be comma-separated positive integers."
-                    ) from exc
-            elif isinstance(item, int) and not isinstance(item, bool):
-                dilation = item
-            else:
-                raise ValueError("--multiscale_adapter_dilations must be positive integers.")
-            if dilation < 1:
-                raise ValueError("--multiscale_adapter_dilations must be positive integers.")
-            dilations.append(dilation)
-        return tuple(dilations)
-
-    @staticmethod
-    def _parse_multiscale_adapter_kernel_size(value):
-        if isinstance(value, str):
-            try:
-                kernel_size = int(value.strip())
-            except ValueError as exc:
-                raise ValueError("--multiscale_adapter_kernel_size must be a positive odd integer.") from exc
-        elif isinstance(value, int) and not isinstance(value, bool):
-            kernel_size = value
-        else:
-            raise ValueError("--multiscale_adapter_kernel_size must be a positive odd integer.")
-        if kernel_size < 1 or kernel_size % 2 == 0:
-            raise ValueError("--multiscale_adapter_kernel_size must be a positive odd integer.")
-        return kernel_size
-
-    @staticmethod
-    def _validate_multiscale_adapter_options(opt):
-        if not hasattr(opt, "multiscale_adapter_dilations"):
-            opt.multiscale_adapter_dilations = (1, 2, 3)
-        else:
-            opt.multiscale_adapter_dilations = BaseOptions._parse_multiscale_adapter_dilations(
-                opt.multiscale_adapter_dilations
-            )
-        if not hasattr(opt, "multiscale_adapter_kernel_size"):
-            opt.multiscale_adapter_kernel_size = 3
-        else:
-            opt.multiscale_adapter_kernel_size = BaseOptions._parse_multiscale_adapter_kernel_size(
-                opt.multiscale_adapter_kernel_size
-            )
+    def _normalize_query_anchor_widths(opt):
+        raw_widths = getattr(opt, "query_anchor_widths", "")
+        if raw_widths is None:
+            opt.query_anchor_widths = None
+            return
+        if isinstance(raw_widths, str):
+            values = [value.strip() for value in raw_widths.split(",")]
+            values = [float(value) for value in values if value]
+            opt.query_anchor_widths = values if values else None
+            return
+        opt.query_anchor_widths = [float(value) for value in raw_widths] if raw_widths else None
 
     @staticmethod
     def _validate_label_loss_options(opt):
@@ -466,6 +401,12 @@ class BaseOptions(object):
             raise ValueError("--go_lsd_loss_coef > 0 requires auxiliary decoder losses.")
         if opt.go_lsd_loss_coef > 0 and opt.dset_name == "tvsum":
             raise ValueError("--go_lsd_loss_coef > 0 requires matcher-based VMR training.")
+        if not hasattr(opt, "span_xx_loss_coef"):
+            opt.span_xx_loss_coef = 0.0
+        if opt.span_xx_loss_coef < 0:
+            raise ValueError("--span_xx_loss_coef must be >= 0.")
+        if opt.span_xx_loss_coef > 0 and opt.span_loss_type == "ce":
+            raise ValueError("--span_xx_loss_coef > 0 requires --span_loss_type l1, dfl, or fdr.")
         if opt.width_loss_coef < 0:
             raise ValueError("--width_loss_coef must be >= 0.")
         if opt.width_loss_coef > 0 and opt.width_loss_type != "none" and opt.span_loss_type == "ce":

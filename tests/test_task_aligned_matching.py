@@ -1,17 +1,15 @@
-import sys
 import unittest
-from unittest import mock
 
 import torch
 
 from vmr_detr.modeling.matcher import HungarianMatcher, TaskAlignedMatcher
 from vmr_detr.modeling.model import (
-    ResidualMultiScaleTemporalAdapter,
     SetCriterion,
     VMRDETR,
     _decode_fdr_cumulative_outputs,
     fdr_logits_to_spans,
     fdr_offset_support,
+    init_temporal_queries,
 )
 from vmr_detr.ops.span_utils import span_xx_to_cxw
 
@@ -84,98 +82,91 @@ class _FixedFDRVMRDETR(VMRDETR):
         return hs, refs, vid_mem, memory_global, txt_mem
 
 
-class ResidualMultiScaleTemporalAdapterTest(unittest.TestCase):
-    def test_accepts_arbitrary_dilation_tuple(self):
-        adapter = ResidualMultiScaleTemporalAdapter(
-            hidden_dim=4, dropout=0.0, dilations=(1, 3, 7)
-        )
-        x = torch.randn(2, 6, 4)
-        x_mask = torch.tensor([[1, 1, 1, 1, 0, 0], [1, 1, 1, 1, 1, 1]])
-        text_global = torch.randn(2, 4)
+class TemporalQueryInitTest(unittest.TestCase):
+    def test_temporal_query_helper_uses_multiscale_widths(self):
+        refs = init_temporal_queries(7).sigmoid()
 
-        out = adapter(x, x_mask, text_global=text_global)
+        expected_centers = torch.linspace(0.05, 0.95, 7)
+        expected_widths = torch.tensor([0.1, 0.3, 0.6, 0.1, 0.3, 0.6, 0.1])
 
-        self.assertEqual(adapter.dilations, (1, 3, 7))
-        self.assertEqual(len(adapter.temporal_branches), 3)
-        self.assertEqual(out.shape, x.shape)
-        self.assertTrue(torch.allclose(out, x * x_mask.float().unsqueeze(-1)))
+        self.assertEqual(refs.shape, (7, 2))
+        self.assertTrue(torch.allclose(refs[:, 0], expected_centers, atol=1e-6))
+        self.assertTrue(torch.allclose(refs[:, 1], expected_widths, atol=1e-6))
 
-    def test_accepts_arbitrary_dilation_string(self):
-        adapter = ResidualMultiScaleTemporalAdapter(
-            hidden_dim=4, dropout=0.0, dilations="1,3,7,9"
-        )
+    def test_temporal_query_helper_builds_valid_custom_anchor_grid(self):
+        refs = init_temporal_queries(9, anchor_widths=[0.1, 0.3, 0.6]).sigmoid()
+        starts = refs[:, 0] - 0.5 * refs[:, 1]
+        ends = refs[:, 0] + 0.5 * refs[:, 1]
 
-        self.assertEqual(adapter.dilations, (1, 3, 7, 9))
-        self.assertEqual(len(adapter.temporal_branches), 4)
-        self.assertEqual(adapter.num_branches, 5)
+        self.assertEqual(refs.shape, (9, 2))
+        self.assertTrue(torch.all(starts >= -1e-6))
+        self.assertTrue(torch.all(ends <= 1 + 1e-6))
+        expected_widths = torch.tensor([0.1, 0.1, 0.1, 0.3, 0.3, 0.3, 0.6, 0.6, 0.6])
+        self.assertTrue(torch.allclose(torch.sort(refs[:, 1]).values, expected_widths, atol=1e-6))
 
-    def test_accepts_arbitrary_kernel_size(self):
-        adapter = ResidualMultiScaleTemporalAdapter(
-            hidden_dim=4, dropout=0.0, dilations=(1, 3), kernel_size=5
-        )
-        x = torch.randn(2, 6, 4)
-        x_mask = torch.ones(2, 6)
-        text_global = torch.randn(2, 4)
+    def test_temporal_query_helper_handles_uneven_and_clamped_custom_widths(self):
+        refs = init_temporal_queries(10, anchor_widths=[0.0, 0.1, 0.1, 2.0]).sigmoid()
+        starts = refs[:, 0] - 0.5 * refs[:, 1]
+        ends = refs[:, 0] + 0.5 * refs[:, 1]
 
-        out = adapter(x, x_mask, text_global=text_global)
+        self.assertEqual(refs.shape, (10, 2))
+        self.assertTrue(torch.all(starts >= -1e-6))
+        self.assertTrue(torch.all(ends <= 1 + 1e-6))
+        self.assertEqual(torch.unique(torch.round(refs[:, 1] * 1000)).numel(), 3)
 
-        self.assertEqual(adapter.kernel_size, 5)
-        self.assertEqual(out.shape, x.shape)
-        self.assertTrue(torch.allclose(out, x))
-        for dilation, branch in zip(adapter.dilations, adapter.temporal_branches):
-            self.assertEqual(branch.kernel_size, (5,))
-            self.assertEqual(branch.padding, (dilation * 2,))
-
-    def test_rejects_invalid_kernel_size(self):
-        for kernel_size in [0, -1, 2, 4, True]:
-            with self.subTest(kernel_size=kernel_size):
-                with self.assertRaises(ValueError):
-                    ResidualMultiScaleTemporalAdapter(
-                        hidden_dim=4, dropout=0.0, kernel_size=kernel_size
-                    )
-
-
-class MultiscaleAdapterConfigTest(unittest.TestCase):
-    @staticmethod
-    def _parse_dilations(value):
-        with mock.patch.dict(sys.modules, {"pandas": mock.MagicMock()}):
-            from vmr_detr.config.options import BaseOptions
-        return BaseOptions._parse_multiscale_adapter_dilations(value)
-
-    @staticmethod
-    def _parse_kernel_size(value):
-        with mock.patch.dict(sys.modules, {"pandas": mock.MagicMock()}):
-            from vmr_detr.config.options import BaseOptions
-        return BaseOptions._parse_multiscale_adapter_kernel_size(value)
-
-    def test_parse_multiscale_adapter_dilations(self):
-        self.assertEqual(
-            self._parse_dilations("1,3,7"),
-            (1, 3, 7),
-        )
-        self.assertEqual(
-            self._parse_dilations("1, 3, 7, 9"),
-            (1, 3, 7, 9),
+    def test_model_can_initialize_query_refs_from_temporal_anchors(self):
+        model = VMRDETR(
+            transformer=_DummyTransformer(hidden_dim=4),
+            position_embed=None,
+            txt_position_embed=None,
+            txt_dim=4,
+            vid_dim=4,
+            num_queries=4,
+            input_dropout=0.0,
+            max_v_l=75,
+            n_input_proj=1,
+            query_init="temporal_anchors",
         )
 
-    def test_rejects_invalid_multiscale_adapter_dilations(self):
-        invalid_values = ["", "1,,7", "1,a,7", "1,0,7", "1,-3,7"]
-        for value in invalid_values:
-            with self.subTest(value=value):
-                with self.assertRaises(ValueError):
-                    self._parse_dilations(value)
+        expected_refs = init_temporal_queries(4).sigmoid()
 
-    def test_parse_multiscale_adapter_kernel_size(self):
-        for value in [3, 5, 7, "5"]:
-            with self.subTest(value=value):
-                self.assertEqual(self._parse_kernel_size(value), int(value))
+        self.assertEqual(model.query_init, "temporal_anchors")
+        self.assertTrue(torch.allclose(model.query_embed.weight.detach().sigmoid(), expected_refs, atol=1e-6))
 
-    def test_rejects_invalid_multiscale_adapter_kernel_size(self):
-        invalid_values = ["", "abc", 0, -1, 2, 4, True]
-        for value in invalid_values:
-            with self.subTest(value=value):
-                with self.assertRaises(ValueError):
-                    self._parse_kernel_size(value)
+    def test_model_can_initialize_query_refs_from_custom_temporal_anchors(self):
+        model = VMRDETR(
+            transformer=_DummyTransformer(hidden_dim=4),
+            position_embed=None,
+            txt_position_embed=None,
+            txt_dim=4,
+            vid_dim=4,
+            num_queries=5,
+            input_dropout=0.0,
+            max_v_l=75,
+            n_input_proj=1,
+            query_init="temporal_anchors",
+            query_anchor_widths="0.2,0.5",
+        )
+
+        expected_refs = init_temporal_queries(5, anchor_widths=[0.2, 0.5]).sigmoid()
+
+        self.assertEqual(model.query_init, "temporal_anchors")
+        self.assertTrue(torch.allclose(model.query_embed.weight.detach().sigmoid(), expected_refs, atol=1e-6))
+
+    def test_invalid_query_init_raises(self):
+        with self.assertRaisesRegex(ValueError, "query_init"):
+            VMRDETR(
+                transformer=_DummyTransformer(hidden_dim=4),
+                position_embed=None,
+                txt_position_embed=None,
+                txt_dim=4,
+                vid_dim=4,
+                num_queries=4,
+                input_dropout=0.0,
+                max_v_l=75,
+                n_input_proj=1,
+                query_init="unsupported",
+            )
 
 
 class TaskAlignedMatcherTest(unittest.TestCase):
@@ -481,7 +472,7 @@ class TaskAlignedCriterionTest(unittest.TestCase):
                 label_loss_type="quality",
             )
 
-    def test_hungarian_quality_labels_keep_auxiliary_outputs_hard_labeled(self):
+    def test_hungarian_quality_labels_mirror_main_loss_for_auxiliary_outputs(self):
         logits = _logits_from_fg_scores([0.80]).unsqueeze(0)
         outputs = {
             "pred_logits": logits,
@@ -517,10 +508,7 @@ class TaskAlignedCriterionTest(unittest.TestCase):
             fg_logit,
             torch.full_like(fg_logit, 0.75),
         )
-        expected_aux = torch.nn.functional.binary_cross_entropy_with_logits(
-            fg_logit,
-            torch.ones_like(fg_logit),
-        )
+        expected_aux = expected_final
         self.assertTrue(torch.allclose(losses["loss_label"], expected_final))
         self.assertTrue(torch.allclose(losses["loss_label_0"], expected_aux))
 
@@ -695,7 +683,7 @@ class TaskAlignedCriterionTest(unittest.TestCase):
         )
         self.assertTrue(torch.allclose(losses["loss_label"], expected))
 
-    def test_vfl_label_loss_keeps_auxiliary_outputs_hard_labeled(self):
+    def test_vfl_label_loss_mirrors_main_loss_for_auxiliary_outputs(self):
         logits = _logits_from_fg_scores([0.80]).unsqueeze(0)
         outputs = {
             "pred_logits": logits,
@@ -731,10 +719,7 @@ class TaskAlignedCriterionTest(unittest.TestCase):
             alpha=criterion.vfl_alpha,
             gamma=criterion.vfl_gamma,
         )
-        expected_aux = torch.nn.functional.binary_cross_entropy_with_logits(
-            fg_logit,
-            torch.ones_like(fg_logit),
-        )
+        expected_aux = expected_final
         self.assertTrue(torch.allclose(losses["loss_label"], expected_final))
         self.assertTrue(torch.allclose(losses["loss_label_0"], expected_aux))
 
@@ -974,6 +959,31 @@ class TemporalFDRTest(unittest.TestCase):
 
         self.assertGreater(losses["loss_width"].item(), 0.0)
 
+    def test_span_xx_loss_penalizes_start_end_boundary_errors(self):
+        pred_spans = _cxw([[0.1, 0.5]]).unsqueeze(0).requires_grad_()
+        outputs = {
+            "pred_spans": pred_spans,
+            "pred_span_logits": torch.zeros(1, 1, 64),
+            "pred_span_refs": _cxw([[0.1, 0.5]]).unsqueeze(0),
+        }
+        targets = {"span_labels": [dict(spans=_cxw([[0.2, 0.4]]))]}
+        criterion = SetCriterion(
+            matcher=HungarianMatcher(span_loss_type="fdr"),
+            weight_dict={"loss_span_xx": 1.0},
+            eos_coef=0.1,
+            losses=["spans"],
+            temperature=0.07,
+            span_loss_type="fdr",
+            max_v_l=75,
+        )
+
+        losses = criterion.loss_spans(outputs, targets, [(torch.tensor([0]), torch.tensor([0]))])
+        losses["loss_span_xx"].backward()
+
+        self.assertIn("loss_span_xx", losses)
+        self.assertTrue(torch.allclose(losses["loss_span_xx"], torch.tensor(0.1)))
+        self.assertIsNotNone(pred_spans.grad)
+
     def test_fdr_empty_targets_return_zero_finite_losses(self):
         refs = _cxw([[0.3, 0.7]]).unsqueeze(0)
         pred_logits = torch.zeros(1, 1, 64)
@@ -1024,6 +1034,30 @@ class TemporalFDRTest(unittest.TestCase):
 
         self.assertEqual(losses["loss_width"].item(), 0.0)
 
+    def test_fdr_empty_targets_return_zero_span_xx_loss_when_enabled(self):
+        refs = _cxw([[0.3, 0.7]]).unsqueeze(0)
+        pred_logits = torch.zeros(1, 1, 64)
+        outputs = {
+            "pred_logits": _logits_from_fg_scores([0.80]).unsqueeze(0),
+            "pred_spans": fdr_logits_to_spans(pred_logits, refs, 32, 1.5, 1.0 / 75),
+            "pred_span_logits": pred_logits,
+            "pred_span_refs": refs,
+        }
+        targets = {"span_labels": [dict(spans=torch.empty(0, 2))]}
+        criterion = SetCriterion(
+            matcher=HungarianMatcher(span_loss_type="fdr"),
+            weight_dict={"loss_fgl": 1.0, "loss_giou": 1.0, "loss_span_xx": 1.0},
+            eos_coef=0.1,
+            losses=["spans"],
+            temperature=0.07,
+            span_loss_type="fdr",
+            max_v_l=75,
+        )
+
+        losses = criterion(outputs, targets)
+
+        self.assertEqual(losses["loss_span_xx"].item(), 0.0)
+
     def test_width_loss_is_repeated_for_auxiliary_outputs(self):
         refs = _cxw([[0.2, 0.6], [0.1, 0.5]]).unsqueeze(0)
         pred_logits = torch.zeros(1, 2, 64)
@@ -1056,6 +1090,9 @@ class TemporalFDRTest(unittest.TestCase):
                 "loss_width": 1.0,
                 "loss_width_0": 1.0,
                 "loss_width_1": 1.0,
+                "loss_span_xx": 1.0,
+                "loss_span_xx_0": 1.0,
+                "loss_span_xx_1": 1.0,
             },
             eos_coef=0.1,
             losses=["spans"],
@@ -1070,6 +1107,9 @@ class TemporalFDRTest(unittest.TestCase):
         self.assertIn("loss_width", losses)
         self.assertIn("loss_width_0", losses)
         self.assertIn("loss_width_1", losses)
+        self.assertIn("loss_span_xx", losses)
+        self.assertIn("loss_span_xx_0", losses)
+        self.assertIn("loss_span_xx_1", losses)
 
     def test_go_lsd_global_indices_merge_and_resolve_duplicates(self):
         criterion = SetCriterion(
@@ -1309,6 +1349,18 @@ class TemporalFDRTest(unittest.TestCase):
                 losses=["spans"],
                 temperature=0.07,
                 span_loss_type="l1",
+                max_v_l=75,
+            )
+
+    def test_span_xx_loss_rejects_discrete_ce_spans(self):
+        with self.assertRaisesRegex(ValueError, "loss_span_xx"):
+            SetCriterion(
+                matcher=HungarianMatcher(span_loss_type="ce"),
+                weight_dict={"loss_span_xx": 1.0},
+                eos_coef=0.1,
+                losses=["spans"],
+                temperature=0.07,
+                span_loss_type="ce",
                 max_v_l=75,
             )
 

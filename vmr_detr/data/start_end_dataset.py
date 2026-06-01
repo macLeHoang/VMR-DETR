@@ -303,7 +303,7 @@ class StartEndDataset(Dataset):
             if self.q_feat_type == "last_hidden_state":
                 q_feat = q_feat[:self.max_q_l]
 
-            if self.normalize_v:
+            if self.normalize_t:
                 q_feat = l2_normalize_np_array(q_feat)
             q_feat_list.append(q_feat)
         # some features are slightly longer than the others

@@ -4,7 +4,7 @@
 dset_name=charades_sta
 ctx_mode=video_tef
 results_root=results
-exp_id=exp_fdr_no_golsd_quality_s05_metricrank_r1guard_ramp10
+exp_id=exp_fdr_quality_s05
 
 # Data paths
 train_path=/content/drive/MyDrive/Master/Thesis/QD-DETR-Old/data/charades-sta/train.jsonl
@@ -50,46 +50,42 @@ enc_layers=3
 dec_layers=3
 clip_length=1
 span_loss_type=fdr
-dfl_num_bins=32
-dfl_ref_prior_sigma=4.0
 fdr_num_bins=32
 fdr_reg_scale=1.5
-fdr_min_ref_width=0.05
+fdr_min_ref_width=0.01
+query_anchor_widths=0.08,0.22,0.48
 matching_type=hungarian
 aux_matching_type=hungarian
 aux_one_to_many_k=2
-use_late_gated_video_fusion_flag=--use_late_gated_video_fusion
-use_multiscale_stream_adapter_flag=--use_multiscale_stream_adapter
-multiscale_adapter_dropout=0.1
-multiscale_adapter_dilations=1,3,5,8,13
-multiscale_adapter_kernel_size=5
+set_cost_span=10
+set_cost_giou=1
+set_cost_class=8
 
 # Losses: localization and labels
 span_loss_coef=1.0
-fgl_loss_coef=2.0
+span_xx_loss_coef=4.0
+fgl_loss_coef=1.0
 giou_loss_coef=1.0
 width_loss_type=log
 width_loss_coef=0.5
 label_loss_coef=4.0
 
 # Losses: label supervision
-label_loss_type=vfl
-vfl_alpha=0.75
-vfl_gamma=2.0
-quality_label_strength=0.5
-quality_label_iou_gamma=1.0
-quality_label_warmup_epoch=10
-quality_label_ramp_epoch=30
+label_loss_type=quality
+quality_label_strength=1.0
+quality_label_iou_gamma=1.5
+quality_label_warmup_epoch=0
+quality_label_ramp_epoch=5
 
 # Losses: GO-LSD self-distillation, disabled by default here
-go_lsd_loss_coef=0.3
-go_lsd_temperature=2.0
+go_lsd_loss_coef=0.5
+go_lsd_temperature=4.0
 go_lsd_start_epoch=0
 
 # Losses: contrastive query/text alignment
 contrastive_align_loss_flag=--contrastive_align_loss
 contrastive_align_loss_coef=0.3
-contrastive_start_epoch=10
+contrastive_start_epoch=0
 contrastive_decay_epoch=30
 contrastive_decay_coef=0.1
 
@@ -111,6 +107,14 @@ ema_decay=0.999
 max_es_cnt=10
 best_metric=MR-full-R1@0.5+0.7
 
+query_anchor_widths_args=()
+if [[ -n "${query_anchor_widths}" ]]; then
+  echo "Using query_anchor_widths=${query_anchor_widths}"
+  query_anchor_widths_args=(--query_anchor_widths "${query_anchor_widths}")
+else
+  echo "Using default temporal anchor widths."
+fi
+
 PYTHONPATH="${PYTHONPATH}:." python vmr_detr/cli/train.py \
   --dset_name "${dset_name}" \
   --ctx_mode "${ctx_mode}" \
@@ -124,6 +128,8 @@ PYTHONPATH="${PYTHONPATH}:." python vmr_detr/cli/train.py \
   --v_feat_len_mode "${v_feat_len_mode}" \
   --results_root "${results_root}" \
   --exp_id "${exp_id}" \
+  --query_init temporal_anchors \
+  "${query_anchor_widths_args[@]}" \
   --bsz "${bsz}" \
   --eval_bsz "${eval_bsz}" \
   --n_epoch "${n_epoch}" \
@@ -131,23 +137,23 @@ PYTHONPATH="${PYTHONPATH}:." python vmr_detr/cli/train.py \
   --dec_layers "${dec_layers}" \
   --clip_length "${clip_length}" \
   --span_loss_type "${span_loss_type}" \
-  --dfl_num_bins "${dfl_num_bins}" \
-  --dfl_ref_prior_sigma "${dfl_ref_prior_sigma}" \
   --fdr_num_bins "${fdr_num_bins}" \
   --fdr_reg_scale "${fdr_reg_scale}" \
   --fdr_min_ref_width "${fdr_min_ref_width}" \
   --matching_type "${matching_type}" \
   --aux_matching_type "${aux_matching_type}" \
   --aux_one_to_many_k "${aux_one_to_many_k}" \
+  --set_cost_span "${set_cost_span}" \
+  --set_cost_giou "${set_cost_giou}" \
+  --set_cost_class "${set_cost_class}" \
   --span_loss_coef "${span_loss_coef}" \
+  --span_xx_loss_coef "${span_xx_loss_coef}" \
   --fgl_loss_coef "${fgl_loss_coef}" \
   --giou_loss_coef "${giou_loss_coef}" \
   --width_loss_type "${width_loss_type}" \
   --width_loss_coef "${width_loss_coef}" \
   --label_loss_coef "${label_loss_coef}" \
   --label_loss_type "${label_loss_type}" \
-  --vfl_alpha "${vfl_alpha}" \
-  --vfl_gamma "${vfl_gamma}" \
   --quality_label_strength "${quality_label_strength}" \
   --quality_label_iou_gamma "${quality_label_iou_gamma}" \
   --quality_label_warmup_epoch "${quality_label_warmup_epoch}" \
@@ -171,9 +177,4 @@ PYTHONPATH="${PYTHONPATH}:." python vmr_detr/cli/train.py \
   --ema_decay "${ema_decay}" \
   --max_es_cnt "${max_es_cnt}" \
   --best_metric "${best_metric}" \
-  ${use_late_gated_video_fusion_flag} \
-  ${use_multiscale_stream_adapter_flag} \
-  --multiscale_adapter_dropout "${multiscale_adapter_dropout}" \
-  --multiscale_adapter_dilations "${multiscale_adapter_dilations}" \
-  --multiscale_adapter_kernel_size "${multiscale_adapter_kernel_size}" \
   "$@"

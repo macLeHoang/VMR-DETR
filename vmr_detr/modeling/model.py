@@ -20,51 +20,55 @@ def inverse_sigmoid(x, eps=1e-3):
     return torch.log(x1/x2)
 
 
-def _parse_adapter_dilations(dilations):
-    if isinstance(dilations, str):
-        if dilations.strip() == "":
-            raise ValueError("adapter dilations must contain at least one positive integer.")
-        values = dilations.split(",")
-        if any(value.strip() == "" for value in values):
-            raise ValueError("adapter dilations must be comma-separated positive integers.")
-    else:
-        try:
-            values = list(dilations)
-        except TypeError as exc:
-            raise ValueError("adapter dilations must be a sequence of positive integers.") from exc
-        if len(values) == 0:
-            raise ValueError("adapter dilations must contain at least one positive integer.")
+def _normalize_query_anchor_widths(anchor_widths):
+    if anchor_widths is None:
+        return None
+    if isinstance(anchor_widths, str):
+        anchor_widths = [value.strip() for value in anchor_widths.split(",")]
+        anchor_widths = [float(value) for value in anchor_widths if value]
+        return anchor_widths if anchor_widths else None
+    return anchor_widths
 
-    parsed = []
-    for value in values:
-        if isinstance(value, str):
-            try:
-                dilation = int(value.strip())
-            except ValueError as exc:
-                raise ValueError("adapter dilations must be comma-separated positive integers.") from exc
-        elif isinstance(value, int) and not isinstance(value, bool):
-            dilation = value
+
+def init_temporal_queries(num_queries, eps=1e-3, anchor_widths=None):
+    if num_queries <= 0:
+        raise ValueError("num_queries must be > 0.")
+    anchor_widths = _normalize_query_anchor_widths(anchor_widths)
+    if anchor_widths is None:
+        centers = torch.linspace(0.05, 0.95, num_queries)
+        scale_widths = torch.tensor([0.1, 0.3, 0.6], dtype=centers.dtype, device=centers.device)
+        widths = scale_widths[torch.arange(num_queries, device=centers.device) % scale_widths.numel()]
+        refs = torch.stack([centers, widths], dim=-1).clamp(eps, 1 - eps)
+        return inverse_sigmoid(refs, eps=eps)
+
+    widths = torch.as_tensor(anchor_widths, dtype=torch.float32).flatten()
+    if widths.numel() == 0:
+        raise ValueError("anchor_widths must contain at least one width.")
+    if not torch.isfinite(widths).all():
+        raise ValueError("anchor_widths must be finite.")
+    widths = torch.unique(widths.clamp(eps, 1 - eps), sorted=True)
+    num_scales = min(widths.numel(), num_queries)
+    widths = widths[:num_scales]
+
+    base = num_queries // num_scales
+    extra = num_queries % num_scales
+    refs = []
+    for width_idx, width in enumerate(widths):
+        n_centers = base + int(width_idx < extra)
+        if n_centers == 0:
+            continue
+        lo = 0.5 * width
+        hi = 1.0 - 0.5 * width
+        if n_centers == 1:
+            centers = ((lo + hi) * 0.5).reshape(1)
         else:
-            raise ValueError("adapter dilations must be positive integers.")
-        if dilation < 1:
-            raise ValueError("adapter dilations must be positive integers.")
-        parsed.append(dilation)
-    return tuple(parsed)
+            centers = torch.linspace(lo.item(), hi.item(), n_centers, dtype=widths.dtype)
+        refs.append(torch.stack([centers, width.expand(n_centers)], dim=-1))
 
-
-def _parse_adapter_kernel_size(kernel_size):
-    if isinstance(kernel_size, str):
-        try:
-            parsed = int(kernel_size.strip())
-        except ValueError as exc:
-            raise ValueError("adapter kernel_size must be a positive odd integer.") from exc
-    elif isinstance(kernel_size, int) and not isinstance(kernel_size, bool):
-        parsed = kernel_size
-    else:
-        raise ValueError("adapter kernel_size must be a positive odd integer.")
-    if parsed < 1 or parsed % 2 == 0:
-        raise ValueError("adapter kernel_size must be a positive odd integer.")
-    return parsed
+    refs = torch.cat(refs, dim=0)
+    order = torch.argsort(refs[:, 0] + refs[:, 1] * 1e-4)
+    refs = refs[order].clamp(eps, 1 - eps)
+    return inverse_sigmoid(refs, eps=eps)
 
 
 def dfl_logits_to_spans(span_logits, dfl_num_bins):
@@ -138,98 +142,6 @@ def _decode_fdr_cumulative_outputs(span_delta_logits, reference_spans, fdr_num_b
     return span_logits, spans, initial_reference
 
 
-class StreamTextConditionedEncoder(nn.Module):
-    """Lightweight cross-attention block that conditions a video stream on text."""
-
-    def __init__(self, hidden_dim, nhead, dim_feedforward=None, dropout=0.1):
-        super().__init__()
-        if dim_feedforward is None:
-            dim_feedforward = hidden_dim * 4
-        self.cross_attn = nn.MultiheadAttention(hidden_dim, nhead, dropout=dropout)
-        self.linear1 = nn.Linear(hidden_dim, dim_feedforward)
-        self.linear2 = nn.Linear(dim_feedforward, hidden_dim)
-        self.norm1 = nn.LayerNorm(hidden_dim)
-        self.norm2 = nn.LayerNorm(hidden_dim)
-        self.dropout = nn.Dropout(dropout)
-        self.dropout1 = nn.Dropout(dropout)
-        self.dropout2 = nn.Dropout(dropout)
-
-    def forward(self, stream_feat, stream_mask, txt_feat, txt_mask, stream_pos=None, txt_pos=None):
-        # stream_feat/txt_feat: (bsz, L, d), masks: 1 for valid, 0 for pad
-        stream_query = stream_feat if stream_pos is None else stream_feat + stream_pos
-        txt_key = txt_feat if txt_pos is None else txt_feat + txt_pos
-        q = stream_query.transpose(0, 1)
-        k = txt_key.transpose(0, 1)
-        v = txt_feat.transpose(0, 1)
-        txt_key_padding_mask = ~txt_mask.bool()
-        attn_out = self.cross_attn(
-            q, k, value=v, key_padding_mask=txt_key_padding_mask
-        )[0].transpose(0, 1)
-        stream_feat = self.norm1(stream_feat + self.dropout1(attn_out))
-        ff = self.linear2(self.dropout(F.relu(self.linear1(stream_feat), inplace=True)))
-        stream_feat = self.norm2(stream_feat + self.dropout2(ff))
-        return stream_feat * stream_mask.float().unsqueeze(-1)
-
-
-class ResidualMultiScaleTemporalAdapter(nn.Module):
-    """Weak parallel temporal adapter that starts as an identity residual."""
-
-    def __init__(self, hidden_dim, dropout=0.1, text_conditioned=True, dilations=(1, 2, 3),
-                 kernel_size=3):
-        super().__init__()
-        self.text_conditioned = text_conditioned
-        self.dilations = _parse_adapter_dilations(dilations)
-        self.kernel_size = _parse_adapter_kernel_size(kernel_size)
-        self.temporal_branches = nn.ModuleList([
-            nn.Conv1d(
-                hidden_dim, hidden_dim, kernel_size=self.kernel_size, dilation=dilation,
-                padding=dilation * (self.kernel_size - 1) // 2, groups=hidden_dim, bias=False
-            )
-            for dilation in self.dilations
-        ])
-        self.num_branches = 1 + len(self.temporal_branches)
-
-        gate_input_dim = hidden_dim * (self.num_branches + (1 if text_conditioned else 0))
-        self.gate_mlp = nn.Sequential(
-            nn.Linear(gate_input_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, hidden_dim * self.num_branches)
-        )
-        self.residual_norm = nn.LayerNorm(hidden_dim)
-        self.dropout = nn.Dropout(dropout)
-        self.residual_scale = nn.Parameter(torch.zeros(hidden_dim))
-
-    def forward(self, x, x_mask, text_global=None):
-        if self.text_conditioned and text_global is None:
-            raise ValueError("text_global is required when text_conditioned=True.")
-
-        mask = x_mask.float().unsqueeze(-1)
-        x_masked = x * mask
-        x_t = x_masked.transpose(1, 2)
-
-        branches = [x_masked]
-        branches.extend([
-            branch(x_t).transpose(1, 2) * mask
-            for branch in self.temporal_branches
-        ])
-
-        gate_inputs = list(branches)
-        if self.text_conditioned:
-            text_global_expanded = text_global.unsqueeze(1).expand(-1, x.shape[1], -1)
-            gate_inputs.append(text_global_expanded)
-        gate_input = torch.cat(gate_inputs, dim=-1)
-        gate = self.gate_mlp(gate_input).view(
-            x.shape[0], x.shape[1], self.num_branches, x.shape[2]
-        )
-        gate = torch.softmax(gate, dim=2)
-
-        branches = torch.stack(branches, dim=2)
-        refined = (gate * branches).sum(dim=2)
-        residual = self.residual_norm(refined - x_masked)
-        residual = self.dropout(residual) * self.residual_scale.view(1, 1, -1)
-        return (x + residual) * mask
-
-
 class VMRDETR(nn.Module):
     """ VMR DETR. """
 
@@ -237,12 +149,9 @@ class VMRDETR(nn.Module):
                  num_queries, input_dropout, aux_loss=False,
                  contrastive_align_loss=False, contrastive_hdim=64,
                  max_v_l=75, span_loss_type="l1", use_txt_pos=False, n_input_proj=2, aud_dim=0,
-                 use_gated_video_fusion=False, use_late_gated_video_fusion=False,
-                 slowfast_dim=2304, clip_dim=512, tef_dim=2, dropout=0.1, dim_feedforward=None,
-                 use_multiscale_stream_adapter=False, multiscale_adapter_dropout=0.1,
-                 multiscale_adapter_dilations=(1, 2, 3), multiscale_adapter_kernel_size=3,
                  dfl_num_bins=16, dfl_ref_prior_sigma=2.0,
-                 fdr_num_bins=32, fdr_reg_scale=1.5, fdr_min_ref_width=None):
+                 fdr_num_bins=32, fdr_reg_scale=1.5, fdr_min_ref_width=None,
+                 query_init="random", query_anchor_widths=None):
         """ Initializes the model.
         Parameters:
             transformer: torch module of the transformer architecture. See transformer.py
@@ -263,6 +172,7 @@ class VMRDETR(nn.Module):
                 ce: (st_idx, ed_idx) classification.
                 dfl: start/end boundary distributions with expectation decoding.
                 fdr: residual start/end boundary-offset distributions around decoder references.
+            query_anchor_widths: optional normalized widths for temporal anchor query initialization.
             # foreground_thd: float, intersection over prediction >= foreground_thd: labeled as foreground
             # background_thd: float, intersection over prediction <= background_thd: labeled background
         """
@@ -309,6 +219,12 @@ class VMRDETR(nn.Module):
         # self.foreground_thd = foreground_thd
         # self.background_thd = background_thd
         self.query_embed = nn.Embedding(num_queries, 2)
+        if query_init not in ("random", "temporal_anchors"):
+            raise ValueError("query_init must be one of ['random', 'temporal_anchors'].")
+        self.query_init = query_init
+        if query_init == "temporal_anchors":
+            with torch.no_grad():
+                self.query_embed.weight.copy_(init_temporal_queries(num_queries, anchor_widths=query_anchor_widths))
         
         relu_args = [True] * 3
         relu_args[n_input_proj-1] = False
@@ -322,54 +238,6 @@ class VMRDETR(nn.Module):
             LinearLayer(hidden_dim, hidden_dim, layer_norm=True, dropout=input_dropout, relu=relu_args[1]),
             LinearLayer(hidden_dim, hidden_dim, layer_norm=True, dropout=input_dropout, relu=relu_args[2])
         ][:n_input_proj])
-
-        if use_gated_video_fusion and use_late_gated_video_fusion:
-            raise ValueError("Use only one of use_gated_video_fusion or use_late_gated_video_fusion.")
-
-        self.use_gated_video_fusion = use_gated_video_fusion
-        self.use_late_gated_video_fusion = use_late_gated_video_fusion
-        self.use_multiscale_stream_adapter = use_multiscale_stream_adapter
-        self.slowfast_dim = slowfast_dim
-        self.clip_dim = clip_dim
-        self.tef_dim = tef_dim
-
-        if self.use_gated_video_fusion or self.use_late_gated_video_fusion:
-            self.input_slowfast_proj = nn.Sequential(*[
-                LinearLayer(slowfast_dim, hidden_dim, layer_norm=True, dropout=input_dropout, relu=relu_args[0]),
-                LinearLayer(hidden_dim, hidden_dim, layer_norm=True, dropout=input_dropout, relu=relu_args[1]),
-                LinearLayer(hidden_dim, hidden_dim, layer_norm=True, dropout=input_dropout, relu=relu_args[2])
-            ][:n_input_proj])
-            self.input_clip_proj = nn.Sequential(*[
-                LinearLayer(clip_dim, hidden_dim, layer_norm=True, dropout=input_dropout, relu=relu_args[0]),
-                LinearLayer(hidden_dim, hidden_dim, layer_norm=True, dropout=input_dropout, relu=relu_args[1]),
-                LinearLayer(hidden_dim, hidden_dim, layer_norm=True, dropout=input_dropout, relu=relu_args[2])
-            ][:n_input_proj])
-            self.video_gate_mlp = nn.Sequential(
-                nn.Linear(hidden_dim * 4, hidden_dim),
-                nn.ReLU(inplace=True),
-                nn.Linear(hidden_dim, hidden_dim)
-            )
-            self.input_tef_proj = nn.Sequential(*[
-                LinearLayer(tef_dim, hidden_dim, layer_norm=True, dropout=input_dropout, relu=relu_args[0]),
-                LinearLayer(hidden_dim, hidden_dim, layer_norm=True, dropout=input_dropout, relu=relu_args[1]),
-                LinearLayer(hidden_dim, hidden_dim, layer_norm=True, dropout=input_dropout, relu=relu_args[2])
-            ][:n_input_proj])
-
-        if self.use_late_gated_video_fusion:
-            self.slowfast_txt_encoder = StreamTextConditionedEncoder(
-                hidden_dim=hidden_dim, nhead=transformer.nhead,
-                dim_feedforward=dim_feedforward, dropout=dropout
-            )
-            self.clip_txt_encoder = StreamTextConditionedEncoder(
-                hidden_dim=hidden_dim, nhead=transformer.nhead,
-                dim_feedforward=dim_feedforward, dropout=dropout
-            )
-            if self.use_multiscale_stream_adapter:
-                self.clip_multiscale_adapter = ResidualMultiScaleTemporalAdapter(
-                    hidden_dim=hidden_dim, dropout=multiscale_adapter_dropout,
-                    dilations=multiscale_adapter_dilations,
-                    kernel_size=multiscale_adapter_kernel_size
-                )
 
         self.contrastive_align_loss = contrastive_align_loss
         if contrastive_align_loss:
@@ -385,71 +253,9 @@ class VMRDETR(nn.Module):
         self.global_rep_token = torch.nn.Parameter(torch.randn(hidden_dim))
         self.global_rep_pos = torch.nn.Parameter(torch.randn(hidden_dim))
 
-    def _masked_text_global(self, src_txt, src_txt_mask):
-        text_mask = src_txt_mask.float().unsqueeze(-1)
-        text_denom = text_mask.sum(dim=1).clamp(min=1.0)
-        return (src_txt * text_mask).sum(dim=1) / text_denom
-
     def _validate_text_mask(self, src_txt, src_txt_mask):
         if src_txt.shape[1] == 0 or not src_txt_mask.bool().any(dim=1).all():
             raise ValueError("Each sample must contain at least one valid text token.")
-
-    def _split_video_streams(self, src_vid):
-        expected_vid_dim = self.slowfast_dim + self.clip_dim + self.tef_dim
-        if src_vid.shape[-1] != expected_vid_dim:
-            raise ValueError(
-                f"Expected src_vid dim={expected_vid_dim} "
-                f"(slowfast={self.slowfast_dim}, clip={self.clip_dim}, tef={self.tef_dim}), "
-                f"but got {src_vid.shape[-1]}."
-            )
-
-        slowfast = src_vid[..., :self.slowfast_dim]
-        clip = src_vid[..., self.slowfast_dim:self.slowfast_dim + self.clip_dim]
-        tef = src_vid[..., self.slowfast_dim + self.clip_dim:]
-        return slowfast, clip, tef
-
-    def _early_fuse_streams_with_text(self, src_vid, src_txt, src_txt_mask):
-        slowfast, clip, tef = self._split_video_streams(src_vid)
-
-        slowfast_h = self.input_slowfast_proj(slowfast)
-        clip_h = self.input_clip_proj(clip)
-
-        text_global = self._masked_text_global(src_txt, src_txt_mask)
-        text_global_expanded = text_global.unsqueeze(1).expand(-1, slowfast_h.shape[1], -1)
-        gate_input = torch.cat(
-            [slowfast_h, clip_h, slowfast_h * clip_h, text_global_expanded], dim=-1
-        )
-        gate = torch.sigmoid(self.video_gate_mlp(gate_input))
-        fused_mem = gate * clip_h + (1.0 - gate) * slowfast_h
-        return fused_mem + self.input_tef_proj(tef)
-
-    def _late_fuse_streams_with_text(self, src_vid, src_vid_mask, src_txt, src_txt_mask):
-        slowfast, clip, tef = self._split_video_streams(src_vid)
-
-        slowfast_h = self.input_slowfast_proj(slowfast)
-        clip_h = self.input_clip_proj(clip)
-        text_global = self._masked_text_global(src_txt, src_txt_mask)
-
-        if self.use_multiscale_stream_adapter:
-            clip_h = self.clip_multiscale_adapter(clip_h, src_vid_mask, text_global=text_global)
-
-        # Shared temporal positions: both streams are already aligned to the same video grid.
-        stream_pos = self.position_embed(slowfast_h, src_vid_mask)
-        txt_pos = self.txt_position_embed(src_txt) if self.use_txt_pos else torch.zeros_like(src_txt)
-        slowfast_mem = self.slowfast_txt_encoder(
-            slowfast_h, src_vid_mask, src_txt, src_txt_mask, stream_pos=stream_pos, txt_pos=txt_pos
-        )
-        clip_mem = self.clip_txt_encoder(
-            clip_h, src_vid_mask, src_txt, src_txt_mask, stream_pos=stream_pos, txt_pos=txt_pos
-        )
-
-        text_global_expanded = text_global.unsqueeze(1).expand(-1, slowfast_mem.shape[1], -1)
-        gate_input = torch.cat(
-            [slowfast_mem, clip_mem, slowfast_mem * clip_mem, text_global_expanded], dim=-1
-        )
-        gate = torch.sigmoid(self.video_gate_mlp(gate_input))
-        fused_mem = gate * clip_mem + (1.0 - gate) * slowfast_mem
-        return fused_mem + self.input_tef_proj(tef)
 
     def _run_text_video_transformer(self, src_vid, src_vid_mask, src_txt, src_txt_mask):
         src = torch.cat([src_vid, src_txt], dim=1)  # (bsz, L_vid+L_txt, d)
@@ -486,21 +292,12 @@ class VMRDETR(nn.Module):
                - "aux_outputs": Optional, only returned when auxilary losses are activated. It is a list of
                                 dictionnaries containing the two above keys for each decoder layer.
         """
-        if src_aud is not None and (self.use_gated_video_fusion or self.use_late_gated_video_fusion):
-            raise ValueError("gated video fusion currently supports non-audio runs only.")
         if src_aud is not None:
             src_vid = torch.cat([src_vid, src_aud], dim=2)
 
         self._validate_text_mask(src_txt, src_txt_mask)
-        src_vid_input = src_vid
         src_txt = self.input_txt_proj(src_txt)
-
-        if self.use_late_gated_video_fusion:
-            src_vid = self._late_fuse_streams_with_text(src_vid_input, src_vid_mask, src_txt, src_txt_mask)
-        elif self.use_gated_video_fusion:
-            src_vid = self._early_fuse_streams_with_text(src_vid, src_txt, src_txt_mask)
-        else:
-            src_vid = self.input_vid_proj(src_vid)
+        src_vid = self.input_vid_proj(src_vid)
 
         hs, reference, vid_mem, memory_global, txt_mem = self._run_text_video_transformer(
             src_vid, src_vid_mask, src_txt, src_txt_mask
@@ -553,10 +350,7 @@ class VMRDETR(nn.Module):
         ### Neg Pairs ###
         src_txt_neg = torch.cat([src_txt[1:], src_txt[0:1]], dim=0)
         src_txt_mask_neg = torch.cat([src_txt_mask[1:], src_txt_mask[0:1]], dim=0)
-        if self.use_late_gated_video_fusion:
-            src_vid_neg = self._late_fuse_streams_with_text(src_vid_input, src_vid_mask, src_txt_neg, src_txt_mask_neg)
-        else:
-            src_vid_neg = src_vid
+        src_vid_neg = src_vid
 
         _, _, vid_mem_neg, memory_global_neg, _ = self._run_text_video_transformer(
             src_vid_neg, src_vid_mask, src_txt_neg, src_txt_mask_neg
@@ -681,6 +475,11 @@ class SetCriterion(nn.Module):
         )
         if self.go_lsd_loss_enabled and span_loss_type != "fdr":
             raise ValueError("GO-LSD requires span_loss_type to be 'fdr'.")
+        self.span_xx_loss_enabled = any(
+            k == "loss_span_xx" or k.startswith("loss_span_xx_") for k in weight_dict
+        )
+        if self.span_xx_loss_enabled and span_loss_type not in ("l1", "dfl", "fdr"):
+            raise ValueError("loss_span_xx requires span_loss_type to be 'l1', 'dfl', or 'fdr'.")
         self.losses = losses
         self.temperature = temperature
         self.span_loss_type = span_loss_type
@@ -826,6 +625,12 @@ class SetCriterion(nn.Module):
         raise ValueError(f"Unsupported width_loss_type: {self.width_loss_type}")
 
     @staticmethod
+    def _loss_span_xx(src_spans, tgt_spans):
+        src_xx = span_cxw_to_xx(src_spans)
+        tgt_xx = span_cxw_to_xx(tgt_spans)
+        return F.l1_loss(src_xx, tgt_xx, reduction='none')
+
+    @staticmethod
     def _foreground_logits(outputs):
         logits = outputs["pred_logits"]
         if logits.shape[-1] != 1:
@@ -951,6 +756,8 @@ class SetCriterion(nn.Module):
                 losses = {"loss_span": zero, "loss_giou": zero}
             if self.width_loss_type != "none" and self.span_loss_type in ("l1", "dfl", "fdr"):
                 losses["loss_width"] = zero
+            if self.span_xx_loss_enabled:
+                losses["loss_span_xx"] = zero
             return losses
 
         idx = self._get_src_permutation_idx(indices)
@@ -990,6 +797,8 @@ class SetCriterion(nn.Module):
         losses['loss_giou'] = loss_giou.mean()
         if self.width_loss_type != "none" and self.span_loss_type in ("l1", "dfl", "fdr"):
             losses['loss_width'] = self._loss_width(src_spans, tgt_spans).mean()
+        if self.span_xx_loss_enabled:
+            losses['loss_span_xx'] = self._loss_span_xx(src_spans, tgt_spans).mean()
         return losses
 
     def _tal_quality_targets(self, outputs, targets, indices):
@@ -1023,7 +832,6 @@ class SetCriterion(nn.Module):
         return target_quality
 
     def _loss_labels_tal(self, outputs, targets, indices, log=True):
-        src_logits = outputs['pred_logits']
         target_quality = self._tal_quality_targets(outputs, targets, indices)
         fg_logits = self._foreground_logits(outputs)
         loss_bce = F.binary_cross_entropy_with_logits(fg_logits, target_quality, reduction="none")
@@ -1069,7 +877,6 @@ class SetCriterion(nn.Module):
         return target_quality
 
     def _loss_labels_hungarian_quality(self, outputs, targets, indices, log=True):
-        src_logits = outputs['pred_logits']
         target_quality = self._hungarian_quality_targets(outputs, targets, indices)
         fg_logits = self._foreground_logits(outputs)
         loss_bce = F.binary_cross_entropy_with_logits(fg_logits, target_quality, reduction="none")
@@ -1101,7 +908,7 @@ class SetCriterion(nn.Module):
                 tgt_spans_xx = span_cxw_to_xx(tgt_spans)
                 matched_ious = torch.diag(
                     temporal_iou(pred_spans_xx[batch_idx, src_idx], tgt_spans_xx[tgt_idx])[0]
-                ).clamp(0.1, 1)
+                ).clamp(0, 1)
                 target_score[batch_idx, src_idx] = matched_ious.to(target_score.dtype)
                 positive[batch_idx, src_idx] = True
 
@@ -1138,7 +945,6 @@ class SetCriterion(nn.Module):
         if label_loss_type != "ce":
             raise ValueError("label_loss_type must be one of ce, quality, or vfl.")
 
-        src_logits = outputs['pred_logits']
         fg_logits = self._foreground_logits(outputs)
         # idx is a tuple of two 1D tensors (batch_idx, src_idx), of the same length == #objects in batch
         idx = self._get_src_permutation_idx(indices)
@@ -1366,7 +1172,6 @@ class SetCriterion(nn.Module):
                     kwargs = {}
                     if loss == "labels":
                         kwargs["matching_type"] = "hungarian"
-                        kwargs["label_loss_type"] = "ce"
                     loss_indices = indices_go if go_lsd_active and loss == "spans" else aux_indices
                     l_dict = self.get_loss(loss, aux_outputs, targets, loss_indices, **kwargs)
                     l_dict = {k + f'_{i}': v for k, v in l_dict.items()}
@@ -1442,6 +1247,8 @@ def build_model(args):
     fdr_num_bins = getattr(args, "fdr_num_bins", 32)
     fdr_reg_scale = getattr(args, "fdr_reg_scale", 1.5)
     fdr_min_ref_width = getattr(args, "fdr_min_ref_width", None)
+    query_init = getattr(args, "query_init", "random")
+    query_anchor_widths = getattr(args, "query_anchor_widths", None)
     if fdr_min_ref_width is not None and fdr_min_ref_width <= 0:
         fdr_min_ref_width = 1.0 / float(args.max_v_l)
 
@@ -1466,17 +1273,8 @@ def build_model(args):
             fdr_min_ref_width=fdr_min_ref_width,
             use_txt_pos=args.use_txt_pos,
             n_input_proj=args.n_input_proj,
-            use_gated_video_fusion=args.use_gated_video_fusion,
-            use_late_gated_video_fusion=args.use_late_gated_video_fusion,
-            slowfast_dim=args.slowfast_dim,
-            clip_dim=args.clip_dim,
-            tef_dim=args.tef_dim,
-            dropout=args.dropout,
-            dim_feedforward=args.dim_feedforward,
-            use_multiscale_stream_adapter=args.use_multiscale_stream_adapter,
-            multiscale_adapter_dropout=args.multiscale_adapter_dropout,
-            multiscale_adapter_dilations=getattr(args, "multiscale_adapter_dilations", (1, 2, 3)),
-            multiscale_adapter_kernel_size=getattr(args, "multiscale_adapter_kernel_size", 3),
+            query_init=query_init,
+            query_anchor_widths=query_anchor_widths,
         )
     else:
         model = VMRDETR(
@@ -1500,17 +1298,8 @@ def build_model(args):
             fdr_min_ref_width=fdr_min_ref_width,
             use_txt_pos=args.use_txt_pos,
             n_input_proj=args.n_input_proj,
-            use_gated_video_fusion=args.use_gated_video_fusion,
-            use_late_gated_video_fusion=args.use_late_gated_video_fusion,
-            slowfast_dim=args.slowfast_dim,
-            clip_dim=args.clip_dim,
-            tef_dim=args.tef_dim,
-            dropout=args.dropout,
-            dim_feedforward=args.dim_feedforward,
-            use_multiscale_stream_adapter=args.use_multiscale_stream_adapter,
-            multiscale_adapter_dropout=args.multiscale_adapter_dropout,
-            multiscale_adapter_dilations=getattr(args, "multiscale_adapter_dilations", (1, 2, 3)),
-            multiscale_adapter_kernel_size=getattr(args, "multiscale_adapter_kernel_size", 3),
+            query_init=query_init,
+            query_anchor_widths=query_anchor_widths,
         )
 
     matching_type = getattr(args, "matching_type", "hungarian")
@@ -1531,6 +1320,9 @@ def build_model(args):
     width_loss_coef = getattr(args, "width_loss_coef", 0.0)
     if width_loss_coef > 0 and width_loss_type != "none":
         weight_dict["loss_width"] = width_loss_coef
+    span_xx_loss_coef = getattr(args, "span_xx_loss_coef", 0.0)
+    if span_xx_loss_coef > 0:
+        weight_dict["loss_span_xx"] = span_xx_loss_coef
     go_lsd_loss_coef = getattr(args, "go_lsd_loss_coef", 0.0)
     if go_lsd_loss_coef > 0:
         weight_dict["loss_golsd"] = go_lsd_loss_coef
