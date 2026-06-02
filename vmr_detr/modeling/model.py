@@ -230,20 +230,18 @@ class TemporalLocalBlock(nn.Module):
     def _masked_depthwise_conv(self, x, valid_mask, conv, dilation, padding):
         valid = valid_mask.bool().to(dtype=x.dtype).unsqueeze(1)
         x_t = x.transpose(1, 2) * valid
+
         y = F.conv1d(
-            x_t, conv.weight, bias=None, stride=1, padding=padding,
-            dilation=dilation, groups=conv.groups
+            x_t,
+            conv.weight,
+            bias=conv.bias,
+            stride=1,
+            padding=padding,
+            dilation=dilation,
+            groups=conv.groups,
         )
-        count_kernel = torch.ones(
-            1, 1, self.kernel_size, dtype=x.dtype, device=x.device
-        )
-        valid_count = F.conv1d(
-            valid, count_kernel, stride=1, padding=padding, dilation=dilation
-        )
-        y = y * (float(self.kernel_size) / valid_count.clamp_min(1.0))
-        if conv.bias is not None:
-            y = y + conv.bias.view(1, -1, 1)
-        y = y * valid * (valid_count > 0).to(dtype=x.dtype)
+
+        y = y * valid
         return y.transpose(1, 2)
 
     def forward(self, x, valid_mask):
@@ -256,7 +254,7 @@ class TemporalLocalBlock(nn.Module):
                 self.layers, self.layer_scales, self.layer_dilations, self.layer_paddings):
             residual = out
             y = layer["norm"](out) * valid_f
-            y = layer["dropout"](y)
+            
             y = self._masked_depthwise_conv(
                 y, valid_mask, layer["depthwise"], dilation, padding
             )
@@ -264,6 +262,7 @@ class TemporalLocalBlock(nn.Module):
             y = layer["pointwise_expand"](y)
             y = F.gelu(y)
             y = layer["pointwise_project"](y).transpose(1, 2)
+            y = layer["dropout"](y)
             out = residual + layer_scale.view(1, 1, -1) * y
             out = out * valid_f
 
@@ -1417,6 +1416,7 @@ class SetCriterion(nn.Module):
                     kwargs = {}
                     if loss == "labels":
                         kwargs["matching_type"] = "hungarian"
+                        kwargs["use_quality_label_loss"] = False
                     loss_indices = indices_go if go_lsd_active and loss == "spans" else aux_indices
                     l_dict = self.get_loss(loss, aux_outputs, targets, loss_indices, **kwargs)
                     l_dict = {k + f'_{i}': v for k, v in l_dict.items()}
