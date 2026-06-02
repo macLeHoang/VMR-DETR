@@ -252,6 +252,74 @@ class TemporalLocalBlockTest(unittest.TestCase):
 
         self.assertEqual(dilations, [1, 2, 4, 1])
 
+    def test_temporal_local_masked_conv_normalizes_missing_neighbors(self):
+        block = TemporalLocalBlock(
+            hidden_dim=1, num_layers=1, kernel_size=3, dilations=[1], dropout=0.0
+        )
+        conv = block.layers[0]["depthwise"]
+        with torch.no_grad():
+            conv.weight.fill_(1.0)
+            conv.bias.zero_()
+        x = torch.tensor([[[2.0], [4.0], [100.0]]])
+        valid_mask = torch.tensor([[1, 1, 0]])
+
+        out = block._masked_depthwise_conv(x, valid_mask, conv, dilation=1, padding=1)
+
+        self.assertTrue(torch.allclose(out.squeeze(-1), torch.tensor([[9.0, 9.0, 0.0]])))
+
+    def test_temporal_local_padded_values_do_not_affect_valid_outputs(self):
+        torch.manual_seed(0)
+        block = TemporalLocalBlock(
+            hidden_dim=4, num_layers=2, kernel_size=3, dilations=[1, 2], dropout=0.0
+        )
+        x = torch.randn(2, 6, 4)
+        valid_mask = torch.tensor([
+            [1, 1, 1, 1, 0, 0],
+            [1, 1, 1, 0, 0, 0],
+        ])
+        x_with_large_padding = x.clone()
+        x_with_large_padding[~valid_mask.bool()] = 1e6
+
+        out = block(x, valid_mask)
+        out_with_large_padding = block(x_with_large_padding, valid_mask)
+
+        self.assertTrue(torch.allclose(
+            out[valid_mask.bool()], out_with_large_padding[valid_mask.bool()], atol=1e-6
+        ))
+
+    def test_temporal_local_block_has_small_residual_scales(self):
+        block = TemporalLocalBlock(
+            hidden_dim=4, num_layers=2, kernel_size=3, dilations=[1, 2], dropout=0.0
+        )
+
+        self.assertEqual(len(block.layer_scales), 2)
+        for layer_scale in block.layer_scales:
+            self.assertEqual(tuple(layer_scale.shape), (4,))
+            self.assertTrue(torch.allclose(layer_scale, torch.full((4,), 1e-3)))
+
+    def test_temporal_local_block_loads_legacy_pointwise_state_strictly(self):
+        block = TemporalLocalBlock(
+            hidden_dim=4, num_layers=2, kernel_size=3, dilations=[1, 2], dropout=0.0
+        )
+        legacy_state = {
+            key: value.clone()
+            for key, value in block.state_dict().items()
+            if "pointwise_expand" not in key
+            and "pointwise_project" not in key
+            and not key.startswith("layer_scales.")
+        }
+        for layer_idx in range(2):
+            legacy_state[f"layers.{layer_idx}.pointwise.weight"] = torch.randn(4, 4, 1)
+            legacy_state[f"layers.{layer_idx}.pointwise.bias"] = torch.randn(4)
+
+        new_block = TemporalLocalBlock(
+            hidden_dim=4, num_layers=2, kernel_size=3, dilations=[1, 2], dropout=0.0
+        )
+        result = new_block.load_state_dict(legacy_state, strict=True)
+
+        self.assertEqual(result.missing_keys, [])
+        self.assertEqual(result.unexpected_keys, [])
+
     def test_invalid_temporal_local_settings_raise(self):
         invalid_configs = [
             (dict(num_layers=0), "temporal_local_layers"),

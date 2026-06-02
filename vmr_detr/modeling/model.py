@@ -176,31 +176,95 @@ class TemporalLocalBlock(nn.Module):
 
         dilations = _normalize_temporal_local_dilations(dilations)
         self.layers = nn.ModuleList()
+        self.layer_scales = nn.ParameterList()
+        self.kernel_size = kernel_size
+        self.layer_dilations = []
+        self.layer_paddings = []
+        expansion_dim = hidden_dim * 2
         for layer_idx in range(num_layers):
             dilation = dilations[layer_idx % len(dilations)]
             padding = dilation * (kernel_size // 2)
+            self.layer_dilations.append(dilation)
+            self.layer_paddings.append(padding)
             self.layers.append(nn.ModuleDict({
+                "norm": nn.LayerNorm(hidden_dim),
                 "depthwise": nn.Conv1d(
                     hidden_dim, hidden_dim, kernel_size=kernel_size,
                     padding=padding, dilation=dilation, groups=hidden_dim
                 ),
-                "pointwise": nn.Conv1d(hidden_dim, hidden_dim, kernel_size=1),
+                "pointwise_expand": nn.Conv1d(hidden_dim, expansion_dim, kernel_size=1),
+                "pointwise_project": nn.Conv1d(expansion_dim, hidden_dim, kernel_size=1),
                 "dropout": nn.Dropout(dropout),
-                "norm": nn.LayerNorm(hidden_dim),
             }))
+            self.layer_scales.append(nn.Parameter(torch.full((hidden_dim,), 1e-3)))
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        local_state = self.state_dict()
+        for layer_idx in range(len(self.layers)):
+            legacy_keys = [
+                f"{prefix}layers.{layer_idx}.pointwise.weight",
+                f"{prefix}layers.{layer_idx}.pointwise.bias",
+            ]
+            legacy_pointwise = any(key in state_dict for key in legacy_keys)
+            if legacy_pointwise:
+                new_keys = [
+                    f"layers.{layer_idx}.pointwise_expand.weight",
+                    f"layers.{layer_idx}.pointwise_expand.bias",
+                    f"layers.{layer_idx}.pointwise_project.weight",
+                    f"layers.{layer_idx}.pointwise_project.bias",
+                    f"layer_scales.{layer_idx}",
+                ]
+                for key in new_keys:
+                    full_key = prefix + key
+                    if full_key not in state_dict:
+                        state_dict[full_key] = local_state[key].detach().clone()
+                for key in legacy_keys:
+                    state_dict.pop(key, None)
+
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict,
+            missing_keys, unexpected_keys, error_msgs
+        )
+
+    def _masked_depthwise_conv(self, x, valid_mask, conv, dilation, padding):
+        valid = valid_mask.bool().to(dtype=x.dtype).unsqueeze(1)
+        x_t = x.transpose(1, 2) * valid
+        y = F.conv1d(
+            x_t, conv.weight, bias=None, stride=1, padding=padding,
+            dilation=dilation, groups=conv.groups
+        )
+        count_kernel = torch.ones(
+            1, 1, self.kernel_size, dtype=x.dtype, device=x.device
+        )
+        valid_count = F.conv1d(
+            valid, count_kernel, stride=1, padding=padding, dilation=dilation
+        )
+        y = y * (float(self.kernel_size) / valid_count.clamp_min(1.0))
+        if conv.bias is not None:
+            y = y + conv.bias.view(1, -1, 1)
+        y = y * valid * (valid_count > 0).to(dtype=x.dtype)
+        return y.transpose(1, 2)
 
     def forward(self, x, valid_mask):
-        valid = valid_mask.bool().unsqueeze(-1)
+        valid_mask = valid_mask.bool()
+        valid = valid_mask.unsqueeze(-1)
         valid_f = valid.to(dtype=x.dtype)
         out = x * valid_f
 
-        for layer in self.layers:
+        for layer, layer_scale, dilation, padding in zip(
+                self.layers, self.layer_scales, self.layer_dilations, self.layer_paddings):
             residual = out
-            y = layer["depthwise"](out.transpose(1, 2))
-            y = F.relu(y, inplace=True)
-            y = layer["pointwise"](y).transpose(1, 2)
+            y = layer["norm"](out) * valid_f
             y = layer["dropout"](y)
-            out = layer["norm"](residual + y)
+            y = self._masked_depthwise_conv(
+                y, valid_mask, layer["depthwise"], dilation, padding
+            )
+            y = F.gelu(y).transpose(1, 2)
+            y = layer["pointwise_expand"](y)
+            y = F.gelu(y)
+            y = layer["pointwise_project"](y).transpose(1, 2)
+            out = residual + layer_scale.view(1, 1, -1) * y
             out = out * valid_f
 
         return out
