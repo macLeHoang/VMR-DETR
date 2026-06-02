@@ -52,21 +52,26 @@ clip_length=1
 span_loss_type=fdr
 fdr_num_bins=32
 fdr_reg_scale=1.5
-fdr_min_ref_width=0.01
+fdr_min_ref_width=0.05
 query_anchor_widths=0.08,0.22,0.48
-temporal_pyramid_flag=--use_temporal_pyramid
+temporal_pyramid_flag=
 temporal_pyramid_downsample=conv
+temporal_local_flag=--use_temporal_local
+temporal_local_layers=3
+temporal_local_kernel_size=3
+temporal_local_dilations=1,2,2
+temporal_local_dropout=0.1
 matching_type=hungarian
 aux_matching_type=hungarian
 aux_one_to_many_k=2
 set_cost_span=10
 set_cost_giou=1
-set_cost_class=8
+set_cost_class=4
 
 # Losses: localization and labels
 span_loss_coef=1.0
 span_xx_loss_coef=5.0
-fgl_loss_coef=2.0
+fgl_loss_coef=0.5
 giou_loss_coef=1.0
 width_loss_type=log
 width_loss_coef=0.5
@@ -76,18 +81,18 @@ label_loss_coef=4.0
 label_loss_type=quality
 quality_label_strength=1.0
 quality_label_iou_gamma=2.0
-quality_label_warmup_epoch=5
-quality_label_ramp_epoch=5
+quality_label_warmup_epoch=0
+quality_label_ramp_epoch=0
 
 # Losses: GO-LSD self-distillation, disabled by default here
 go_lsd_loss_coef=0.5
 go_lsd_temperature=2.0
-go_lsd_start_epoch=5
+go_lsd_start_epoch=0
 
 # Losses: contrastive query/text alignment
 contrastive_align_loss_flag=--contrastive_align_loss
 contrastive_align_loss_coef=0.3
-contrastive_start_epoch=5
+contrastive_start_epoch=10
 contrastive_decay_epoch=30
 contrastive_decay_coef=0.1
 
@@ -107,8 +112,8 @@ num_workers=2
 eval_every_epoch_after=40
 ema_decay=0.999
 ema_start_epoch=1
-ema_start_decay=0.99
-ema_warmup_updates=1000
+ema_start_decay=0.995
+ema_warmup_updates=2000
 ema_update_every=1
 ema_schedule=cosine
 max_es_cnt=10
@@ -139,6 +144,11 @@ PYTHONPATH="${PYTHONPATH}:." python vmr_detr/cli/train.py \
   "${query_anchor_widths_args[@]}" \
   ${temporal_pyramid_flag} \
   --temporal_pyramid_downsample "${temporal_pyramid_downsample}" \
+  ${temporal_local_flag} \
+  --temporal_local_layers "${temporal_local_layers}" \
+  --temporal_local_kernel_size "${temporal_local_kernel_size}" \
+  --temporal_local_dilations "${temporal_local_dilations}" \
+  --temporal_local_dropout "${temporal_local_dropout}" \
   --bsz "${bsz}" \
   --eval_bsz "${eval_bsz}" \
   --n_epoch "${n_epoch}" \

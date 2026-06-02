@@ -146,6 +146,16 @@ class BaseOptions(object):
                             help="Use pooled multi-scale temporal video tokens in transformer memory.")
         parser.add_argument("--temporal_pyramid_downsample", default="avg", choices=["avg", "conv"],
                             help="Downsample method for temporal pyramid video tokens.")
+        parser.add_argument("--use_temporal_local", action="store_true",
+                            help="Use residual dilated temporal convolution before transformer attention.")
+        parser.add_argument("--temporal_local_layers", default=2, type=int,
+                            help="Number of residual temporal-local convolution layers.")
+        parser.add_argument("--temporal_local_kernel_size", default=3, type=int,
+                            help="Odd kernel size for temporal-local convolution layers.")
+        parser.add_argument("--temporal_local_dilations", default="1,2", type=str,
+                            help="Comma-separated positive dilations for temporal-local convolution layers.")
+        parser.add_argument("--temporal_local_dropout", default=0.1, type=float,
+                            help="Dropout for temporal-local residual convolution layers.")
         parser.add_argument('--pre_norm', action='store_true')
         # other model configs
         parser.add_argument("--n_input_proj", type=int, default=2, help="#layers to encoder input")
@@ -292,6 +302,8 @@ class BaseOptions(object):
             if opt.eval_results_dir is not None:
                 opt.results_dir = opt.eval_results_dir
             self._normalize_query_anchor_widths(opt)
+            self._normalize_temporal_local_dilations(opt)
+            self._validate_temporal_local_options(opt)
             if opt.dfl_num_bins < 2:
                 raise ValueError("--dfl_num_bins must be >= 2.")
             if opt.dfl_ref_prior_sigma <= 0:
@@ -301,6 +313,8 @@ class BaseOptions(object):
             self._validate_tal_options(opt)
         else:
             self._normalize_query_anchor_widths(opt)
+            self._normalize_temporal_local_dilations(opt)
+            self._validate_temporal_local_options(opt)
             if opt.dfl_num_bins < 2:
                 raise ValueError("--dfl_num_bins must be >= 2.")
             if opt.dfl_ref_prior_sigma <= 0:
@@ -360,6 +374,45 @@ class BaseOptions(object):
             opt.query_anchor_widths = values if values else None
             return
         opt.query_anchor_widths = [float(value) for value in raw_widths] if raw_widths else None
+
+    @staticmethod
+    def _normalize_temporal_local_dilations(opt):
+        raw_dilations = getattr(opt, "temporal_local_dilations", "1,2")
+        if raw_dilations is None:
+            opt.temporal_local_dilations = []
+            return
+        try:
+            if isinstance(raw_dilations, str):
+                values = [value.strip() for value in raw_dilations.split(",")]
+                opt.temporal_local_dilations = [int(value) for value in values if value]
+                return
+            if isinstance(raw_dilations, int):
+                opt.temporal_local_dilations = [raw_dilations]
+                return
+            opt.temporal_local_dilations = [int(value) for value in raw_dilations]
+        except (TypeError, ValueError):
+            raise ValueError("--temporal_local_dilations must be comma-separated positive integers.") from None
+
+    @staticmethod
+    def _validate_temporal_local_options(opt):
+        if not hasattr(opt, "use_temporal_local"):
+            opt.use_temporal_local = False
+        if not hasattr(opt, "temporal_local_layers"):
+            opt.temporal_local_layers = 2
+        if not hasattr(opt, "temporal_local_kernel_size"):
+            opt.temporal_local_kernel_size = 3
+        if not hasattr(opt, "temporal_local_dropout"):
+            opt.temporal_local_dropout = 0.1
+        if opt.temporal_local_layers < 1:
+            raise ValueError("--temporal_local_layers must be >= 1.")
+        if opt.temporal_local_kernel_size < 1 or opt.temporal_local_kernel_size % 2 == 0:
+            raise ValueError("--temporal_local_kernel_size must be a positive odd integer.")
+        if not opt.temporal_local_dilations:
+            raise ValueError("--temporal_local_dilations must contain at least one dilation.")
+        if any(value <= 0 for value in opt.temporal_local_dilations):
+            raise ValueError("--temporal_local_dilations must be positive integers.")
+        if opt.temporal_local_dropout < 0 or opt.temporal_local_dropout > 1:
+            raise ValueError("--temporal_local_dropout must be in [0, 1].")
 
     @staticmethod
     def _validate_label_loss_options(opt):

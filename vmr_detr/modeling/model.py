@@ -142,6 +142,70 @@ def _decode_fdr_cumulative_outputs(span_delta_logits, reference_spans, fdr_num_b
     return span_logits, spans, initial_reference
 
 
+def _normalize_temporal_local_dilations(dilations):
+    try:
+        if isinstance(dilations, str):
+            values = [value.strip() for value in dilations.split(",")]
+            values = [int(value) for value in values if value]
+        elif isinstance(dilations, int):
+            values = [dilations]
+        else:
+            values = [int(value) for value in dilations]
+    except (TypeError, ValueError):
+        raise ValueError("temporal_local_dilations must be comma-separated positive integers.") from None
+    if not values:
+        raise ValueError("temporal_local_dilations must contain at least one dilation.")
+    if any(value <= 0 for value in values):
+        raise ValueError("temporal_local_dilations must be positive integers.")
+    return values
+
+
+class TemporalLocalBlock(nn.Module):
+    """Masked residual temporal convolution block for video tokens."""
+
+    def __init__(self, hidden_dim, num_layers=2, kernel_size=3, dilations=(1, 2), dropout=0.1):
+        super().__init__()
+        if hidden_dim <= 0:
+            raise ValueError("hidden_dim must be > 0.")
+        if num_layers < 1:
+            raise ValueError("temporal_local_layers must be >= 1.")
+        if kernel_size < 1 or kernel_size % 2 == 0:
+            raise ValueError("temporal_local_kernel_size must be a positive odd integer.")
+        if dropout < 0 or dropout > 1:
+            raise ValueError("temporal_local_dropout must be in [0, 1].")
+
+        dilations = _normalize_temporal_local_dilations(dilations)
+        self.layers = nn.ModuleList()
+        for layer_idx in range(num_layers):
+            dilation = dilations[layer_idx % len(dilations)]
+            padding = dilation * (kernel_size // 2)
+            self.layers.append(nn.ModuleDict({
+                "depthwise": nn.Conv1d(
+                    hidden_dim, hidden_dim, kernel_size=kernel_size,
+                    padding=padding, dilation=dilation, groups=hidden_dim
+                ),
+                "pointwise": nn.Conv1d(hidden_dim, hidden_dim, kernel_size=1),
+                "dropout": nn.Dropout(dropout),
+                "norm": nn.LayerNorm(hidden_dim),
+            }))
+
+    def forward(self, x, valid_mask):
+        valid = valid_mask.bool().unsqueeze(-1)
+        valid_f = valid.to(dtype=x.dtype)
+        out = x * valid_f
+
+        for layer in self.layers:
+            residual = out
+            y = layer["depthwise"](out.transpose(1, 2))
+            y = F.relu(y, inplace=True)
+            y = layer["pointwise"](y).transpose(1, 2)
+            y = layer["dropout"](y)
+            out = layer["norm"](residual + y)
+            out = out * valid_f
+
+        return out
+
+
 class VMRDETR(nn.Module):
     """ VMR DETR. """
 
@@ -152,7 +216,10 @@ class VMRDETR(nn.Module):
                  dfl_num_bins=16, dfl_ref_prior_sigma=2.0,
                  fdr_num_bins=32, fdr_reg_scale=1.5, fdr_min_ref_width=None,
                  query_init="random", query_anchor_widths=None,
-                 use_temporal_pyramid=False, temporal_pyramid_downsample="avg"):
+                 use_temporal_pyramid=False, temporal_pyramid_downsample="avg",
+                 use_temporal_local=False, temporal_local_layers=2,
+                 temporal_local_kernel_size=3, temporal_local_dilations=(1, 2),
+                 temporal_local_dropout=0.1):
         """ Initializes the model.
         Parameters:
             transformer: torch module of the transformer architecture. See transformer.py
@@ -176,6 +243,7 @@ class VMRDETR(nn.Module):
             query_anchor_widths: optional normalized widths for temporal anchor query initialization.
             use_temporal_pyramid: if true, decoder attends to pooled temporal levels in addition to level 1.
             temporal_pyramid_downsample: temporal pyramid downsample method, one of [avg, conv].
+            use_temporal_local: if true, apply residual local temporal convolution before the transformer.
             # foreground_thd: float, intersection over prediction >= foreground_thd: labeled as foreground
             # background_thd: float, intersection over prediction <= background_thd: labeled background
         """
@@ -188,6 +256,7 @@ class VMRDETR(nn.Module):
         self.span_loss_type = span_loss_type
         self.max_v_l = max_v_l
         self.use_temporal_pyramid = use_temporal_pyramid
+        self.use_temporal_local = use_temporal_local
         if temporal_pyramid_downsample not in ("avg", "conv"):
             raise ValueError("temporal_pyramid_downsample must be one of ['avg', 'conv'].")
         self.temporal_pyramid_downsample = temporal_pyramid_downsample
@@ -259,6 +328,16 @@ class VMRDETR(nn.Module):
         self.hidden_dim = hidden_dim
         self.global_rep_token = torch.nn.Parameter(torch.randn(hidden_dim))
         self.global_rep_pos = torch.nn.Parameter(torch.randn(hidden_dim))
+        self.temporal_local = (
+            TemporalLocalBlock(
+                hidden_dim,
+                num_layers=temporal_local_layers,
+                kernel_size=temporal_local_kernel_size,
+                dilations=temporal_local_dilations,
+                dropout=temporal_local_dropout,
+            )
+            if use_temporal_local else None
+        )
         self.video_level_embed = nn.Embedding(3, hidden_dim) if use_temporal_pyramid else None
         if use_temporal_pyramid and temporal_pyramid_downsample == "conv":
             self.temporal_downsample = nn.ModuleList([
@@ -398,6 +477,8 @@ class VMRDETR(nn.Module):
         self._validate_text_mask(src_txt, src_txt_mask)
         src_txt = self.input_txt_proj(src_txt)
         src_vid = self.input_vid_proj(src_vid)
+        if self.temporal_local is not None:
+            src_vid = self.temporal_local(src_vid, src_vid_mask)
 
         hs, reference, vid_mem, memory_global, txt_mem = self._run_text_video_transformer(
             src_vid, src_vid_mask, src_txt, src_txt_mask
@@ -1351,6 +1432,11 @@ def build_model(args):
     query_anchor_widths = getattr(args, "query_anchor_widths", None)
     use_temporal_pyramid = getattr(args, "use_temporal_pyramid", False)
     temporal_pyramid_downsample = getattr(args, "temporal_pyramid_downsample", "avg")
+    use_temporal_local = getattr(args, "use_temporal_local", False)
+    temporal_local_layers = getattr(args, "temporal_local_layers", 2)
+    temporal_local_kernel_size = getattr(args, "temporal_local_kernel_size", 3)
+    temporal_local_dilations = getattr(args, "temporal_local_dilations", (1, 2))
+    temporal_local_dropout = getattr(args, "temporal_local_dropout", 0.1)
     if fdr_min_ref_width is not None and fdr_min_ref_width <= 0:
         fdr_min_ref_width = 1.0 / float(args.max_v_l)
 
@@ -1379,6 +1465,11 @@ def build_model(args):
             query_anchor_widths=query_anchor_widths,
             use_temporal_pyramid=use_temporal_pyramid,
             temporal_pyramid_downsample=temporal_pyramid_downsample,
+            use_temporal_local=use_temporal_local,
+            temporal_local_layers=temporal_local_layers,
+            temporal_local_kernel_size=temporal_local_kernel_size,
+            temporal_local_dilations=temporal_local_dilations,
+            temporal_local_dropout=temporal_local_dropout,
         )
     else:
         model = VMRDETR(
@@ -1406,6 +1497,11 @@ def build_model(args):
             query_anchor_widths=query_anchor_widths,
             use_temporal_pyramid=use_temporal_pyramid,
             temporal_pyramid_downsample=temporal_pyramid_downsample,
+            use_temporal_local=use_temporal_local,
+            temporal_local_layers=temporal_local_layers,
+            temporal_local_kernel_size=temporal_local_kernel_size,
+            temporal_local_dilations=temporal_local_dilations,
+            temporal_local_dropout=temporal_local_dropout,
         )
 
     matching_type = getattr(args, "matching_type", "hungarian")
