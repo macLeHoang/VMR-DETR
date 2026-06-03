@@ -190,7 +190,7 @@ class TemporalLocalBlock(nn.Module):
                 "norm": nn.LayerNorm(hidden_dim),
                 "depthwise": nn.Conv1d(
                     hidden_dim, hidden_dim, kernel_size=kernel_size,
-                    padding=padding, dilation=dilation, groups=hidden_dim
+                    padding=padding, dilation=dilation, groups=hidden_dim, bias=False
                 ),
                 "pointwise_expand": nn.Conv1d(hidden_dim, expansion_dim, kernel_size=1),
                 "pointwise_project": nn.Conv1d(expansion_dim, hidden_dim, kernel_size=1),
@@ -228,18 +228,45 @@ class TemporalLocalBlock(nn.Module):
         )
 
     def _masked_depthwise_conv(self, x, valid_mask, conv, dilation, padding):
-        valid = valid_mask.bool().to(dtype=x.dtype).unsqueeze(1)
-        x_t = x.transpose(1, 2) * valid
+        # x: [B, L, C]
+        # valid_mask: [B, L], True for valid clips
 
+        valid = valid_mask.bool().to(dtype=x.dtype).unsqueeze(1)  # [B, 1, L]
+        x_t = x.transpose(1, 2) * valid                           # [B, C, L]
+
+        # Convolve masked input.
         y = F.conv1d(
             x_t,
             conv.weight,
-            bias=conv.bias,
+            bias=None,
             stride=1,
             padding=padding,
             dilation=dilation,
             groups=conv.groups,
         )
+
+        # Count valid neighbors per output position.
+        kernel_size = conv.weight.shape[-1]
+        count_kernel = torch.ones(
+            1, 1, kernel_size,
+            device=x.device,
+            dtype=x.dtype,
+        )
+
+        valid_count = F.conv1d(
+            valid,
+            count_kernel,
+            bias=None,
+            stride=1,
+            padding=padding,
+            dilation=dilation,
+        ).clamp_min(1.0)
+
+        # Renormalize so boundary tokens are not weakened by padded neighbors.
+        y = y * (float(kernel_size) / valid_count)
+
+        if conv.bias is not None:
+            y = y + conv.bias.view(1, -1, 1)
 
         y = y * valid
         return y.transpose(1, 2)
@@ -258,9 +285,9 @@ class TemporalLocalBlock(nn.Module):
             y = self._masked_depthwise_conv(
                 y, valid_mask, layer["depthwise"], dilation, padding
             )
-            y = F.gelu(y).transpose(1, 2)
+            y = F.gelu(y, approximate="tanh").transpose(1, 2)
             y = layer["pointwise_expand"](y)
-            y = F.gelu(y)
+            y = F.gelu(y, approximate="tanh")
             y = layer["pointwise_project"](y).transpose(1, 2)
             y = layer["dropout"](y)
             out = residual + layer_scale.view(1, 1, -1) * y
@@ -306,7 +333,8 @@ class VMRDETR(nn.Module):
             query_anchor_widths: optional normalized widths for temporal anchor query initialization.
             use_temporal_pyramid: if true, decoder attends to pooled temporal levels in addition to level 1.
             temporal_pyramid_downsample: temporal pyramid downsample method, one of [avg, conv].
-            use_temporal_local: if true, apply residual local temporal convolution before the transformer.
+            use_temporal_local: if true, apply residual local temporal convolution. With temporal pyramid,
+                only pooled levels are built from localized tokens; level 1 stays raw.
             # foreground_thd: float, intersection over prediction >= foreground_thd: labeled as foreground
             # background_thd: float, intersection over prediction <= background_thd: labeled background
         """
@@ -469,20 +497,30 @@ class VMRDETR(nn.Module):
         pooled_x = pooled_x * pooled_mask.to(dtype=x.dtype).unsqueeze(-1)
         return pooled_x, pooled_mask
 
-    def _build_temporal_pyramid(self, src_vid, src_vid_mask):
-        v1 = src_vid
+    def _build_temporal_pyramid(self, src_vid, src_vid_mask, temporal_local_src=None):
+        raw_v1 = src_vid
         m1 = src_vid_mask.bool()
+        local_src = temporal_local_src
+        if local_src is None and self.temporal_local is not None:
+            local_src = self.temporal_local(raw_v1, m1)
+        if local_src is None:
+            local_src = raw_v1
+
+        v1 = raw_v1
         pos1 = self.position_embed(v1, m1)
 
         if not self.use_temporal_pyramid:
+            if self.temporal_local is not None:
+                v1 = local_src
+                pos1 = self.position_embed(v1, m1)
             return v1, m1, pos1, v1.shape[1]
 
         if self.temporal_pyramid_downsample == "conv":
-            v2, m2 = self._masked_temporal_conv(v1, m1, level_idx=1, kernel_size=3, stride=2, padding=1)
-            v3, m3 = self._masked_temporal_conv(v1, m1, level_idx=2, kernel_size=5, stride=4, padding=2)
+            v2, m2 = self._masked_temporal_conv(local_src, m1, level_idx=1, kernel_size=3, stride=2, padding=1)
+            v3, m3 = self._masked_temporal_conv(local_src, m1, level_idx=2, kernel_size=5, stride=4, padding=2)
         else:
-            v2, m2 = self._masked_temporal_pool(v1, m1, kernel_size=2, stride=2)
-            v3, m3 = self._masked_temporal_pool(v1, m1, kernel_size=4, stride=4)
+            v2, m2 = self._masked_temporal_pool(local_src, m1, kernel_size=2, stride=2)
+            v3, m3 = self._masked_temporal_pool(local_src, m1, kernel_size=4, stride=4)
         pos2 = self.position_embed(v2, m2)
         pos3 = self.position_embed(v3, m3)
 
@@ -496,9 +534,10 @@ class VMRDETR(nn.Module):
         pos_vid_pyr = torch.cat([pos1, pos2, pos3], dim=1)
         return src_vid_pyr, src_vid_pyr_mask, pos_vid_pyr, v1.shape[1]
 
-    def _run_text_video_transformer(self, src_vid, src_vid_mask, src_txt, src_txt_mask):
+    def _run_text_video_transformer(self, src_vid, src_vid_mask, src_txt, src_txt_mask,
+                                    temporal_local_src=None):
         src_vid, src_vid_mask_for_transformer, pos_vid, level1_length = self._build_temporal_pyramid(
-            src_vid, src_vid_mask
+            src_vid, src_vid_mask, temporal_local_src=temporal_local_src
         )
         src = torch.cat([src_vid, src_txt], dim=1)  # (bsz, L_vid+L_txt, d)
         mask = torch.cat([src_vid_mask_for_transformer, src_txt_mask.bool()], dim=1)  # (bsz, L_vid+L_txt)
@@ -540,11 +579,12 @@ class VMRDETR(nn.Module):
         self._validate_text_mask(src_txt, src_txt_mask)
         src_txt = self.input_txt_proj(src_txt)
         src_vid = self.input_vid_proj(src_vid)
+        temporal_local_src = None
         if self.temporal_local is not None:
-            src_vid = self.temporal_local(src_vid, src_vid_mask)
+            temporal_local_src = self.temporal_local(src_vid, src_vid_mask)
 
         hs, reference, vid_mem, memory_global, txt_mem = self._run_text_video_transformer(
-            src_vid, src_vid_mask, src_txt, src_txt_mask
+            src_vid, src_vid_mask, src_txt, src_txt_mask, temporal_local_src=temporal_local_src
         )
 
         outputs_class = self.class_embed(hs)  # (#layers, batch_size, #queries, 1 foreground logit)
@@ -597,7 +637,8 @@ class VMRDETR(nn.Module):
         src_vid_neg = src_vid
 
         _, _, vid_mem_neg, memory_global_neg, _ = self._run_text_video_transformer(
-            src_vid_neg, src_vid_mask, src_txt_neg, src_txt_mask_neg
+            src_vid_neg, src_vid_mask, src_txt_neg, src_txt_mask_neg,
+            temporal_local_src=temporal_local_src
         )
 
 

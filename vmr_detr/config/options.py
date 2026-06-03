@@ -147,7 +147,8 @@ class BaseOptions(object):
         parser.add_argument("--temporal_pyramid_downsample", default="avg", choices=["avg", "conv"],
                             help="Downsample method for temporal pyramid video tokens.")
         parser.add_argument("--use_temporal_local", action="store_true",
-                            help="Use residual dilated temporal convolution before transformer attention.")
+                            help="Use residual dilated temporal convolution; with temporal pyramid, "
+                                 "only pooled levels use localized tokens.")
         parser.add_argument("--temporal_local_layers", default=2, type=int,
                             help="Number of residual temporal-local convolution layers.")
         parser.add_argument("--temporal_local_kernel_size", default=3, type=int,

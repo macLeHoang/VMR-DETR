@@ -75,6 +75,16 @@ class _ZeroPosition(torch.nn.Module):
         return torch.zeros_like(x)
 
 
+class _AddTemporalLocal(torch.nn.Module):
+    def __init__(self, offset):
+        super().__init__()
+        self.offset = float(offset)
+
+    def forward(self, x, valid_mask):
+        valid = valid_mask.bool().to(dtype=x.dtype).unsqueeze(-1)
+        return (x + self.offset) * valid
+
+
 class _FixedSpanEmbed(torch.nn.Module):
     def __init__(self, logits):
         super().__init__()
@@ -106,7 +116,8 @@ class _FixedFDRVMRDETR(VMRDETR):
         self.register_buffer("refs", refs)
         self.span_embed = _FixedSpanEmbed(delta_logits)
 
-    def _run_text_video_transformer(self, src_vid, src_vid_mask, src_txt, src_txt_mask):
+    def _run_text_video_transformer(self, src_vid, src_vid_mask, src_txt, src_txt_mask,
+                                    temporal_local_src=None):
         bsz = src_vid.shape[0]
         n_layers = self.refs.shape[0]
         refs = self.refs.to(device=src_vid.device, dtype=src_vid.dtype).expand(-1, bsz, -1, -1)
@@ -259,7 +270,8 @@ class TemporalLocalBlockTest(unittest.TestCase):
         conv = block.layers[0]["depthwise"]
         with torch.no_grad():
             conv.weight.fill_(1.0)
-            conv.bias.zero_()
+            if conv.bias is not None:
+                conv.bias.zero_()
         x = torch.tensor([[[2.0], [4.0], [100.0]]])
         valid_mask = torch.tensor([[1, 1, 0]])
 
@@ -462,6 +474,32 @@ class TemporalPyramidMemoryTest(unittest.TestCase):
         self.assertEqual(call["level1_length"], 75)
         self.assertEqual(call["src_shape"], (2, 138, 4))
         self.assertEqual(outputs["saliency_scores"].shape, (2, 75))
+
+    def test_temporal_local_with_pyramid_only_feeds_pooled_levels(self):
+        torch.manual_seed(0)
+        model, transformer = self._build_model(
+            use_temporal_pyramid=True,
+            temporal_pyramid_downsample="avg",
+            use_temporal_local=True,
+        )
+        model.temporal_local = _AddTemporalLocal(offset=10.0)
+        model.eval()
+        src_txt = torch.randn(1, 5, 4)
+        src_txt_mask = torch.ones(1, 5)
+        src_vid = torch.randn(1, 75, 4)
+        src_vid_mask = torch.ones(1, 75)
+
+        with torch.no_grad():
+            raw_vid = model.input_vid_proj(src_vid)
+            localized_vid = model.temporal_local(raw_vid, src_vid_mask)
+            expected_v2, _ = model._masked_temporal_pool(
+                localized_vid, src_vid_mask, kernel_size=2, stride=2
+            )
+            model(src_txt, src_txt_mask, src_vid, src_vid_mask)
+
+        call = transformer.calls[0]
+        self.assertTrue(torch.allclose(call["src"][0, 1:76], raw_vid[0], atol=1e-6))
+        self.assertTrue(torch.allclose(call["src"][0, 76:114], expected_v2[0], atol=1e-6))
 
     def test_masked_temporal_pool_ignores_padded_tokens(self):
         x = torch.tensor([[[1.0], [3.0], [100.0], [100.0], [100.0]]])
