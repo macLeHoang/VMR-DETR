@@ -47,29 +47,21 @@ fi
 
 # Model
 input_dropout=0.5
+video_input_proj=conv
 enc_layers=3
 dec_layers=3
 clip_length=1
 span_loss_type=fdr
 fdr_num_bins=32
 fdr_reg_scale=1.5
-fdr_min_ref_width=0.05
+fdr_min_ref_width=0.0
 query_anchor_widths=0.08,0.22,0.48
-temporal_pyramid_flag=--use_temporal_pyramid
-temporal_pyramid_downsample=conv
-temporal_pyramid_strides=1,2,4
-temporal_local_flag=
-#--use_temporal_local
-temporal_local_layers=1
-temporal_local_kernel_size=1
-temporal_local_dilations=1
-temporal_local_dropout=0.0
 matching_type=hungarian
 aux_matching_type=hungarian
 aux_one_to_many_k=2
-set_cost_span=8
+set_cost_span=10
 set_cost_giou=1
-set_cost_class=6
+set_cost_class=4
 
 # Losses: localization and labels
 span_loss_coef=1.0
@@ -93,7 +85,7 @@ contrastive_align_loss_flag=--contrastive_align_loss
 contrastive_align_loss_coef=0.3
 contrastive_start_epoch=0
 contrastive_decay_epoch=30
-contrastive_decay_coef=0.1
+contrastive_decay_coef=0.3
 
 # Losses: saliency
 lw_saliency=1.0
@@ -103,7 +95,7 @@ saliency_margin=0.2
 bsz=32
 eval_bsz=32
 n_epoch=100
-lr=1.5e-4
+lr=1e-4
 lr_drop=100
 lr_scheduler=step
 lrf=0.01
@@ -111,7 +103,7 @@ num_workers=2
 eval_every_epoch_after=40
 ema_decay=0.999
 ema_start_epoch=1
-ema_start_decay=0.995
+ema_start_decay=0.99
 ema_warmup_updates=2000
 ema_update_every=1
 ema_schedule=cosine
@@ -140,16 +132,9 @@ PYTHONPATH="${PYTHONPATH}:." python vmr_detr/cli/train.py \
   --results_root "${results_root}" \
   --exp_id "${exp_id}" \
   --input_dropout "${input_dropout}" \
+  --video_input_proj "${video_input_proj}" \
   --query_init temporal_anchors \
   "${query_anchor_widths_args[@]}" \
-  ${temporal_pyramid_flag} \
-  --temporal_pyramid_downsample "${temporal_pyramid_downsample}" \
-  --temporal_pyramid_strides "${temporal_pyramid_strides}" \
-  ${temporal_local_flag} \
-  --temporal_local_layers "${temporal_local_layers}" \
-  --temporal_local_kernel_size "${temporal_local_kernel_size}" \
-  --temporal_local_dilations "${temporal_local_dilations}" \
-  --temporal_local_dropout "${temporal_local_dropout}" \
   --bsz "${bsz}" \
   --eval_bsz "${eval_bsz}" \
   --n_epoch "${n_epoch}" \

@@ -4,11 +4,11 @@ import torch
 
 from vmr_detr.modeling.matcher import HungarianMatcher, TaskAlignedMatcher
 from vmr_detr.modeling.model import (
+    Conv1DLayer,
+    LinearLayer,
     SetCriterion,
-    TemporalLocalBlock,
     VMRDETR,
     _decode_fdr_cumulative_outputs,
-    _normalize_temporal_pyramid_strides,
     fdr_logits_to_spans,
     fdr_offset_support,
     init_temporal_queries,
@@ -77,16 +77,6 @@ class _ZeroPosition(torch.nn.Module):
         return torch.zeros_like(x)
 
 
-class _AddTemporalLocal(torch.nn.Module):
-    def __init__(self, offset):
-        super().__init__()
-        self.offset = float(offset)
-
-    def forward(self, x, valid_mask):
-        valid = valid_mask.bool().to(dtype=x.dtype).unsqueeze(-1)
-        return (x + self.offset) * valid
-
-
 class _FixedSpanEmbed(torch.nn.Module):
     def __init__(self, logits):
         super().__init__()
@@ -118,8 +108,7 @@ class _FixedFDRVMRDETR(VMRDETR):
         self.register_buffer("refs", refs)
         self.span_embed = _FixedSpanEmbed(delta_logits)
 
-    def _run_text_video_transformer(self, src_vid, src_vid_mask, src_txt, src_txt_mask,
-                                    temporal_local_src=None):
+    def _run_text_video_transformer(self, src_vid, src_vid_mask, src_txt, src_txt_mask):
         bsz = src_vid.shape[0]
         n_layers = self.refs.shape[0]
         refs = self.refs.to(device=src_vid.device, dtype=src_vid.dtype).expand(-1, bsz, -1, -1)
@@ -217,143 +206,58 @@ class TemporalQueryInitTest(unittest.TestCase):
             )
 
 
-class TemporalLocalBlockTest(unittest.TestCase):
-    def test_temporal_local_block_preserves_shape_and_zeroes_padded_tokens(self):
-        block = TemporalLocalBlock(
-            hidden_dim=4, num_layers=2, kernel_size=3, dilations=[1, 2], dropout=0.0
-        )
-        x = torch.randn(2, 6, 4)
-        valid_mask = torch.tensor([
-            [1, 1, 1, 1, 0, 0],
-            [1, 1, 0, 0, 0, 0],
-        ])
-
-        out = block(x, valid_mask)
-
-        self.assertEqual(out.shape, x.shape)
-        self.assertTrue(torch.allclose(out[~valid_mask.bool()], torch.zeros_like(out[~valid_mask.bool()])))
-
-    def test_temporal_local_block_has_parameter_gradients(self):
-        torch.manual_seed(0)
-        block = TemporalLocalBlock(
-            hidden_dim=4, num_layers=2, kernel_size=3, dilations=[1, 2], dropout=0.0
-        )
-        x = torch.randn(2, 6, 4, requires_grad=True)
-        valid_mask = torch.tensor([
-            [1, 1, 1, 1, 0, 0],
-            [1, 1, 1, 0, 0, 0],
-        ])
-
-        out = block(x, valid_mask)
-        weights = torch.tensor([1.0, 0.5, -0.25, 0.75])
-        loss = (out[valid_mask.bool()] * weights).sum()
-        loss.backward()
-
-        grad_sum = sum(
-            p.grad.detach().abs().sum().item()
-            for p in block.parameters()
-            if p.grad is not None
-        )
-        self.assertGreater(grad_sum, 0)
-
-    def test_temporal_local_block_cycles_custom_dilations(self):
-        block = TemporalLocalBlock(
-            hidden_dim=4, num_layers=4, kernel_size=3, dilations="1,2,4", dropout=0.0
+class VideoInputProjectionTest(unittest.TestCase):
+    def _build_model(self, video_input_proj="linear", n_input_proj=1):
+        return VMRDETR(
+            transformer=_DummyTransformer(hidden_dim=4),
+            position_embed=None,
+            txt_position_embed=None,
+            txt_dim=4,
+            vid_dim=4,
+            num_queries=4,
+            input_dropout=0.0,
+            max_v_l=75,
+            n_input_proj=n_input_proj,
+            video_input_proj=video_input_proj,
         )
 
-        dilations = [layer["depthwise"].dilation[0] for layer in block.layers]
+    def test_video_input_projection_defaults_to_linear(self):
+        model = self._build_model()
 
-        self.assertEqual(dilations, [1, 2, 4, 1])
+        self.assertEqual(model.video_input_proj, "linear")
+        self.assertIsInstance(model.input_vid_proj[0], LinearLayer)
+        self.assertNotIsInstance(model.input_vid_proj[0], Conv1DLayer)
 
-    def test_temporal_local_masked_conv_normalizes_missing_neighbors(self):
-        block = TemporalLocalBlock(
-            hidden_dim=1, num_layers=1, kernel_size=3, dilations=[1], dropout=0.0
-        )
-        conv = block.layers[0]["depthwise"]
-        with torch.no_grad():
-            conv.weight.fill_(1.0)
-            if conv.bias is not None:
-                conv.bias.zero_()
-        x = torch.tensor([[[2.0], [4.0], [100.0]]])
-        valid_mask = torch.tensor([[1, 1, 0]])
+    def test_conv_video_input_projection_preserves_sequence_shape(self):
+        model = self._build_model(video_input_proj="conv", n_input_proj=1)
+        src_vid = torch.randn(2, 7, 4)
 
-        out = block._masked_depthwise_conv(x, valid_mask, conv, dilation=1, padding=1)
+        out = model.input_vid_proj(src_vid)
 
-        self.assertTrue(torch.allclose(out.squeeze(-1), torch.tensor([[9.0, 9.0, 0.0]])))
+        self.assertEqual(model.video_input_proj, "conv")
+        self.assertEqual(out.shape, (2, 7, 4))
+        self.assertIsInstance(model.input_vid_proj[0], Conv1DLayer)
+        self.assertIsInstance(model.input_vid_proj[0].conv, torch.nn.Conv1d)
+        self.assertEqual(model.input_vid_proj[0].conv.kernel_size, (3,))
+        self.assertEqual(model.input_vid_proj[0].conv.padding, (1,))
 
-    def test_temporal_local_padded_values_do_not_affect_valid_outputs(self):
-        torch.manual_seed(0)
-        block = TemporalLocalBlock(
-            hidden_dim=4, num_layers=2, kernel_size=3, dilations=[1, 2], dropout=0.0
-        )
-        x = torch.randn(2, 6, 4)
-        valid_mask = torch.tensor([
-            [1, 1, 1, 1, 0, 0],
-            [1, 1, 1, 0, 0, 0],
-        ])
-        x_with_large_padding = x.clone()
-        x_with_large_padding[~valid_mask.bool()] = 1e6
+    def test_conv_video_input_projection_respects_n_input_proj(self):
+        src_vid = torch.randn(2, 7, 4)
+        for n_input_proj in (1, 2):
+            with self.subTest(n_input_proj=n_input_proj):
+                model = self._build_model(video_input_proj="conv", n_input_proj=n_input_proj)
+                out = model.input_vid_proj(src_vid)
 
-        out = block(x, valid_mask)
-        out_with_large_padding = block(x_with_large_padding, valid_mask)
+                self.assertEqual(len(model.input_vid_proj), n_input_proj)
+                self.assertEqual(out.shape, (2, 7, 4))
 
-        self.assertTrue(torch.allclose(
-            out[valid_mask.bool()], out_with_large_padding[valid_mask.bool()], atol=1e-6
-        ))
-
-    def test_temporal_local_block_has_small_residual_scales(self):
-        block = TemporalLocalBlock(
-            hidden_dim=4, num_layers=2, kernel_size=3, dilations=[1, 2], dropout=0.0
-        )
-
-        self.assertEqual(len(block.layer_scales), 2)
-        for layer_scale in block.layer_scales:
-            self.assertEqual(tuple(layer_scale.shape), (4,))
-            self.assertTrue(torch.allclose(layer_scale, torch.full((4,), 1e-3)))
-
-    def test_temporal_local_block_loads_legacy_pointwise_state_strictly(self):
-        block = TemporalLocalBlock(
-            hidden_dim=4, num_layers=2, kernel_size=3, dilations=[1, 2], dropout=0.0
-        )
-        legacy_state = {
-            key: value.clone()
-            for key, value in block.state_dict().items()
-            if "pointwise_expand" not in key
-            and "pointwise_project" not in key
-            and not key.startswith("layer_scales.")
-        }
-        for layer_idx in range(2):
-            legacy_state[f"layers.{layer_idx}.pointwise.weight"] = torch.randn(4, 4, 1)
-            legacy_state[f"layers.{layer_idx}.pointwise.bias"] = torch.randn(4)
-
-        new_block = TemporalLocalBlock(
-            hidden_dim=4, num_layers=2, kernel_size=3, dilations=[1, 2], dropout=0.0
-        )
-        result = new_block.load_state_dict(legacy_state, strict=True)
-
-        self.assertEqual(result.missing_keys, [])
-        self.assertEqual(result.unexpected_keys, [])
-
-    def test_invalid_temporal_local_settings_raise(self):
-        invalid_configs = [
-            (dict(num_layers=0), "temporal_local_layers"),
-            (dict(kernel_size=2), "temporal_local_kernel_size"),
-            (dict(dilations=""), "temporal_local_dilations"),
-            (dict(dilations="1,0"), "temporal_local_dilations"),
-            (dict(dropout=-0.1), "temporal_local_dropout"),
-        ]
-
-        for kwargs, pattern in invalid_configs:
-            with self.subTest(kwargs=kwargs):
-                with self.assertRaisesRegex(ValueError, pattern):
-                    TemporalLocalBlock(hidden_dim=4, **kwargs)
+    def test_invalid_video_input_projection_raises(self):
+        with self.assertRaisesRegex(ValueError, "video_input_proj"):
+            self._build_model(video_input_proj="unsupported")
 
 
-class TemporalPyramidMemoryTest(unittest.TestCase):
-    def _build_model(self, use_temporal_pyramid, temporal_pyramid_downsample="avg",
-                     hidden_dim=4, use_temporal_local=False,
-                     temporal_local_layers=2, temporal_local_dilations="1,2",
-                     temporal_pyramid_strides=(1, 2, 4)):
+class SingleLevelVideoMemoryTest(unittest.TestCase):
+    def _build_model(self, hidden_dim=4):
         transformer = _CaptureTransformer(hidden_dim=hidden_dim)
         model = VMRDETR(
             transformer=transformer,
@@ -366,18 +270,11 @@ class TemporalPyramidMemoryTest(unittest.TestCase):
             contrastive_align_loss=True,
             max_v_l=75,
             n_input_proj=1,
-            use_temporal_pyramid=use_temporal_pyramid,
-            temporal_pyramid_downsample=temporal_pyramid_downsample,
-            temporal_pyramid_strides=temporal_pyramid_strides,
-            use_temporal_local=use_temporal_local,
-            temporal_local_layers=temporal_local_layers,
-            temporal_local_dilations=temporal_local_dilations,
-            temporal_local_dropout=0.0,
         )
         return model, transformer
 
-    def test_temporal_pyramid_disabled_keeps_single_grid_memory(self):
-        model, transformer = self._build_model(use_temporal_pyramid=False)
+    def test_model_uses_single_video_memory_level(self):
+        model, transformer = self._build_model()
         src_txt = torch.randn(2, 5, 4)
         src_txt_mask = torch.ones(2, 5)
         src_vid = torch.randn(2, 75, 4)
@@ -392,14 +289,12 @@ class TemporalPyramidMemoryTest(unittest.TestCase):
         self.assertEqual(call["pos_shape"], (2, 81, 4))
         self.assertEqual(outputs["saliency_scores"].shape, (2, 75))
         self.assertEqual(outputs["proj_vid_mem"].shape, (2, 75, 64))
+        self.assertFalse(hasattr(model, "temporal_local"))
+        self.assertFalse(hasattr(model, "video_level_embed"))
+        self.assertFalse(hasattr(model, "temporal_downsample"))
 
-    def test_temporal_local_enabled_preserves_model_shapes_and_masks_padding(self):
-        model, transformer = self._build_model(
-            use_temporal_pyramid=False,
-            use_temporal_local=True,
-            temporal_local_layers=3,
-            temporal_local_dilations="1,2,4",
-        )
+    def test_padded_video_mask_does_not_expand_memory(self):
+        model, transformer = self._build_model()
         src_txt = torch.randn(2, 5, 4)
         src_txt_mask = torch.ones(2, 5)
         src_vid = torch.randn(2, 75, 4)
@@ -412,162 +307,35 @@ class TemporalPyramidMemoryTest(unittest.TestCase):
         self.assertEqual(call["video_length"], 75)
         self.assertEqual(call["level1_length"], 75)
         self.assertEqual(call["src_shape"], (2, 81, 4))
-        self.assertEqual(outputs["saliency_scores"].shape, (2, 75))
-        self.assertTrue(torch.allclose(call["src"][1, 73:76], torch.zeros(3, 4), atol=1e-6))
-
-    def test_temporal_pyramid_avg_enabled_expands_transformer_memory_only(self):
-        model, transformer = self._build_model(
-            use_temporal_pyramid=True, temporal_pyramid_downsample="avg"
-        )
-        src_txt = torch.randn(2, 5, 4)
-        src_txt_mask = torch.ones(2, 5)
-        src_vid = torch.randn(2, 75, 4)
-        src_vid_mask = torch.ones(2, 75)
-        src_vid_mask[1, 72:] = 0
-
-        outputs = model(src_txt, src_txt_mask, src_vid, src_vid_mask)
-        call = transformer.calls[0]
-
-        self.assertEqual(call["video_length"], 132)
-        self.assertEqual(call["level1_length"], 75)
-        self.assertEqual(call["src_shape"], (2, 138, 4))
-        self.assertEqual(call["pos_shape"], (2, 138, 4))
+        self.assertEqual(call["pos_shape"], (2, 81, 4))
         self.assertEqual(outputs["saliency_scores"].shape, (2, 75))
         self.assertEqual(outputs["proj_vid_mem"].shape, (2, 75, 64))
         self.assertEqual(int(call["mask"][0].sum().item()), 0)
-        self.assertEqual(int(call["mask"][1].sum().item()), 6)
+        self.assertEqual(int(call["mask"][1].sum().item()), 3)
 
-    def test_temporal_pyramid_conv_enabled_expands_transformer_memory_only(self):
-        model, transformer = self._build_model(
-            use_temporal_pyramid=True, temporal_pyramid_downsample="conv"
+    def test_removed_temporal_constructor_kwargs_are_rejected(self):
+        base_kwargs = dict(
+            transformer=_DummyTransformer(hidden_dim=4),
+            position_embed=None,
+            txt_position_embed=None,
+            txt_dim=4,
+            vid_dim=4,
+            num_queries=4,
+            input_dropout=0.0,
+            max_v_l=75,
+            n_input_proj=1,
         )
-        src_txt = torch.randn(2, 5, 4)
-        src_txt_mask = torch.ones(2, 5)
-        src_vid = torch.randn(2, 75, 4)
-        src_vid_mask = torch.ones(2, 75)
-        src_vid_mask[1, 72:] = 0
+        removed_kwargs = [
+            {"use_temporal_pyramid": True},
+            {"temporal_pyramid_strides": (1, 2, 4)},
+            {"use_temporal_local": True},
+            {"temporal_local_layers": 2},
+        ]
 
-        outputs = model(src_txt, src_txt_mask, src_vid, src_vid_mask)
-        call = transformer.calls[0]
-
-        self.assertEqual(call["video_length"], 132)
-        self.assertEqual(call["level1_length"], 75)
-        self.assertEqual(call["src_shape"], (2, 138, 4))
-        self.assertEqual(call["pos_shape"], (2, 138, 4))
-        self.assertEqual(outputs["saliency_scores"].shape, (2, 75))
-        self.assertEqual(outputs["proj_vid_mem"].shape, (2, 75, 64))
-        self.assertEqual(int(call["mask"][0].sum().item()), 0)
-        self.assertEqual(int(call["mask"][1].sum().item()), 4)
-
-    def test_temporal_pyramid_custom_strides_expand_memory(self):
-        model, transformer = self._build_model(
-            use_temporal_pyramid=True,
-            temporal_pyramid_downsample="avg",
-            temporal_pyramid_strides=(1, 2, 4, 8),
-        )
-        src_txt = torch.randn(2, 5, 4)
-        src_txt_mask = torch.ones(2, 5)
-        src_vid = torch.randn(2, 75, 4)
-        src_vid_mask = torch.ones(2, 75)
-
-        outputs = model(src_txt, src_txt_mask, src_vid, src_vid_mask)
-        call = transformer.calls[0]
-
-        self.assertEqual(call["video_length"], 142)
-        self.assertEqual(call["level1_length"], 75)
-        self.assertEqual(call["src_shape"], (2, 148, 4))
-        self.assertEqual(outputs["saliency_scores"].shape, (2, 75))
-        self.assertEqual(outputs["proj_vid_mem"].shape, (2, 75, 64))
-
-    def test_temporal_pyramid_level_embed_zero_initialized(self):
-        model, _ = self._build_model(use_temporal_pyramid=True)
-
-        self.assertTrue(torch.equal(model.video_level_embed.weight, torch.zeros_like(model.video_level_embed.weight)))
-
-    def test_temporal_local_composes_with_temporal_pyramid(self):
-        model, transformer = self._build_model(
-            use_temporal_pyramid=True,
-            temporal_pyramid_downsample="conv",
-            use_temporal_local=True,
-        )
-        src_txt = torch.randn(2, 5, 4)
-        src_txt_mask = torch.ones(2, 5)
-        src_vid = torch.randn(2, 75, 4)
-        src_vid_mask = torch.ones(2, 75)
-        src_vid_mask[1, 72:] = 0
-
-        outputs = model(src_txt, src_txt_mask, src_vid, src_vid_mask)
-        call = transformer.calls[0]
-
-        self.assertEqual(call["video_length"], 132)
-        self.assertEqual(call["level1_length"], 75)
-        self.assertEqual(call["src_shape"], (2, 138, 4))
-        self.assertEqual(outputs["saliency_scores"].shape, (2, 75))
-
-    def test_temporal_local_with_pyramid_only_feeds_pooled_levels(self):
-        torch.manual_seed(0)
-        model, transformer = self._build_model(
-            use_temporal_pyramid=True,
-            temporal_pyramid_downsample="avg",
-            use_temporal_local=True,
-        )
-        model.temporal_local = _AddTemporalLocal(offset=10.0)
-        model.eval()
-        src_txt = torch.randn(1, 5, 4)
-        src_txt_mask = torch.ones(1, 5)
-        src_vid = torch.randn(1, 75, 4)
-        src_vid_mask = torch.ones(1, 75)
-
-        with torch.no_grad():
-            raw_vid = model.input_vid_proj(src_vid)
-            localized_vid = model.temporal_local(raw_vid, src_vid_mask)
-            expected_v2, _ = model._masked_temporal_pool(
-                localized_vid, src_vid_mask, kernel_size=2, stride=2
-            )
-            model(src_txt, src_txt_mask, src_vid, src_vid_mask)
-
-        call = transformer.calls[0]
-        self.assertTrue(torch.allclose(call["src"][0, 1:76], raw_vid[0], atol=1e-6))
-        self.assertTrue(torch.allclose(call["src"][0, 76:114], expected_v2[0], atol=1e-6))
-
-    def test_masked_temporal_pool_ignores_padded_tokens(self):
-        x = torch.tensor([[[1.0], [3.0], [100.0], [100.0], [100.0]]])
-        valid_mask = torch.tensor([[1, 1, 0, 0, 0]])
-
-        pooled2, mask2 = VMRDETR._masked_temporal_pool(x, valid_mask, kernel_size=2, stride=2)
-        pooled4, mask4 = VMRDETR._masked_temporal_pool(x, valid_mask, kernel_size=4, stride=4)
-
-        self.assertEqual(pooled2.shape, (1, 3, 1))
-        self.assertTrue(torch.allclose(pooled2.squeeze(-1), torch.tensor([[2.0, 0.0, 0.0]])))
-        self.assertTrue(torch.equal(mask2, torch.tensor([[True, False, False]])))
-        self.assertEqual(pooled4.shape, (1, 2, 1))
-        self.assertTrue(torch.allclose(pooled4.squeeze(-1), torch.tensor([[2.0, 0.0]])))
-        self.assertTrue(torch.equal(mask4, torch.tensor([[True, False]])))
-
-    def test_masked_temporal_conv_zeroes_padded_only_outputs(self):
-        model, _ = self._build_model(
-            use_temporal_pyramid=True, temporal_pyramid_downsample="conv", hidden_dim=1
-        )
-        x = torch.tensor([[[1.0], [3.0], [100.0], [100.0], [100.0]]])
-        valid_mask = torch.tensor([[1, 1, 0, 0, 0]])
-
-        pooled, mask = model._masked_temporal_conv(
-            x, valid_mask, level_idx=1, kernel_size=3, stride=2, padding=1
-        )
-
-        self.assertEqual(pooled.shape, (1, 3, 1))
-        self.assertTrue(torch.allclose(pooled.squeeze(-1), torch.tensor([[2.0, 3.0, 0.0]])))
-        self.assertTrue(torch.equal(mask, torch.tensor([[True, True, False]])))
-
-    def test_temporal_pyramid_strides_are_normalized(self):
-        self.assertEqual(_normalize_temporal_pyramid_strides("1,2,2,4,8"), (1, 2, 4, 8))
-        self.assertEqual(_normalize_temporal_pyramid_strides([1, 4, 2]), (1, 4, 2))
-
-        invalid_configs = ["", "2,4", "1,0", "1,a"]
-        for config in invalid_configs:
-            with self.subTest(config=config):
-                with self.assertRaisesRegex(ValueError, "temporal_pyramid_strides"):
-                    _normalize_temporal_pyramid_strides(config)
+        for kwargs in removed_kwargs:
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaises(TypeError):
+                    VMRDETR(**base_kwargs, **kwargs)
 
 
 class TaskAlignedMatcherTest(unittest.TestCase):

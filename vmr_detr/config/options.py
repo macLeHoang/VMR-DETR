@@ -142,26 +142,11 @@ class BaseOptions(object):
                             help="Query reference initialization strategy.")
         parser.add_argument("--query_anchor_widths", default="", type=str,
                             help="Comma-separated normalized widths for temporal anchor query initialization.")
-        parser.add_argument("--use_temporal_pyramid", action="store_true",
-                            help="Use pooled multi-scale temporal video tokens in transformer memory.")
-        parser.add_argument("--temporal_pyramid_downsample", default="avg", choices=["avg", "conv"],
-                            help="Downsample method for temporal pyramid video tokens.")
-        parser.add_argument("--temporal_pyramid_strides", default="1,2,4", type=str,
-                            help="Comma-separated temporal pyramid strides. Must start with 1.")
-        parser.add_argument("--use_temporal_local", action="store_true",
-                            help="Use residual dilated temporal convolution; with temporal pyramid, "
-                                 "only pooled levels use localized tokens.")
-        parser.add_argument("--temporal_local_layers", default=2, type=int,
-                            help="Number of residual temporal-local convolution layers.")
-        parser.add_argument("--temporal_local_kernel_size", default=3, type=int,
-                            help="Odd kernel size for temporal-local convolution layers.")
-        parser.add_argument("--temporal_local_dilations", default="1,2", type=str,
-                            help="Comma-separated positive dilations for temporal-local convolution layers.")
-        parser.add_argument("--temporal_local_dropout", default=0.1, type=float,
-                            help="Dropout for temporal-local residual convolution layers.")
         parser.add_argument('--pre_norm', action='store_true')
         # other model configs
         parser.add_argument("--n_input_proj", type=int, default=2, help="#layers to encoder input")
+        parser.add_argument("--video_input_proj", type=str, default="linear", choices=["linear", "conv"],
+                            help="Projection type for video input features.")
         parser.add_argument("--contrastive_hdim", type=int, default=64, help="dim for contrastive embeddings")
         parser.add_argument("--temperature", type=float, default=0.07, help="temperature nce contrastive_align_loss")
         # Loss
@@ -296,8 +281,6 @@ class BaseOptions(object):
             if a_feat_dir is not None:
                 opt.a_feat_dir = a_feat_dir
             saved_options = load_json(os.path.join(opt.model_dir, self.saved_option_filename))
-            if "use_temporal_level_router" in saved_options:
-                raise ValueError("Saved options contain removed option --use_temporal_level_router.")
             for arg in saved_options:  # use saved options to overwrite all BaseOptions args.
                 if arg not in ["results_root", "num_workers", "nms_thd", "debug",  # "max_before_nms", "max_after_nms"
                                "max_pred_l", "min_pred_l",
@@ -307,9 +290,6 @@ class BaseOptions(object):
             if opt.eval_results_dir is not None:
                 opt.results_dir = opt.eval_results_dir
             self._normalize_query_anchor_widths(opt)
-            self._normalize_temporal_pyramid_strides(opt)
-            self._normalize_temporal_local_dilations(opt)
-            self._validate_temporal_local_options(opt)
             if opt.dfl_num_bins < 2:
                 raise ValueError("--dfl_num_bins must be >= 2.")
             if opt.dfl_ref_prior_sigma <= 0:
@@ -319,9 +299,6 @@ class BaseOptions(object):
             self._validate_tal_options(opt)
         else:
             self._normalize_query_anchor_widths(opt)
-            self._normalize_temporal_pyramid_strides(opt)
-            self._normalize_temporal_local_dilations(opt)
-            self._validate_temporal_local_options(opt)
             if opt.dfl_num_bins < 2:
                 raise ValueError("--dfl_num_bins must be >= 2.")
             if opt.dfl_ref_prior_sigma <= 0:
@@ -381,75 +358,6 @@ class BaseOptions(object):
             opt.query_anchor_widths = values if values else None
             return
         opt.query_anchor_widths = [float(value) for value in raw_widths] if raw_widths else None
-
-    @staticmethod
-    def _normalize_temporal_local_dilations(opt):
-        raw_dilations = getattr(opt, "temporal_local_dilations", "1,2")
-        if raw_dilations is None:
-            opt.temporal_local_dilations = []
-            return
-        try:
-            if isinstance(raw_dilations, str):
-                values = [value.strip() for value in raw_dilations.split(",")]
-                opt.temporal_local_dilations = [int(value) for value in values if value]
-                return
-            if isinstance(raw_dilations, int):
-                opt.temporal_local_dilations = [raw_dilations]
-                return
-            opt.temporal_local_dilations = [int(value) for value in raw_dilations]
-        except (TypeError, ValueError):
-            raise ValueError("--temporal_local_dilations must be comma-separated positive integers.") from None
-
-    @staticmethod
-    def _normalize_temporal_pyramid_strides(opt):
-        raw_strides = getattr(opt, "temporal_pyramid_strides", "1,2,4")
-        if raw_strides is None:
-            raw_strides = "1,2,4"
-        try:
-            if isinstance(raw_strides, str):
-                values = [value.strip() for value in raw_strides.split(",")]
-                values = [int(value) for value in values if value]
-            elif isinstance(raw_strides, int):
-                values = [raw_strides]
-            else:
-                values = [int(value) for value in raw_strides]
-        except (TypeError, ValueError):
-            raise ValueError("--temporal_pyramid_strides must be comma-separated positive integers.") from None
-        if not values:
-            raise ValueError("--temporal_pyramid_strides must contain at least one stride.")
-        if any(value <= 0 for value in values):
-            raise ValueError("--temporal_pyramid_strides must be positive integers.")
-
-        deduped = []
-        seen = set()
-        for value in values:
-            if value not in seen:
-                deduped.append(value)
-                seen.add(value)
-        if deduped[0] != 1:
-            raise ValueError("--temporal_pyramid_strides must start with 1.")
-        opt.temporal_pyramid_strides = deduped
-
-    @staticmethod
-    def _validate_temporal_local_options(opt):
-        if not hasattr(opt, "use_temporal_local"):
-            opt.use_temporal_local = False
-        if not hasattr(opt, "temporal_local_layers"):
-            opt.temporal_local_layers = 2
-        if not hasattr(opt, "temporal_local_kernel_size"):
-            opt.temporal_local_kernel_size = 3
-        if not hasattr(opt, "temporal_local_dropout"):
-            opt.temporal_local_dropout = 0.1
-        if opt.temporal_local_layers < 1:
-            raise ValueError("--temporal_local_layers must be >= 1.")
-        if opt.temporal_local_kernel_size < 1 or opt.temporal_local_kernel_size % 2 == 0:
-            raise ValueError("--temporal_local_kernel_size must be a positive odd integer.")
-        if not opt.temporal_local_dilations:
-            raise ValueError("--temporal_local_dilations must contain at least one dilation.")
-        if any(value <= 0 for value in opt.temporal_local_dilations):
-            raise ValueError("--temporal_local_dilations must be positive integers.")
-        if opt.temporal_local_dropout < 0 or opt.temporal_local_dropout > 1:
-            raise ValueError("--temporal_local_dropout must be in [0, 1].")
 
     @staticmethod
     def _validate_label_loss_options(opt):
