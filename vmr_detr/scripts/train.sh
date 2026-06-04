@@ -47,7 +47,8 @@ fi
 
 # Model
 input_dropout=0.5
-video_input_proj=conv
+video_input_proj=linear
+temporal_comp_flag=--use_temporal_comp
 enc_layers=3
 dec_layers=3
 clip_length=1
@@ -65,11 +66,11 @@ set_cost_class=4
 
 # Losses: localization and labels
 span_loss_coef=1.0
-span_xx_loss_coef=3.0
-fgl_loss_coef=1.0
-giou_loss_coef=1.5
+span_xx_loss_coef=4.0
+fgl_loss_coef=1.25
+giou_loss_coef=1.0
 width_loss_type=log
-width_loss_coef=0.25
+width_loss_coef=0.5
 label_loss_coef=4.0
 
 # Losses: label supervision
@@ -83,9 +84,9 @@ go_lsd_start_epoch=10
 # Losses: contrastive query/text alignment
 contrastive_align_loss_flag=--contrastive_align_loss
 contrastive_align_loss_coef=0.3
-contrastive_start_epoch=0
+contrastive_start_epoch=10
 contrastive_decay_epoch=30
-contrastive_decay_coef=0.3
+contrastive_decay_coef=0.1
 
 # Losses: saliency
 lw_saliency=1.0
@@ -95,7 +96,7 @@ saliency_margin=0.2
 bsz=32
 eval_bsz=32
 n_epoch=100
-lr=1e-4
+lr=1.5e-4
 lr_drop=100
 lr_scheduler=step
 lrf=0.01
@@ -133,6 +134,7 @@ PYTHONPATH="${PYTHONPATH}:." python vmr_detr/cli/train.py \
   --exp_id "${exp_id}" \
   --input_dropout "${input_dropout}" \
   --video_input_proj "${video_input_proj}" \
+  ${temporal_comp_flag} \
   --query_init temporal_anchors \
   "${query_anchor_widths_args[@]}" \
   --bsz "${bsz}" \

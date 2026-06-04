@@ -150,6 +150,7 @@ class VMRDETR(nn.Module):
                  contrastive_align_loss=False, contrastive_hdim=64,
                  max_v_l=75, span_loss_type="l1", use_txt_pos=False, n_input_proj=2, aud_dim=0,
                  video_input_proj="linear",
+                 use_temporal_comp=False,
                  dfl_num_bins=16, dfl_ref_prior_sigma=2.0,
                  fdr_num_bins=32, fdr_reg_scale=1.5, fdr_min_ref_width=None,
                  query_init="random", query_anchor_widths=None):
@@ -188,6 +189,7 @@ class VMRDETR(nn.Module):
         if video_input_proj not in ("linear", "conv"):
             raise ValueError("video_input_proj must be one of ['linear', 'conv'].")
         self.video_input_proj = video_input_proj
+        self.use_temporal_comp = use_temporal_comp
         if dfl_num_bins < 2:
             raise ValueError("dfl_num_bins must be >= 2.")
         if dfl_ref_prior_sigma <= 0:
@@ -232,6 +234,7 @@ class VMRDETR(nn.Module):
         
         relu_args = [True] * 3
         relu_args[n_input_proj-1] = False
+        relu_args[n_input_proj-2] = False
         self.input_txt_proj = nn.Sequential(*[
             LinearLayer(txt_dim, hidden_dim, layer_norm=True, dropout=input_dropout, relu=relu_args[0]),
             LinearLayer(hidden_dim, hidden_dim, layer_norm=True, dropout=input_dropout, relu=relu_args[1]),
@@ -243,6 +246,9 @@ class VMRDETR(nn.Module):
             vid_proj_layer(hidden_dim, hidden_dim, layer_norm=True, dropout=input_dropout, relu=relu_args[1]),
             vid_proj_layer(hidden_dim, hidden_dim, layer_norm=True, dropout=input_dropout, relu=relu_args[2])
         ][:n_input_proj])
+        if use_temporal_comp:
+            self.temporal_comp = TemporalCompensationBlock(hidden_dim, dropout=input_dropout)
+            self.temporal_comp_scale = nn.Parameter(torch.full((1,), 0.01))
 
         self.contrastive_align_loss = contrastive_align_loss
         if contrastive_align_loss:
@@ -305,7 +311,13 @@ class VMRDETR(nn.Module):
 
         self._validate_text_mask(src_txt, src_txt_mask)
         src_txt = self.input_txt_proj(src_txt)
-        src_vid = self.input_vid_proj(src_vid)
+        src_vid_base = self.input_vid_proj(src_vid)
+        if self.use_temporal_comp:
+            src_vid_temp = self.temporal_comp(src_vid_base, src_vid_mask)
+            src_vid = src_vid_base + self.temporal_comp_scale * (src_vid_temp - src_vid_base)
+            src_vid = src_vid * src_vid_mask.bool().unsqueeze(-1).to(dtype=src_vid.dtype)
+        else:
+            src_vid = src_vid_base
 
         hs, reference, vid_mem, memory_global, txt_mem = self._run_text_video_transformer(
             src_vid, src_vid_mask, src_txt, src_txt_mask
@@ -1263,6 +1275,76 @@ class Conv1DLayer(nn.Module):
         return x  # (N, L, D)
 
 
+class TemporalCompensationBlock(nn.Module):
+    """Mask-safe temporal refinement for video features shaped as (N, L, D)."""
+
+    def __init__(self, dim, dropout=0.1):
+        super().__init__()
+        self.norm = nn.BatchNorm1d(dim)
+        self.dwconv1 = nn.Conv1d(
+            dim,
+            dim,
+            kernel_size=3,
+            padding=1,
+            groups=dim,
+            bias=True,
+        )
+        self.bn1 = nn.BatchNorm1d(dim)
+
+        self.dwconv2 = nn.Conv1d(
+            dim,
+            dim,
+            kernel_size=3,
+            padding=2,
+            dilation=2,
+            groups=dim,
+            bias=True,
+        )
+        self.bn2 = nn.BatchNorm1d(dim)
+
+        self.pointwise = nn.Sequential(
+            nn.Conv1d(dim, dim * 4, kernel_size=1),
+            nn.BatchNorm1d(dim * 4),
+            nn.ReLU(),
+            nn.Conv1d(dim * 4, dim, kernel_size=1),
+        )
+        self.gate = nn.Sequential(
+            nn.Linear(dim * 3, dim),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x, mask):
+        """Apply gated temporal compensation with mask semantics 1=valid, 0=pad."""
+        valid = mask.bool().unsqueeze(-1)
+        valid_f = valid.to(dtype=x.dtype)
+
+        z = x * valid_f
+
+        prev_z = torch.cat([z[:, :1], z[:, :-1]], dim=1)
+        next_z = torch.cat([z[:, 1:], z[:, -1:]], dim=1)
+
+        prev_valid = torch.cat([valid[:, :1], valid[:, :-1]], dim=1)
+        next_valid = torch.cat([valid[:, 1:], valid[:, -1:]], dim=1)
+        prev_valid_f = prev_valid.to(dtype=x.dtype)
+        next_valid_f = next_valid.to(dtype=x.dtype)
+
+        delta_prev = (z - prev_z) * valid_f * prev_valid_f
+        delta_next = (next_z - z) * valid_f * next_valid_f
+
+        motion_feat = torch.cat([z, delta_prev, delta_next], dim=-1)
+        gate = self.gate(motion_feat) * valid_f
+
+        y = z.transpose(1, 2)
+        y = F.relu(self.bn1(self.dwconv1(y))) + F.relu(self.bn2(self.dwconv2(y)))
+        y = self.pointwise(y)
+        y = y.transpose(1, 2)
+        y = y * valid_f
+
+        comp = self.norm((gate * y).transpose(1, 2)).transpose(1, 2)
+        out = comp + x
+        return out * valid_f
+
+
 def build_model(args):
     # the `num_classes` naming here is somewhat misleading.
     # it indeed corresponds to `max_obj_id + 1`, where max_obj_id
@@ -1284,6 +1366,7 @@ def build_model(args):
     query_init = getattr(args, "query_init", "random")
     query_anchor_widths = getattr(args, "query_anchor_widths", None)
     video_input_proj = getattr(args, "video_input_proj", "linear")
+    use_temporal_comp = getattr(args, "use_temporal_comp", False)
     if fdr_min_ref_width is not None and fdr_min_ref_width <= 0:
         fdr_min_ref_width = 1.0 / float(args.max_v_l)
 
@@ -1309,6 +1392,7 @@ def build_model(args):
             use_txt_pos=args.use_txt_pos,
             n_input_proj=args.n_input_proj,
             video_input_proj=video_input_proj,
+            use_temporal_comp=use_temporal_comp,
             query_init=query_init,
             query_anchor_widths=query_anchor_widths,
         )
@@ -1335,6 +1419,7 @@ def build_model(args):
             use_txt_pos=args.use_txt_pos,
             n_input_proj=args.n_input_proj,
             video_input_proj=video_input_proj,
+            use_temporal_comp=use_temporal_comp,
             query_init=query_init,
             query_anchor_widths=query_anchor_widths,
         )

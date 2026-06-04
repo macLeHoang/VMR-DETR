@@ -147,6 +147,8 @@ class BaseOptions(object):
         parser.add_argument("--n_input_proj", type=int, default=2, help="#layers to encoder input")
         parser.add_argument("--video_input_proj", type=str, default="linear", choices=["linear", "conv"],
                             help="Projection type for video input features.")
+        parser.add_argument("--use_temporal_comp", action="store_true",
+                            help="Apply temporal compensation to projected video features before the transformer.")
         parser.add_argument("--contrastive_hdim", type=int, default=64, help="dim for contrastive embeddings")
         parser.add_argument("--temperature", type=float, default=0.07, help="temperature nce contrastive_align_loss")
         # Loss

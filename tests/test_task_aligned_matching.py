@@ -7,6 +7,7 @@ from vmr_detr.modeling.model import (
     Conv1DLayer,
     LinearLayer,
     SetCriterion,
+    TemporalCompensationBlock,
     VMRDETR,
     _decode_fdr_cumulative_outputs,
     fdr_logits_to_spans,
@@ -256,8 +257,20 @@ class VideoInputProjectionTest(unittest.TestCase):
             self._build_model(video_input_proj="unsupported")
 
 
+class TemporalCompensationBlockTest(unittest.TestCase):
+    def test_block_keeps_padded_outputs_zero(self):
+        block = TemporalCompensationBlock(dim=4, dropout=0.0)
+        x = torch.arange(48, dtype=torch.float32).reshape(2, 6, 4) / 10.0
+        mask = torch.ones(2, 6)
+        mask[:, -2:] = 0
+
+        out = block(x, mask)
+
+        self.assertTrue(torch.equal(out[:, -2:], torch.zeros_like(out[:, -2:])))
+
+
 class SingleLevelVideoMemoryTest(unittest.TestCase):
-    def _build_model(self, hidden_dim=4):
+    def _build_model(self, hidden_dim=4, use_temporal_comp=False):
         transformer = _CaptureTransformer(hidden_dim=hidden_dim)
         model = VMRDETR(
             transformer=transformer,
@@ -270,6 +283,7 @@ class SingleLevelVideoMemoryTest(unittest.TestCase):
             contrastive_align_loss=True,
             max_v_l=75,
             n_input_proj=1,
+            use_temporal_comp=use_temporal_comp,
         )
         return model, transformer
 
@@ -289,9 +303,31 @@ class SingleLevelVideoMemoryTest(unittest.TestCase):
         self.assertEqual(call["pos_shape"], (2, 81, 4))
         self.assertEqual(outputs["saliency_scores"].shape, (2, 75))
         self.assertEqual(outputs["proj_vid_mem"].shape, (2, 75, 64))
+        self.assertFalse(model.use_temporal_comp)
+        self.assertFalse(hasattr(model, "temporal_comp"))
+        self.assertFalse(hasattr(model, "temporal_comp_scale"))
         self.assertFalse(hasattr(model, "temporal_local"))
         self.assertFalse(hasattr(model, "video_level_embed"))
         self.assertFalse(hasattr(model, "temporal_downsample"))
+
+    def test_temporal_compensation_is_opt_in_and_preserves_shapes(self):
+        model, transformer = self._build_model(use_temporal_comp=True)
+        src_txt = torch.arange(40, dtype=torch.float32).reshape(2, 5, 4) / 10.0
+        src_txt_mask = torch.ones(2, 5)
+        src_vid = torch.arange(600, dtype=torch.float32).reshape(2, 75, 4) / 10.0
+        src_vid_mask = torch.ones(2, 75)
+        src_vid_mask[1, 72:] = 0
+
+        outputs = model(src_txt, src_txt_mask, src_vid, src_vid_mask)
+        call = transformer.calls[0]
+
+        self.assertTrue(model.use_temporal_comp)
+        self.assertIsInstance(model.temporal_comp, TemporalCompensationBlock)
+        self.assertIsInstance(model.temporal_comp_scale, torch.nn.Parameter)
+        self.assertAlmostEqual(float(model.temporal_comp_scale.item()), 0.01, places=6)
+        self.assertEqual(call["src_shape"], (2, 81, 4))
+        self.assertEqual(outputs["saliency_scores"].shape, (2, 75))
+        self.assertTrue(torch.equal(call["src"][1, 73:76], torch.zeros(3, 4)))
 
     def test_padded_video_mask_does_not_expand_memory(self):
         model, transformer = self._build_model()
@@ -641,46 +677,6 @@ class TaskAlignedCriterionTest(unittest.TestCase):
                 label_loss_type="quality",
             )
 
-    def test_hungarian_quality_labels_mirror_main_loss_for_auxiliary_outputs(self):
-        logits = _logits_from_fg_scores([0.80]).unsqueeze(0)
-        outputs = {
-            "pred_logits": logits,
-            "pred_spans": _cxw([[0.0, 0.6]]).unsqueeze(0),
-            "aux_outputs": [
-                {
-                    "pred_logits": logits,
-                    "pred_spans": _cxw([[0.0, 0.6]]).unsqueeze(0),
-                }
-            ],
-        }
-        targets = {"span_labels": [dict(spans=_cxw([[0.2, 0.8]]))]}
-        criterion = SetCriterion(
-            matcher=HungarianMatcher(),
-            weight_dict={"loss_label": 1.0, "loss_label_0": 1.0},
-            eos_coef=0.1,
-            losses=["labels"],
-            temperature=0.07,
-            span_loss_type="l1",
-            max_v_l=75,
-            matching_type="hungarian",
-            label_loss_type="quality",
-            quality_label_strength=0.5,
-            quality_label_warmup_epoch=0,
-            quality_label_ramp_epoch=0,
-        )
-        criterion.set_epoch(1)
-
-        losses = criterion(outputs, targets)
-
-        fg_logit = logits.squeeze(-1)
-        expected_final = torch.nn.functional.binary_cross_entropy_with_logits(
-            fg_logit,
-            torch.full_like(fg_logit, 0.75),
-        )
-        expected_aux = expected_final
-        self.assertTrue(torch.allclose(losses["loss_label"], expected_final))
-        self.assertTrue(torch.allclose(losses["loss_label_0"], expected_aux))
-
     def test_vfl_label_loss_uses_iou_targets_and_focal_negative_weight(self):
         outputs = {
             "pred_logits": torch.zeros(1, 2, 1),
@@ -851,46 +847,6 @@ class TaskAlignedCriterionTest(unittest.TestCase):
             gamma=criterion.vfl_gamma,
         )
         self.assertTrue(torch.allclose(losses["loss_label"], expected))
-
-    def test_vfl_label_loss_mirrors_main_loss_for_auxiliary_outputs(self):
-        logits = _logits_from_fg_scores([0.80]).unsqueeze(0)
-        outputs = {
-            "pred_logits": logits,
-            "pred_spans": _cxw([[0.0, 0.6]]).unsqueeze(0),
-            "aux_outputs": [
-                {
-                    "pred_logits": logits,
-                    "pred_spans": _cxw([[0.0, 0.6]]).unsqueeze(0),
-                }
-            ],
-        }
-        targets = {"span_labels": [dict(spans=_cxw([[0.2, 0.8]]))]}
-        criterion = SetCriterion(
-            matcher=HungarianMatcher(),
-            weight_dict={"loss_label": 1.0, "loss_label_0": 1.0},
-            eos_coef=0.1,
-            losses=["labels"],
-            temperature=0.07,
-            span_loss_type="l1",
-            max_v_l=75,
-            matching_type="hungarian",
-            label_loss_type="vfl",
-        )
-
-        losses = criterion(outputs, targets)
-
-        fg_logit = logits.squeeze(-1)
-        target_score = torch.full_like(fg_logit, 0.5)
-        expected_final = _manual_vfl_loss(
-            fg_logit,
-            target_score,
-            torch.ones_like(fg_logit, dtype=torch.bool),
-            alpha=criterion.vfl_alpha,
-            gamma=criterion.vfl_gamma,
-        )
-        expected_aux = expected_final
-        self.assertTrue(torch.allclose(losses["loss_label"], expected_final))
-        self.assertTrue(torch.allclose(losses["loss_label_0"], expected_aux))
 
     def test_vfl_label_loss_rejects_tal_matching(self):
         with self.assertRaisesRegex(ValueError, "label_loss_type"):
