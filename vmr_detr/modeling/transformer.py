@@ -104,7 +104,8 @@ class Transformer(nn.Module):
                 nn.init.xavier_uniform_(p)
 
     # for tvsum, add video_length in argument
-    def forward(self, src, mask, query_embed, pos_embed, video_length=None, level1_length=None):
+    def forward(self, src, mask, query_embed, pos_embed,
+                video_length=None, level1_length=None):
         """
         Args:
             src: (batch_size, L, d)
@@ -280,7 +281,6 @@ class TransformerDecoder(nn.Module):
                 # print(query_sine_embed.shape) # 10 32 256
 
                 query_sine_embed *= (reft_cond[..., 0] / obj_center[..., 1]).unsqueeze(-1)
-
 
             output = layer(output, memory, tgt_mask=tgt_mask,
                            memory_mask=memory_mask,

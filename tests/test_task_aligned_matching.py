@@ -8,6 +8,7 @@ from vmr_detr.modeling.model import (
     TemporalLocalBlock,
     VMRDETR,
     _decode_fdr_cumulative_outputs,
+    _normalize_temporal_pyramid_strides,
     fdr_logits_to_spans,
     fdr_offset_support,
     init_temporal_queries,
@@ -48,7 +49,8 @@ class _CaptureTransformer(torch.nn.Module):
         self.nhead = 1
         self.calls = []
 
-    def forward(self, src, mask, query_embed, pos_embed, video_length=None, level1_length=None):
+    def forward(self, src, mask, query_embed, pos_embed,
+                video_length=None, level1_length=None):
         bsz, total_length, hidden_dim = src.shape
         video_length = int(video_length)
         level1_length = int(level1_length)
@@ -350,7 +352,8 @@ class TemporalLocalBlockTest(unittest.TestCase):
 class TemporalPyramidMemoryTest(unittest.TestCase):
     def _build_model(self, use_temporal_pyramid, temporal_pyramid_downsample="avg",
                      hidden_dim=4, use_temporal_local=False,
-                     temporal_local_layers=2, temporal_local_dilations="1,2"):
+                     temporal_local_layers=2, temporal_local_dilations="1,2",
+                     temporal_pyramid_strides=(1, 2, 4)):
         transformer = _CaptureTransformer(hidden_dim=hidden_dim)
         model = VMRDETR(
             transformer=transformer,
@@ -365,6 +368,7 @@ class TemporalPyramidMemoryTest(unittest.TestCase):
             n_input_proj=1,
             use_temporal_pyramid=use_temporal_pyramid,
             temporal_pyramid_downsample=temporal_pyramid_downsample,
+            temporal_pyramid_strides=temporal_pyramid_strides,
             use_temporal_local=use_temporal_local,
             temporal_local_layers=temporal_local_layers,
             temporal_local_dilations=temporal_local_dilations,
@@ -455,6 +459,31 @@ class TemporalPyramidMemoryTest(unittest.TestCase):
         self.assertEqual(int(call["mask"][0].sum().item()), 0)
         self.assertEqual(int(call["mask"][1].sum().item()), 4)
 
+    def test_temporal_pyramid_custom_strides_expand_memory(self):
+        model, transformer = self._build_model(
+            use_temporal_pyramid=True,
+            temporal_pyramid_downsample="avg",
+            temporal_pyramid_strides=(1, 2, 4, 8),
+        )
+        src_txt = torch.randn(2, 5, 4)
+        src_txt_mask = torch.ones(2, 5)
+        src_vid = torch.randn(2, 75, 4)
+        src_vid_mask = torch.ones(2, 75)
+
+        outputs = model(src_txt, src_txt_mask, src_vid, src_vid_mask)
+        call = transformer.calls[0]
+
+        self.assertEqual(call["video_length"], 142)
+        self.assertEqual(call["level1_length"], 75)
+        self.assertEqual(call["src_shape"], (2, 148, 4))
+        self.assertEqual(outputs["saliency_scores"].shape, (2, 75))
+        self.assertEqual(outputs["proj_vid_mem"].shape, (2, 75, 64))
+
+    def test_temporal_pyramid_level_embed_zero_initialized(self):
+        model, _ = self._build_model(use_temporal_pyramid=True)
+
+        self.assertTrue(torch.equal(model.video_level_embed.weight, torch.zeros_like(model.video_level_embed.weight)))
+
     def test_temporal_local_composes_with_temporal_pyramid(self):
         model, transformer = self._build_model(
             use_temporal_pyramid=True,
@@ -527,8 +556,18 @@ class TemporalPyramidMemoryTest(unittest.TestCase):
         )
 
         self.assertEqual(pooled.shape, (1, 3, 1))
-        self.assertTrue(torch.allclose(pooled.squeeze(-1), torch.tensor([[4.0 / 3.0, 1.0, 0.0]])))
+        self.assertTrue(torch.allclose(pooled.squeeze(-1), torch.tensor([[2.0, 3.0, 0.0]])))
         self.assertTrue(torch.equal(mask, torch.tensor([[True, True, False]])))
+
+    def test_temporal_pyramid_strides_are_normalized(self):
+        self.assertEqual(_normalize_temporal_pyramid_strides("1,2,2,4,8"), (1, 2, 4, 8))
+        self.assertEqual(_normalize_temporal_pyramid_strides([1, 4, 2]), (1, 4, 2))
+
+        invalid_configs = ["", "2,4", "1,0", "1,a"]
+        for config in invalid_configs:
+            with self.subTest(config=config):
+                with self.assertRaisesRegex(ValueError, "temporal_pyramid_strides"):
+                    _normalize_temporal_pyramid_strides(config)
 
 
 class TaskAlignedMatcherTest(unittest.TestCase):

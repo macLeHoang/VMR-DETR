@@ -28,6 +28,7 @@ def build_inference_model(ckpt_path, **kwargs):
         n_input_proj=args.n_input_proj,
         use_temporal_pyramid=getattr(args, "use_temporal_pyramid", False),
         temporal_pyramid_downsample=getattr(args, "temporal_pyramid_downsample", "avg"),
+        temporal_pyramid_strides=getattr(args, "temporal_pyramid_strides", (1, 2, 4)),
     )
 
     model.load_state_dict(ckpt["model"])

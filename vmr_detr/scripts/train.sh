@@ -46,7 +46,7 @@ if [[ ${t_feat_types} == *"blip"* ]]; then
 fi
 
 # Model
-input_dropout=0.25
+input_dropout=0.5
 enc_layers=3
 dec_layers=3
 clip_length=1
@@ -55,47 +55,45 @@ fdr_num_bins=32
 fdr_reg_scale=1.5
 fdr_min_ref_width=0.05
 query_anchor_widths=0.08,0.22,0.48
-temporal_pyramid_flag=
-temporal_pyramid_downsample=avg
-temporal_local_flag=--use_temporal_local
-temporal_local_layers=2
-temporal_local_kernel_size=3
-temporal_local_dilations=1,2
-temporal_local_dropout=0.1
+temporal_pyramid_flag=--use_temporal_pyramid
+temporal_pyramid_downsample=conv
+temporal_pyramid_strides=1,2,4
+temporal_local_flag=
+#--use_temporal_local
+temporal_local_layers=1
+temporal_local_kernel_size=1
+temporal_local_dilations=1
+temporal_local_dropout=0.0
 matching_type=hungarian
 aux_matching_type=hungarian
 aux_one_to_many_k=2
-set_cost_span=10
+set_cost_span=8
 set_cost_giou=1
-set_cost_class=4
+set_cost_class=6
 
 # Losses: localization and labels
 span_loss_coef=1.0
-span_xx_loss_coef=1.0
-fgl_loss_coef=2.0
-giou_loss_coef=1.0
+span_xx_loss_coef=3.0
+fgl_loss_coef=1.0
+giou_loss_coef=1.5
 width_loss_type=log
-width_loss_coef=0.5
+width_loss_coef=0.25
 label_loss_coef=4.0
 
 # Losses: label supervision
 label_loss_type=vfl
-quality_label_strength=0.75
-quality_label_iou_gamma=2.0
-quality_label_warmup_epoch=0
-quality_label_ramp_epoch=0
 
 # Losses: GO-LSD self-distillation, disabled by default here
 go_lsd_loss_coef=0.0
-go_lsd_temperature=2.0
-go_lsd_start_epoch=0
+go_lsd_temperature=3.0
+go_lsd_start_epoch=10
 
 # Losses: contrastive query/text alignment
 contrastive_align_loss_flag=--contrastive_align_loss
 contrastive_align_loss_coef=0.3
-contrastive_start_epoch=10
+contrastive_start_epoch=0
 contrastive_decay_epoch=30
-contrastive_decay_coef=0.2
+contrastive_decay_coef=0.1
 
 # Losses: saliency
 lw_saliency=1.0
@@ -113,7 +111,7 @@ num_workers=2
 eval_every_epoch_after=40
 ema_decay=0.999
 ema_start_epoch=1
-ema_start_decay=0.999
+ema_start_decay=0.995
 ema_warmup_updates=2000
 ema_update_every=1
 ema_schedule=cosine
@@ -146,6 +144,7 @@ PYTHONPATH="${PYTHONPATH}:." python vmr_detr/cli/train.py \
   "${query_anchor_widths_args[@]}" \
   ${temporal_pyramid_flag} \
   --temporal_pyramid_downsample "${temporal_pyramid_downsample}" \
+  --temporal_pyramid_strides "${temporal_pyramid_strides}" \
   ${temporal_local_flag} \
   --temporal_local_layers "${temporal_local_layers}" \
   --temporal_local_kernel_size "${temporal_local_kernel_size}" \
@@ -175,10 +174,6 @@ PYTHONPATH="${PYTHONPATH}:." python vmr_detr/cli/train.py \
   --width_loss_coef "${width_loss_coef}" \
   --label_loss_coef "${label_loss_coef}" \
   --label_loss_type "${label_loss_type}" \
-  --quality_label_strength "${quality_label_strength}" \
-  --quality_label_iou_gamma "${quality_label_iou_gamma}" \
-  --quality_label_warmup_epoch "${quality_label_warmup_epoch}" \
-  --quality_label_ramp_epoch "${quality_label_ramp_epoch}" \
   --go_lsd_loss_coef "${go_lsd_loss_coef}" \
   --go_lsd_temperature "${go_lsd_temperature}" \
   --go_lsd_start_epoch "${go_lsd_start_epoch}" \

@@ -160,6 +160,35 @@ def _normalize_temporal_local_dilations(dilations):
     return values
 
 
+def _normalize_temporal_pyramid_strides(strides):
+    if strides is None:
+        strides = (1, 2, 4)
+    try:
+        if isinstance(strides, str):
+            values = [value.strip() for value in strides.split(",")]
+            values = [int(value) for value in values if value]
+        elif isinstance(strides, int):
+            values = [strides]
+        else:
+            values = [int(value) for value in strides]
+    except (TypeError, ValueError):
+        raise ValueError("temporal_pyramid_strides must be comma-separated positive integers.") from None
+    if not values:
+        raise ValueError("temporal_pyramid_strides must contain at least one stride.")
+    if any(value <= 0 for value in values):
+        raise ValueError("temporal_pyramid_strides must be positive integers.")
+
+    deduped = []
+    seen = set()
+    for value in values:
+        if value not in seen:
+            deduped.append(value)
+            seen.add(value)
+    if deduped[0] != 1:
+        raise ValueError("temporal_pyramid_strides must start with 1.")
+    return tuple(deduped)
+
+
 class TemporalLocalBlock(nn.Module):
     """Masked residual temporal convolution block for video tokens."""
 
@@ -307,6 +336,7 @@ class VMRDETR(nn.Module):
                  fdr_num_bins=32, fdr_reg_scale=1.5, fdr_min_ref_width=None,
                  query_init="random", query_anchor_widths=None,
                  use_temporal_pyramid=False, temporal_pyramid_downsample="avg",
+                 temporal_pyramid_strides=(1, 2, 4),
                  use_temporal_local=False, temporal_local_layers=2,
                  temporal_local_kernel_size=3, temporal_local_dilations=(1, 2),
                  temporal_local_dropout=0.1):
@@ -333,6 +363,7 @@ class VMRDETR(nn.Module):
             query_anchor_widths: optional normalized widths for temporal anchor query initialization.
             use_temporal_pyramid: if true, decoder attends to pooled temporal levels in addition to level 1.
             temporal_pyramid_downsample: temporal pyramid downsample method, one of [avg, conv].
+            temporal_pyramid_strides: temporal pyramid strides. Must start with 1.
             use_temporal_local: if true, apply residual local temporal convolution. With temporal pyramid,
                 only pooled levels are built from localized tokens; level 1 stays raw.
             # foreground_thd: float, intersection over prediction >= foreground_thd: labeled as foreground
@@ -351,6 +382,7 @@ class VMRDETR(nn.Module):
         if temporal_pyramid_downsample not in ("avg", "conv"):
             raise ValueError("temporal_pyramid_downsample must be one of ['avg', 'conv'].")
         self.temporal_pyramid_downsample = temporal_pyramid_downsample
+        self.temporal_pyramid_strides = _normalize_temporal_pyramid_strides(temporal_pyramid_strides)
         if dfl_num_bins < 2:
             raise ValueError("dfl_num_bins must be >= 2.")
         if dfl_ref_prior_sigma <= 0:
@@ -429,19 +461,38 @@ class VMRDETR(nn.Module):
             )
             if use_temporal_local else None
         )
-        self.video_level_embed = nn.Embedding(3, hidden_dim) if use_temporal_pyramid else None
+        self.video_level_embed = (
+            nn.Embedding(len(self.temporal_pyramid_strides), hidden_dim)
+            if use_temporal_pyramid else None
+        )
+        if self.video_level_embed is not None:
+            nn.init.zeros_(self.video_level_embed.weight)
         if use_temporal_pyramid and temporal_pyramid_downsample == "conv":
-            self.temporal_downsample = nn.ModuleList([
-                nn.Identity(),
-                self._make_temporal_downsample(hidden_dim, kernel_size=3, stride=2, padding=1),
-                self._make_temporal_downsample(hidden_dim, kernel_size=5, stride=4, padding=2),
-            ])
+            self.temporal_downsample = nn.ModuleList()
+            for stride in self.temporal_pyramid_strides:
+                if stride == 1:
+                    self.temporal_downsample.append(nn.Identity())
+                else:
+                    kernel_size, padding = self._temporal_downsample_spec(stride)
+                    self.temporal_downsample.append(
+                        self._make_temporal_downsample(
+                            hidden_dim, kernel_size=kernel_size, stride=stride, padding=padding
+                        )
+                    )
         else:
             self.temporal_downsample = None
 
     def _validate_text_mask(self, src_txt, src_txt_mask):
         if src_txt.shape[1] == 0 or not src_txt_mask.bool().any(dim=1).all():
             raise ValueError("Each sample must contain at least one valid text token.")
+
+    @staticmethod
+    def _temporal_downsample_spec(stride):
+        if stride == 2:
+            return 3, 1
+        if stride == 4:
+            return 5, 2
+        return 2 * stride - 1, stride - 1
 
     @staticmethod
     def _make_temporal_downsample(hidden_dim, kernel_size, stride, padding):
@@ -491,9 +542,16 @@ class VMRDETR(nn.Module):
 
     def _masked_temporal_conv(self, x, valid_mask, level_idx, kernel_size, stride, padding):
         valid_mask = valid_mask.bool()
-        x = x * valid_mask.to(dtype=x.dtype).unsqueeze(-1)
-        pooled_x = self.temporal_downsample[level_idx](x.transpose(1, 2)).transpose(1, 2)
-        pooled_mask = self._temporal_conv_mask(valid_mask, kernel_size, stride, padding)
+        valid = valid_mask.to(dtype=x.dtype).unsqueeze(1)
+        x_t = x.transpose(1, 2) * valid
+
+        depthwise, pointwise = self.temporal_downsample[level_idx]
+        pooled_x = depthwise(x_t)
+        count_kernel = torch.ones(1, 1, kernel_size, dtype=x.dtype, device=x.device)
+        valid_count = F.conv1d(valid, count_kernel, stride=stride, padding=padding)
+        pooled_mask = valid_count.squeeze(1) > 0
+        pooled_x = pooled_x * (float(kernel_size) / valid_count.clamp_min(1.0))
+        pooled_x = pointwise(pooled_x).transpose(1, 2)
         pooled_x = pooled_x * pooled_mask.to(dtype=x.dtype).unsqueeze(-1)
         return pooled_x, pooled_mask
 
@@ -515,23 +573,31 @@ class VMRDETR(nn.Module):
                 pos1 = self.position_embed(v1, m1)
             return v1, m1, pos1, v1.shape[1]
 
-        if self.temporal_pyramid_downsample == "conv":
-            v2, m2 = self._masked_temporal_conv(local_src, m1, level_idx=1, kernel_size=3, stride=2, padding=1)
-            v3, m3 = self._masked_temporal_conv(local_src, m1, level_idx=2, kernel_size=5, stride=4, padding=2)
-        else:
-            v2, m2 = self._masked_temporal_pool(local_src, m1, kernel_size=2, stride=2)
-            v3, m3 = self._masked_temporal_pool(local_src, m1, kernel_size=4, stride=4)
-        pos2 = self.position_embed(v2, m2)
-        pos3 = self.position_embed(v3, m3)
-
         level_embed = self.video_level_embed.weight
-        pos1 = pos1 + level_embed[0].view(1, 1, -1)
-        pos2 = pos2 + level_embed[1].view(1, 1, -1)
-        pos3 = pos3 + level_embed[2].view(1, 1, -1)
+        video_levels = [v1]
+        mask_levels = [m1]
+        pos_levels = [pos1 + level_embed[0].view(1, 1, -1)]
 
-        src_vid_pyr = torch.cat([v1, v2, v3], dim=1)
-        src_vid_pyr_mask = torch.cat([m1, m2, m3], dim=1)
-        pos_vid_pyr = torch.cat([pos1, pos2, pos3], dim=1)
+        for level_idx, stride in enumerate(self.temporal_pyramid_strides[1:], start=1):
+            if self.temporal_pyramid_downsample == "conv":
+                kernel_size, padding = self._temporal_downsample_spec(stride)
+                level_src, level_mask = self._masked_temporal_conv(
+                    local_src, m1, level_idx=level_idx,
+                    kernel_size=kernel_size, stride=stride, padding=padding
+                )
+            else:
+                level_src, level_mask = self._masked_temporal_pool(
+                    local_src, m1, kernel_size=stride, stride=stride
+                )
+            video_levels.append(level_src)
+            mask_levels.append(level_mask)
+            pos_levels.append(
+                self.position_embed(level_src, level_mask) + level_embed[level_idx].view(1, 1, -1)
+            )
+
+        src_vid_pyr = torch.cat(video_levels, dim=1)
+        src_vid_pyr_mask = torch.cat(mask_levels, dim=1)
+        pos_vid_pyr = torch.cat(pos_levels, dim=1)
         return src_vid_pyr, src_vid_pyr_mask, pos_vid_pyr, v1.shape[1]
 
     def _run_text_video_transformer(self, src_vid, src_vid_mask, src_txt, src_txt_mask,
@@ -1537,6 +1603,7 @@ def build_model(args):
     query_anchor_widths = getattr(args, "query_anchor_widths", None)
     use_temporal_pyramid = getattr(args, "use_temporal_pyramid", False)
     temporal_pyramid_downsample = getattr(args, "temporal_pyramid_downsample", "avg")
+    temporal_pyramid_strides = getattr(args, "temporal_pyramid_strides", (1, 2, 4))
     use_temporal_local = getattr(args, "use_temporal_local", False)
     temporal_local_layers = getattr(args, "temporal_local_layers", 2)
     temporal_local_kernel_size = getattr(args, "temporal_local_kernel_size", 3)
@@ -1570,6 +1637,7 @@ def build_model(args):
             query_anchor_widths=query_anchor_widths,
             use_temporal_pyramid=use_temporal_pyramid,
             temporal_pyramid_downsample=temporal_pyramid_downsample,
+            temporal_pyramid_strides=temporal_pyramid_strides,
             use_temporal_local=use_temporal_local,
             temporal_local_layers=temporal_local_layers,
             temporal_local_kernel_size=temporal_local_kernel_size,
@@ -1602,6 +1670,7 @@ def build_model(args):
             query_anchor_widths=query_anchor_widths,
             use_temporal_pyramid=use_temporal_pyramid,
             temporal_pyramid_downsample=temporal_pyramid_downsample,
+            temporal_pyramid_strides=temporal_pyramid_strides,
             use_temporal_local=use_temporal_local,
             temporal_local_layers=temporal_local_layers,
             temporal_local_kernel_size=temporal_local_kernel_size,
