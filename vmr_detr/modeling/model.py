@@ -247,7 +247,12 @@ class VMRDETR(nn.Module):
             vid_proj_layer(hidden_dim, hidden_dim, layer_norm=True, dropout=input_dropout, relu=relu_args[2])
         ][:n_input_proj])
         if use_temporal_comp:
-            self.temporal_comp = TemporalCompensationBlock(hidden_dim, dropout=input_dropout)
+            self.temporal_comp = ConvolutionalBlock(
+                hidden_dim,
+                dropout=input_dropout,
+                n_blocks=3,
+                n_heads=getattr(transformer, "nhead", 8),
+            )
             self.temporal_comp_scale = nn.Parameter(torch.full((1,), 0.01))
 
         self.contrastive_align_loss = contrastive_align_loss
@@ -312,8 +317,14 @@ class VMRDETR(nn.Module):
         self._validate_text_mask(src_txt, src_txt_mask)
         src_txt = self.input_txt_proj(src_txt)
         src_vid_base = self.input_vid_proj(src_vid)
+
         if self.use_temporal_comp:
-            src_vid_temp = self.temporal_comp(src_vid_base, src_vid_mask)
+            src_vid_temp = self.temporal_comp(
+                src_vid_base,
+                video_mask=src_vid_mask,
+                text=src_txt,
+                text_mask=src_txt_mask,
+            )
             src_vid = src_vid_base + self.temporal_comp_scale * (src_vid_temp - src_vid_base)
             src_vid = src_vid * src_vid_mask.bool().unsqueeze(-1).to(dtype=src_vid.dtype)
         else:
@@ -1343,6 +1354,83 @@ class TemporalCompensationBlock(nn.Module):
         comp = self.norm((gate * y).transpose(1, 2)).transpose(1, 2)
         out = comp + x
         return out * valid_f
+
+
+class ConvolutionalBlock(nn.Module):
+    def __init__(self, dim, n_blocks=5, n_heads=8, dropout=0.1):
+        super().__init__()
+        self.video_norm = nn.LayerNorm(dim)
+        self.text_norm = nn.LayerNorm(dim)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=dim,
+            num_heads=n_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.dropout = nn.Dropout(dropout)
+
+        # define the Block
+        class TheBlock(nn.Module):
+            def __init__(self, dim):
+                super().__init__()
+                self.conv1 = nn.Conv1d(
+                    in_channels=dim,
+                    out_channels=dim,
+                    kernel_size=3,
+                    stride=1,
+                    padding=1,
+                )
+                self.bn1 = nn.BatchNorm1d(dim)
+                self.conv2 = nn.Conv1d(
+                    in_channels=dim,
+                    out_channels=dim,
+                    kernel_size=3,
+                    stride=1,
+                    padding=1,
+                )
+                self.bn2 = nn.BatchNorm1d(dim)
+
+            def forward(self, x):
+                return F.relu(
+                    self.bn2(self.conv2(F.relu(self.bn1(self.conv1(x))))) + x)
+
+        blocks = [TheBlock(dim) for _ in range(n_blocks)]
+        self.blocks = nn.ModuleList(blocks)
+
+    def forward(self, x, video_mask=None, text=None, text_mask=None):
+        out = x
+
+        video_valid = None
+        if video_mask is not None:
+            video_valid = video_mask.bool().unsqueeze(-1).to(dtype=out.dtype)
+
+        if text is not None:
+            key_padding_mask = None
+            if text_mask is not None:
+                key_padding_mask = ~text_mask.bool()
+
+            norm_text = self.text_norm(text)
+            attn_out, _ = self.cross_attn(
+                query=self.video_norm(out),
+                key=norm_text,
+                value=norm_text,
+                key_padding_mask=key_padding_mask,
+                need_weights=False,
+            )
+            out = out + self.dropout(attn_out)
+
+        if video_valid is not None:
+            out = out * video_valid
+
+        out = out.transpose(1, 2)
+        for i, layer in enumerate(self.blocks):
+            out = layer(out)
+        out = out.transpose(1, 2)
+
+        if video_valid is not None:
+            out = out * video_valid
+
+        return out
 
 
 def build_model(args):

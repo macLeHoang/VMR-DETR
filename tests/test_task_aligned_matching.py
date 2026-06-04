@@ -4,6 +4,7 @@ import torch
 
 from vmr_detr.modeling.matcher import HungarianMatcher, TaskAlignedMatcher
 from vmr_detr.modeling.model import (
+    ConvolutionalBlock,
     Conv1DLayer,
     LinearLayer,
     SetCriterion,
@@ -269,6 +270,30 @@ class TemporalCompensationBlockTest(unittest.TestCase):
         self.assertTrue(torch.equal(out[:, -2:], torch.zeros_like(out[:, -2:])))
 
 
+class ConvolutionalBlockTest(unittest.TestCase):
+    def test_block_preserves_sequence_shape_without_text(self):
+        block = ConvolutionalBlock(dim=4, n_blocks=2, n_heads=1, dropout=0.0)
+        x = torch.randn(2, 6, 4)
+
+        out = block(x)
+
+        self.assertEqual(out.shape, (2, 6, 4))
+
+    def test_block_accepts_text_cross_attention_and_masks_video_padding(self):
+        block = ConvolutionalBlock(dim=4, n_blocks=2, n_heads=1, dropout=0.0)
+        x = torch.arange(48, dtype=torch.float32).reshape(2, 6, 4) / 10.0
+        video_mask = torch.ones(2, 6)
+        video_mask[:, -2:] = 0
+        text = torch.randn(2, 5, 4)
+        text_mask = torch.ones(2, 5)
+        text_mask[1, -2:] = 0
+
+        out = block(x, video_mask=video_mask, text=text, text_mask=text_mask)
+
+        self.assertEqual(out.shape, (2, 6, 4))
+        self.assertTrue(torch.equal(out[:, -2:], torch.zeros_like(out[:, -2:])))
+
+
 class SingleLevelVideoMemoryTest(unittest.TestCase):
     def _build_model(self, hidden_dim=4, use_temporal_comp=False):
         transformer = _CaptureTransformer(hidden_dim=hidden_dim)
@@ -322,7 +347,7 @@ class SingleLevelVideoMemoryTest(unittest.TestCase):
         call = transformer.calls[0]
 
         self.assertTrue(model.use_temporal_comp)
-        self.assertIsInstance(model.temporal_comp, TemporalCompensationBlock)
+        self.assertIsInstance(model.temporal_comp, ConvolutionalBlock)
         self.assertIsInstance(model.temporal_comp_scale, torch.nn.Parameter)
         self.assertAlmostEqual(float(model.temporal_comp_scale.item()), 0.01, places=6)
         self.assertEqual(call["src_shape"], (2, 81, 4))
