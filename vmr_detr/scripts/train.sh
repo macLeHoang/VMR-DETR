@@ -48,7 +48,8 @@ fi
 # Model
 input_dropout=0.5
 video_input_proj=linear
-temporal_comp_flag=--use_temporal_comp
+temporal_comp_flag=
+# --use_temporal_comp
 enc_layers=3
 dec_layers=3
 clip_length=1
@@ -66,12 +67,12 @@ set_cost_class=4
 
 # Losses: localization and labels
 span_loss_coef=1.0
-span_xx_loss_coef=4.0
-fgl_loss_coef=1.25
-giou_loss_coef=1.0
+span_xx_loss_coef=0.0
+fgl_loss_coef=1.5
+giou_loss_coef=6.0
 width_loss_type=log
 width_loss_coef=0.5
-label_loss_coef=4.0
+label_loss_coef=12.0
 
 # Losses: label supervision
 label_loss_type=vfl
@@ -86,11 +87,19 @@ contrastive_align_loss_flag=--contrastive_align_loss
 contrastive_align_loss_coef=0.3
 contrastive_start_epoch=10
 contrastive_decay_epoch=30
-contrastive_decay_coef=0.1
+contrastive_decay_coef=0.3
 
 # Losses: saliency
 lw_saliency=1.0
 saliency_margin=0.2
+
+# Losses: intra-video hard negatives (Level A + B)
+intra_video_hard_neg_ratio=0.3
+intra_video_hardneg_iou_thd=0.1
+saliency_hardneg_margin=0.4
+hardneg_loss_coef=0.5
+hardneg_warmup_epoch=5
+hardneg_ramp_epoch=20
 
 # Optimization and evaluation
 bsz=32
@@ -166,6 +175,12 @@ PYTHONPATH="${PYTHONPATH}:." python vmr_detr/cli/train.py \
   --go_lsd_start_epoch "${go_lsd_start_epoch}" \
   --lw_saliency "${lw_saliency}" \
   --saliency_margin "${saliency_margin}" \
+  --intra_video_hard_neg_ratio "${intra_video_hard_neg_ratio}" \
+  --intra_video_hardneg_iou_thd "${intra_video_hardneg_iou_thd}" \
+  --saliency_hardneg_margin "${saliency_hardneg_margin}" \
+  --hardneg_loss_coef "${hardneg_loss_coef}" \
+  --hardneg_warmup_epoch "${hardneg_warmup_epoch}" \
+  --hardneg_ramp_epoch "${hardneg_ramp_epoch}" \
   ${contrastive_align_loss_flag} \
   --contrastive_align_loss_coef "${contrastive_align_loss_coef}" \
   --contrastive_start_epoch "${contrastive_start_epoch}" \

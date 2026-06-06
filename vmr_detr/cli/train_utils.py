@@ -283,6 +283,9 @@ def build_datasets(opt):
             txt_drop_ratio=opt.txt_drop_ratio,
             dset_domain=opt.dset_domain,
             v_feat_len_mode=opt.v_feat_len_mode,
+            intra_video_hard_neg_ratio=opt.intra_video_hard_neg_ratio,
+            intra_video_hardneg_iou_thd=opt.intra_video_hardneg_iou_thd,
+            emit_hardneg_labels=(opt.hardneg_loss_coef > 0),
         )
         train_dataset = StartEndDataset(**dataset_config)
     else:
@@ -313,6 +316,7 @@ def build_datasets(opt):
     dataset_config["data_path"] = opt.eval_path
     dataset_config["txt_drop_ratio"] = 0
     if opt.a_feat_dir is None:
+        dataset_config["intra_video_hard_neg_ratio"] = 0
         eval_dataset = StartEndDataset(**dataset_config)
     else:
         eval_dataset = StartEndDataset_audio(**dataset_config)

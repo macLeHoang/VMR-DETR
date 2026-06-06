@@ -247,12 +247,7 @@ class VMRDETR(nn.Module):
             vid_proj_layer(hidden_dim, hidden_dim, layer_norm=True, dropout=input_dropout, relu=relu_args[2])
         ][:n_input_proj])
         if use_temporal_comp:
-            self.temporal_comp = ConvolutionalBlock(
-                hidden_dim,
-                dropout=input_dropout,
-                n_blocks=3,
-                n_heads=getattr(transformer, "nhead", 8),
-            )
+            self.temporal_comp = TemporalCompensationBlock(hidden_dim, dropout=input_dropout)
             self.temporal_comp_scale = nn.Parameter(torch.full((1,), 0.01))
 
         self.contrastive_align_loss = contrastive_align_loss
@@ -317,14 +312,8 @@ class VMRDETR(nn.Module):
         self._validate_text_mask(src_txt, src_txt_mask)
         src_txt = self.input_txt_proj(src_txt)
         src_vid_base = self.input_vid_proj(src_vid)
-
         if self.use_temporal_comp:
-            src_vid_temp = self.temporal_comp(
-                src_vid_base,
-                video_mask=src_vid_mask,
-                text=src_txt,
-                text_mask=src_txt_mask,
-            )
+            src_vid_temp = self.temporal_comp(src_vid_base, src_vid_mask)
             src_vid = src_vid_base + self.temporal_comp_scale * (src_vid_temp - src_vid_base)
             src_vid = src_vid * src_vid_mask.bool().unsqueeze(-1).to(dtype=src_vid.dtype)
         else:
@@ -439,7 +428,9 @@ class SetCriterion(nn.Module):
                  quality_label_loss=False, quality_label_strength=0.5,
                  quality_label_iou_gamma=1.0,
                  quality_label_warmup_epoch=10, quality_label_ramp_epoch=30,
-                 go_lsd_temperature=2.0, go_lsd_start_epoch=0):
+                 go_lsd_temperature=2.0, go_lsd_start_epoch=0,
+                 saliency_hardneg_margin=0.4, hardneg_loss_coef=0.0,
+                 hardneg_warmup_epoch=0, hardneg_ramp_epoch=-1):
         """ Create the criterion.
         Parameters:
             matcher: module able to compute a matching between targets and proposals
@@ -463,6 +454,10 @@ class SetCriterion(nn.Module):
             quality_label_iou_gamma: float, exponent applied to matched IoU targets
             go_lsd_temperature: float, KL temperature for FDR self-distillation
             go_lsd_start_epoch: int, 1-based epoch where GO-LSD starts
+            saliency_hardneg_margin: float, margin for intra-video hard-negative term
+            hardneg_loss_coef: float, coefficient for the hard-negative margin term (0 disables)
+            hardneg_warmup_epoch: int, epoch before which hardneg term is zero
+            hardneg_ramp_epoch: int, epoch at which hardneg term reaches full strength; <=0 means instant
         """
         super().__init__()
         self.matcher = matcher
@@ -548,10 +543,22 @@ class SetCriterion(nn.Module):
         self.fdr_min_ref_width = fdr_min_ref_width
         self.saliency_margin = saliency_margin
 
+        # Intra-video hard-negative margin term
+        if hardneg_loss_coef < 0:
+            raise ValueError("hardneg_loss_coef must be >= 0.")
+        if hardneg_warmup_epoch < 0:
+            raise ValueError("hardneg_warmup_epoch must be >= 0.")
+        if hardneg_ramp_epoch > 0 and hardneg_ramp_epoch < hardneg_warmup_epoch:
+            raise ValueError("hardneg_ramp_epoch must be >= hardneg_warmup_epoch when > 0.")
+        self.saliency_hardneg_margin = saliency_hardneg_margin
+        self.hardneg_coef = hardneg_loss_coef
+        self.hardneg_warmup_epoch = hardneg_warmup_epoch
+        self.hardneg_ramp_epoch = hardneg_ramp_epoch
+
         # Binary foreground classification.
         self.foreground_label = 0
         self.eos_coef = eos_coef
-        
+
         # for tvsum,
         self.use_matcher = use_matcher
         self.contrastive_start_epoch = contrastive_start_epoch
@@ -882,6 +889,21 @@ class SetCriterion(nn.Module):
         denom = max(1, self.quality_label_ramp_epoch - self.quality_label_warmup_epoch)
         return float(self.current_epoch - self.quality_label_warmup_epoch) / float(denom)
 
+    def _hardneg_ramp(self):
+        """Linear warmup ramp for the intra-video hard-negative loss term.
+
+        Returns 0 before hardneg_warmup_epoch, 1 once past hardneg_ramp_epoch
+        (or immediately after warmup when hardneg_ramp_epoch <= 0).
+        """
+        if self.current_epoch < self.hardneg_warmup_epoch:
+            return 0.0
+        if self.hardneg_ramp_epoch <= 0:
+            return 1.0
+        if self.current_epoch >= self.hardneg_ramp_epoch:
+            return 1.0
+        denom = max(1, self.hardneg_ramp_epoch - self.hardneg_warmup_epoch)
+        return float(self.current_epoch - self.hardneg_warmup_epoch) / float(denom)
+
     def _hungarian_quality_targets(self, outputs, targets, indices):
         src_logits = outputs['pred_logits']
         target_quality = src_logits.new_zeros(src_logits.shape[:2])
@@ -1058,6 +1080,17 @@ class SetCriterion(nn.Module):
             [saliency_scores[batch_indices, neg_indices[:, col_idx]] for col_idx in range(num_pairs)], dim=1)
         loss_saliency = torch.clamp(self.saliency_margin + neg_scores - pos_scores, min=0).sum() \
                         / (len(pos_scores) * num_pairs) * 2  # * 2 to keep the loss the same scale
+
+        # Level B: intra-video hard-negative margin term
+        if self.hardneg_coef > 0 and "saliency_hardneg_labels" in targets:
+            hn_indices = targets["saliency_hardneg_labels"]  # (N, #pairs)
+            num_hn_pairs = hn_indices.shape[1]
+            hardneg_scores = torch.stack(
+                [saliency_scores[batch_indices, hn_indices[:, col_idx]] for col_idx in range(num_hn_pairs)], dim=1)
+            loss_hardneg = torch.clamp(
+                self.saliency_hardneg_margin + hardneg_scores - pos_scores, min=0
+            ).sum() / (len(pos_scores) * num_hn_pairs) * 2
+            loss_saliency = loss_saliency + self.hardneg_coef * self._hardneg_ramp() * loss_hardneg
 
         # print(loss_saliency, loss_rank_contrastive)
         # loss_saliency = loss_saliency + loss_rank_contrastive
@@ -1356,83 +1389,6 @@ class TemporalCompensationBlock(nn.Module):
         return out * valid_f
 
 
-class ConvolutionalBlock(nn.Module):
-    def __init__(self, dim, n_blocks=5, n_heads=8, dropout=0.1):
-        super().__init__()
-        self.video_norm = nn.LayerNorm(dim)
-        self.text_norm = nn.LayerNorm(dim)
-        self.cross_attn = nn.MultiheadAttention(
-            embed_dim=dim,
-            num_heads=n_heads,
-            dropout=dropout,
-            batch_first=True,
-        )
-        self.dropout = nn.Dropout(dropout)
-
-        # define the Block
-        class TheBlock(nn.Module):
-            def __init__(self, dim):
-                super().__init__()
-                self.conv1 = nn.Conv1d(
-                    in_channels=dim,
-                    out_channels=dim,
-                    kernel_size=3,
-                    stride=1,
-                    padding=1,
-                )
-                self.bn1 = nn.BatchNorm1d(dim)
-                self.conv2 = nn.Conv1d(
-                    in_channels=dim,
-                    out_channels=dim,
-                    kernel_size=3,
-                    stride=1,
-                    padding=1,
-                )
-                self.bn2 = nn.BatchNorm1d(dim)
-
-            def forward(self, x):
-                return F.relu(
-                    self.bn2(self.conv2(F.relu(self.bn1(self.conv1(x))))) + x)
-
-        blocks = [TheBlock(dim) for _ in range(n_blocks)]
-        self.blocks = nn.ModuleList(blocks)
-
-    def forward(self, x, video_mask=None, text=None, text_mask=None):
-        out = x
-
-        video_valid = None
-        if video_mask is not None:
-            video_valid = video_mask.bool().unsqueeze(-1).to(dtype=out.dtype)
-
-        if text is not None:
-            key_padding_mask = None
-            if text_mask is not None:
-                key_padding_mask = ~text_mask.bool()
-
-            norm_text = self.text_norm(text)
-            attn_out, _ = self.cross_attn(
-                query=self.video_norm(out),
-                key=norm_text,
-                value=norm_text,
-                key_padding_mask=key_padding_mask,
-                need_weights=False,
-            )
-            out = out + self.dropout(attn_out)
-
-        if video_valid is not None:
-            out = out * video_valid
-
-        out = out.transpose(1, 2)
-        for i, layer in enumerate(self.blocks):
-            out = layer(out)
-        out = out.transpose(1, 2)
-
-        if video_valid is not None:
-            out = out * video_valid
-
-        return out
-
-
 def build_model(args):
     # the `num_classes` naming here is somewhat misleading.
     # it indeed corresponds to `max_obj_id + 1`, where max_obj_id
@@ -1590,6 +1546,10 @@ def build_model(args):
         quality_label_ramp_epoch=getattr(args, "quality_label_ramp_epoch", 30),
         go_lsd_temperature=getattr(args, "go_lsd_temperature", 2.0),
         go_lsd_start_epoch=getattr(args, "go_lsd_start_epoch", 0),
+        saliency_hardneg_margin=getattr(args, "saliency_hardneg_margin", 0.4),
+        hardneg_loss_coef=getattr(args, "hardneg_loss_coef", 0.0),
+        hardneg_warmup_epoch=getattr(args, "hardneg_warmup_epoch", 0),
+        hardneg_ramp_epoch=getattr(args, "hardneg_ramp_epoch", -1),
     )
     criterion.to(device)
     return model, criterion

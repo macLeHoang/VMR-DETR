@@ -155,6 +155,18 @@ class BaseOptions(object):
         parser.add_argument("--lw_saliency", type=float, default=1.,
                             help="weight for saliency loss, set to 0 will ignore")
         parser.add_argument("--saliency_margin", type=float, default=0.2)
+        parser.add_argument("--intra_video_hard_neg_ratio", type=float, default=0.0,
+                            help="Fraction of neg clips drawn from other moments of the same video (Level A). 0 disables.")
+        parser.add_argument("--intra_video_hardneg_iou_thd", type=float, default=0.1,
+                            help="Seconds-IoU threshold above which a same-video moment is excluded from the hard pool.")
+        parser.add_argument("--saliency_hardneg_margin", type=float, default=0.4,
+                            help="Margin for the intra-video hard-negative saliency term (Level B).")
+        parser.add_argument("--hardneg_loss_coef", type=float, default=0.0,
+                            help="Coefficient for the intra-video hard-negative loss term. 0 disables (Level B).")
+        parser.add_argument("--hardneg_warmup_epoch", type=int, default=0,
+                            help="Epoch before which the hard-negative loss term is zero.")
+        parser.add_argument("--hardneg_ramp_epoch", type=int, default=-1,
+                            help="Epoch at which the hard-negative loss reaches full strength. <=0 means instant after warmup.")
         parser.add_argument('--no_aux_loss', dest='aux_loss', action='store_false',
                             help="Disables auxiliary decoding losses (loss at each layer)")
         parser.add_argument("--span_loss_type", default="l1", type=str, choices=['l1', 'ce', 'dfl', 'fdr'],

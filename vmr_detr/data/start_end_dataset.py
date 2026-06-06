@@ -4,6 +4,7 @@ import numpy as np
 from tqdm import tqdm
 import random
 import logging
+from collections import defaultdict
 from os.path import join, exists
 from utils.basic_utils import load_jsonl, l2_normalize_np_array
 from utils.tensor_utils import pad_sequences_1d
@@ -30,7 +31,9 @@ class StartEndDataset(Dataset):
                  max_q_l=32, max_v_l=75, data_ratio=1.0, ctx_mode="video",
                  normalize_v=True, normalize_t=True, load_labels=True,
                  clip_len=2, max_windows=5, span_loss_type="l1", txt_drop_ratio=0,
-                 dset_domain=None, v_feat_len_mode="min"):
+                 dset_domain=None, v_feat_len_mode="min",
+                 intra_video_hard_neg_ratio=0.0, intra_video_hardneg_iou_thd=0.1,
+                 emit_hardneg_labels=False):
         self.dset_name = dset_name
         self.data_path = data_path
         self.data_ratio = data_ratio
@@ -52,6 +55,9 @@ class StartEndDataset(Dataset):
         self.span_loss_type = span_loss_type
         self.txt_drop_ratio = txt_drop_ratio
         self.v_feat_len_mode = v_feat_len_mode
+        self.intra_video_hard_neg_ratio = intra_video_hard_neg_ratio
+        self.intra_video_hardneg_iou_thd = intra_video_hardneg_iou_thd
+        self.emit_hardneg_labels = emit_hardneg_labels
         if "val" in data_path or "test" in data_path:
             assert txt_drop_ratio == 0
 
@@ -61,7 +67,12 @@ class StartEndDataset(Dataset):
 
         # data
         self.data = self.load_data()
-        
+
+        # build per-video window index for intra-video hard negatives
+        self.vid2windows = defaultdict(list)
+        for d in self.data:
+            self.vid2windows[d["vid"]].append(d["relevant_windows"])
+
         # load specific domain data for tvsum dataset
         if self.dset_name == 'tvsum':
             target_domain = dset_domain
@@ -82,6 +93,36 @@ class StartEndDataset(Dataset):
             logger.info("Using {}% of the data: {} examples"
                         .format(self.data_ratio * 100, n_examples))
         return datalist
+
+    @staticmethod
+    def _seconds_iou(a, b):
+        """1D temporal IoU of two [st, ed] second-windows."""
+        inter_st = max(a[0], b[0])
+        inter_ed = min(a[1], b[1])
+        inter = max(0.0, inter_ed - inter_st)
+        union = max(0.0, a[1] - a[0]) + max(0.0, b[1] - b[0]) - inter
+        if union <= 0:
+            return 0.0
+        return inter / union
+
+    def _intra_video_hard_pool(self, vid, cur_window, gt_st, gt_ed, ctx_l, clip_len):
+        """Return a list of clip indices covered by OTHER moments of the same video.
+
+        Excludes clips within the current GT range [gt_st, gt_ed] and excludes
+        moments whose seconds-IoU with cur_window exceeds self.intra_video_hardneg_iou_thd.
+        """
+        hard_clips = set()
+        for windows_list in self.vid2windows[vid]:
+            for w in windows_list:
+                # false-negative guard: skip moments too similar to the current GT
+                if self._seconds_iou(w, cur_window) > self.intra_video_hardneg_iou_thd:
+                    continue
+                w_st = int(w[0] / clip_len)
+                w_ed = min(ctx_l, int(w[1] / clip_len) + 1)
+                for ci in range(w_st, w_ed):
+                    if ci < gt_st or ci > gt_ed:
+                        hard_clips.add(ci)
+        return list(hard_clips)
 
     def __len__(self):
         return len(self.data)
@@ -117,23 +158,32 @@ class StartEndDataset(Dataset):
                 model_inputs["span_labels"] = self.get_span_labels(meta["relevant_windows"], ctx_l)  # (#windows, 2)
 
                 if self.dset_name in ['charades_sta', 'tacos', 'activitynet']: ## charades, tacos, nlq
-                    model_inputs["saliency_pos_labels"], model_inputs["saliency_neg_labels"], model_inputs["saliency_all_labels"] = \
-                        self.get_saliency_labels_sub_as_query(meta["relevant_windows"][0], meta["duration"], ctx_l)  # only one gt
+                    model_inputs["saliency_pos_labels"], model_inputs["saliency_neg_labels"], model_inputs["saliency_all_labels"], hardneg = \
+                        self.get_saliency_labels_sub_as_query(meta["relevant_windows"][0], meta["duration"], ctx_l,
+                                                              vid=meta["vid"], cur_window=meta["relevant_windows"][0])  # only one gt
+                    if hardneg is not None:
+                        model_inputs["saliency_hardneg_labels"] = hardneg
                 elif self.dset_name in ['nlq']:
-                    model_inputs["saliency_pos_labels"], model_inputs["saliency_neg_labels"], model_inputs["saliency_all_labels"] = \
-                        self.get_saliency_labels_sub_as_query(meta["relevant_windows"][0], meta["duration"], ctx_l, 2)  # only one gt
+                    model_inputs["saliency_pos_labels"], model_inputs["saliency_neg_labels"], model_inputs["saliency_all_labels"], hardneg = \
+                        self.get_saliency_labels_sub_as_query(meta["relevant_windows"][0], meta["duration"], ctx_l, 2,
+                                                              vid=meta["vid"], cur_window=meta["relevant_windows"][0])  # only one gt
+                    if hardneg is not None:
+                        model_inputs["saliency_hardneg_labels"] = hardneg
                 elif "subs_train" not in self.data_path:
                     model_inputs["saliency_pos_labels"], model_inputs["saliency_neg_labels"], model_inputs["saliency_all_labels"] = \
                         self.get_saliency_labels_all(meta["relevant_clip_ids"], meta["saliency_scores"], ctx_l)
                 else:
                     model_inputs["saliency_pos_labels"], model_inputs["saliency_neg_labels"], model_inputs[
-                        "saliency_all_labels"] = \
-                        self.get_saliency_labels_sub_as_query(meta["relevant_windows"][0], meta["duration"], ctx_l)  # only one gt
+                        "saliency_all_labels"], hardneg = \
+                        self.get_saliency_labels_sub_as_query(meta["relevant_windows"][0], meta["duration"], ctx_l,
+                                                              vid=meta["vid"], cur_window=meta["relevant_windows"][0])  # only one gt
+                    if hardneg is not None:
+                        model_inputs["saliency_hardneg_labels"] = hardneg
                     
         return dict(meta=meta, model_inputs=model_inputs)
 
 
-    def get_saliency_labels_sub_as_query(self, gt_window, duration, ctx_l, max_n=2):
+    def get_saliency_labels_sub_as_query(self, gt_window, duration, ctx_l, max_n=2, vid=None, cur_window=None):
         clip_len = duration / ctx_l
         gt_st = int(gt_window[0] / clip_len)
         gt_ed = max(0, min(int(gt_window[1] / clip_len), ctx_l) - 1)
@@ -149,16 +199,46 @@ class StartEndDataset(Dataset):
                 pos_clip_indices = [gt_st, gt_st]
 
         neg_pool = list(range(0, gt_st)) + list(range(gt_ed+1, ctx_l))
-        try:
-            neg_clip_indices = random.sample(neg_pool, k=max_n)
-        except:
-            neg_clip_indices = pos_clip_indices
+
+        # build hard pool only when needed
+        hard_pool = []
+        need_hard_pool = (vid is not None and
+                          (self.intra_video_hard_neg_ratio > 0 or self.emit_hardneg_labels))
+        if need_hard_pool:
+            _cur_window = cur_window if cur_window is not None else gt_window
+            hard_pool = self._intra_video_hard_pool(vid, _cur_window, gt_st, gt_ed, ctx_l, clip_len)
+
+        # Level A: mix hard negatives into the existing neg_clip_indices slots.
+        # When Level A is inactive, preserve the exact original sampling (without
+        # replacement) so default behavior is bit-for-bit unchanged.
+        if self.intra_video_hard_neg_ratio > 0 and hard_pool:
+            neg_clip_indices = []
+            for _ in range(max_n):
+                if random.random() < self.intra_video_hard_neg_ratio:
+                    neg_clip_indices.append(random.choice(hard_pool))
+                elif neg_pool:
+                    neg_clip_indices.append(random.choice(neg_pool))
+                else:
+                    neg_clip_indices.append(pos_clip_indices[0] if pos_clip_indices else 0)
+        else:
+            try:
+                neg_clip_indices = random.sample(neg_pool, k=max_n)
+            except:
+                neg_clip_indices = pos_clip_indices
 
         # For charades_sta
         score_array = np.zeros(ctx_l)
         score_array[gt_st:gt_ed + 1] = 1
 
-        return pos_clip_indices, neg_clip_indices, score_array
+        # Level B: dedicated hard-neg clip labels
+        hardneg_clip_indices = None
+        if self.emit_hardneg_labels:
+            if hard_pool:
+                hardneg_clip_indices = [random.choice(hard_pool) for _ in range(max_n)]
+            else:
+                hardneg_clip_indices = list(neg_clip_indices)
+
+        return pos_clip_indices, neg_clip_indices, score_array, hardneg_clip_indices
         
 
     def get_saliency_labels(self, rel_clip_ids, scores, ctx_l, max_n=1, add_easy_negative=True):
@@ -458,7 +538,7 @@ def start_end_collate(batch):
         if k == "span_labels":
             batched_data[k] = [dict(spans=e["model_inputs"]["span_labels"]) for e in batch]
             continue
-        if k in ["saliency_pos_labels", "saliency_neg_labels"]:
+        if k in ["saliency_pos_labels", "saliency_neg_labels", "saliency_hardneg_labels"]:
             batched_data[k] = torch.LongTensor([e["model_inputs"][k] for e in batch])
             continue
         if k == "saliency_all_labels":
@@ -488,6 +568,10 @@ def prepare_batch_inputs(batched_model_inputs, device, non_blocking=False):
     if "saliency_pos_labels" in batched_model_inputs:
         for name in ["saliency_pos_labels", "saliency_neg_labels"]:
             targets[name] = batched_model_inputs[name].to(device, non_blocking=non_blocking)
+
+    if "saliency_hardneg_labels" in batched_model_inputs:
+        targets["saliency_hardneg_labels"] = batched_model_inputs["saliency_hardneg_labels"].to(
+            device, non_blocking=non_blocking)
 
     if "saliency_all_labels" in batched_model_inputs:
         targets["saliency_all_labels"] = batched_model_inputs["saliency_all_labels"].to(device, non_blocking=non_blocking)
