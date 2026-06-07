@@ -4,11 +4,9 @@ import torch
 
 from vmr_detr.modeling.matcher import HungarianMatcher, TaskAlignedMatcher
 from vmr_detr.modeling.model import (
-    ConvolutionalBlock,
     Conv1DLayer,
     LinearLayer,
     SetCriterion,
-    TemporalCompensationBlock,
     VMRDETR,
     _decode_fdr_cumulative_outputs,
     fdr_logits_to_spans,
@@ -258,44 +256,8 @@ class VideoInputProjectionTest(unittest.TestCase):
             self._build_model(video_input_proj="unsupported")
 
 
-class TemporalCompensationBlockTest(unittest.TestCase):
-    def test_block_keeps_padded_outputs_zero(self):
-        block = TemporalCompensationBlock(dim=4, dropout=0.0)
-        x = torch.arange(48, dtype=torch.float32).reshape(2, 6, 4) / 10.0
-        mask = torch.ones(2, 6)
-        mask[:, -2:] = 0
-
-        out = block(x, mask)
-
-        self.assertTrue(torch.equal(out[:, -2:], torch.zeros_like(out[:, -2:])))
-
-
-class ConvolutionalBlockTest(unittest.TestCase):
-    def test_block_preserves_sequence_shape_without_text(self):
-        block = ConvolutionalBlock(dim=4, n_blocks=2, n_heads=1, dropout=0.0)
-        x = torch.randn(2, 6, 4)
-
-        out = block(x)
-
-        self.assertEqual(out.shape, (2, 6, 4))
-
-    def test_block_accepts_text_cross_attention_and_masks_video_padding(self):
-        block = ConvolutionalBlock(dim=4, n_blocks=2, n_heads=1, dropout=0.0)
-        x = torch.arange(48, dtype=torch.float32).reshape(2, 6, 4) / 10.0
-        video_mask = torch.ones(2, 6)
-        video_mask[:, -2:] = 0
-        text = torch.randn(2, 5, 4)
-        text_mask = torch.ones(2, 5)
-        text_mask[1, -2:] = 0
-
-        out = block(x, video_mask=video_mask, text=text, text_mask=text_mask)
-
-        self.assertEqual(out.shape, (2, 6, 4))
-        self.assertTrue(torch.equal(out[:, -2:], torch.zeros_like(out[:, -2:])))
-
-
 class SingleLevelVideoMemoryTest(unittest.TestCase):
-    def _build_model(self, hidden_dim=4, use_temporal_comp=False):
+    def _build_model(self, hidden_dim=4):
         transformer = _CaptureTransformer(hidden_dim=hidden_dim)
         model = VMRDETR(
             transformer=transformer,
@@ -308,7 +270,6 @@ class SingleLevelVideoMemoryTest(unittest.TestCase):
             contrastive_align_loss=True,
             max_v_l=75,
             n_input_proj=1,
-            use_temporal_comp=use_temporal_comp,
         )
         return model, transformer
 
@@ -328,31 +289,9 @@ class SingleLevelVideoMemoryTest(unittest.TestCase):
         self.assertEqual(call["pos_shape"], (2, 81, 4))
         self.assertEqual(outputs["saliency_scores"].shape, (2, 75))
         self.assertEqual(outputs["proj_vid_mem"].shape, (2, 75, 64))
-        self.assertFalse(model.use_temporal_comp)
-        self.assertFalse(hasattr(model, "temporal_comp"))
-        self.assertFalse(hasattr(model, "temporal_comp_scale"))
         self.assertFalse(hasattr(model, "temporal_local"))
         self.assertFalse(hasattr(model, "video_level_embed"))
         self.assertFalse(hasattr(model, "temporal_downsample"))
-
-    def test_temporal_compensation_is_opt_in_and_preserves_shapes(self):
-        model, transformer = self._build_model(use_temporal_comp=True)
-        src_txt = torch.arange(40, dtype=torch.float32).reshape(2, 5, 4) / 10.0
-        src_txt_mask = torch.ones(2, 5)
-        src_vid = torch.arange(600, dtype=torch.float32).reshape(2, 75, 4) / 10.0
-        src_vid_mask = torch.ones(2, 75)
-        src_vid_mask[1, 72:] = 0
-
-        outputs = model(src_txt, src_txt_mask, src_vid, src_vid_mask)
-        call = transformer.calls[0]
-
-        self.assertTrue(model.use_temporal_comp)
-        self.assertIsInstance(model.temporal_comp, ConvolutionalBlock)
-        self.assertIsInstance(model.temporal_comp_scale, torch.nn.Parameter)
-        self.assertAlmostEqual(float(model.temporal_comp_scale.item()), 0.01, places=6)
-        self.assertEqual(call["src_shape"], (2, 81, 4))
-        self.assertEqual(outputs["saliency_scores"].shape, (2, 75))
-        self.assertTrue(torch.equal(call["src"][1, 73:76], torch.zeros(3, 4)))
 
     def test_padded_video_mask_does_not_expand_memory(self):
         model, transformer = self._build_model()

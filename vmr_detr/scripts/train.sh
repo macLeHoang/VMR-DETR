@@ -48,8 +48,6 @@ fi
 # Model
 input_dropout=0.5
 video_input_proj=linear
-temporal_comp_flag=
-# --use_temporal_comp
 enc_layers=3
 dec_layers=3
 clip_length=1
@@ -101,6 +99,21 @@ hardneg_loss_coef=0.5
 hardneg_warmup_epoch=5
 hardneg_ramp_epoch=20
 
+# Unified localization and confidence refinement stage
+stage2_flag=--use_stage2
+stage2_dim=128
+stage2_inner_bins=8
+stage2_boundary_samples=2
+stage2_max_shift_clips=1
+stage2_shift_frac=0.0
+stage2_positive_iou=0.2
+stage2_start_epoch=10
+stage2_joint_epoch=70
+stage2_boundary_loss_coef=0.5
+stage2_giou_loss_coef=0.5
+stage2_quality_loss_coef=1.0
+stage2_at_inference_flag=--stage2_at_inference
+
 # Optimization and evaluation
 bsz=32
 eval_bsz=32
@@ -143,7 +156,6 @@ PYTHONPATH="${PYTHONPATH}:." python vmr_detr/cli/train.py \
   --exp_id "${exp_id}" \
   --input_dropout "${input_dropout}" \
   --video_input_proj "${video_input_proj}" \
-  ${temporal_comp_flag} \
   --query_init temporal_anchors \
   "${query_anchor_widths_args[@]}" \
   --bsz "${bsz}" \
@@ -181,6 +193,19 @@ PYTHONPATH="${PYTHONPATH}:." python vmr_detr/cli/train.py \
   --hardneg_loss_coef "${hardneg_loss_coef}" \
   --hardneg_warmup_epoch "${hardneg_warmup_epoch}" \
   --hardneg_ramp_epoch "${hardneg_ramp_epoch}" \
+  ${stage2_flag} \
+  --stage2_dim "${stage2_dim}" \
+  --stage2_inner_bins "${stage2_inner_bins}" \
+  --stage2_boundary_samples "${stage2_boundary_samples}" \
+  --stage2_max_shift_clips "${stage2_max_shift_clips}" \
+  --stage2_shift_frac "${stage2_shift_frac}" \
+  --stage2_positive_iou "${stage2_positive_iou}" \
+  --stage2_start_epoch "${stage2_start_epoch}" \
+  --stage2_joint_epoch "${stage2_joint_epoch}" \
+  --stage2_boundary_loss_coef "${stage2_boundary_loss_coef}" \
+  --stage2_giou_loss_coef "${stage2_giou_loss_coef}" \
+  --stage2_quality_loss_coef "${stage2_quality_loss_coef}" \
+  ${stage2_at_inference_flag} \
   ${contrastive_align_loss_flag} \
   --contrastive_align_loss_coef "${contrastive_align_loss_coef}" \
   --contrastive_start_epoch "${contrastive_start_epoch}" \

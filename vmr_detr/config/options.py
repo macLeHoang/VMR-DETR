@@ -147,8 +147,6 @@ class BaseOptions(object):
         parser.add_argument("--n_input_proj", type=int, default=2, help="#layers to encoder input")
         parser.add_argument("--video_input_proj", type=str, default="linear", choices=["linear", "conv"],
                             help="Projection type for video input features.")
-        parser.add_argument("--use_temporal_comp", action="store_true",
-                            help="Apply temporal compensation to projected video features before the transformer.")
         parser.add_argument("--contrastive_hdim", type=int, default=64, help="dim for contrastive embeddings")
         parser.add_argument("--temperature", type=float, default=0.07, help="temperature nce contrastive_align_loss")
         # Loss
@@ -167,6 +165,30 @@ class BaseOptions(object):
                             help="Epoch before which the hard-negative loss term is zero.")
         parser.add_argument("--hardneg_ramp_epoch", type=int, default=-1,
                             help="Epoch at which the hard-negative loss reaches full strength. <=0 means instant after warmup.")
+        # Unified proposal refinement and localization-quality stage
+        parser.add_argument("--use_stage2", action="store_true",
+                            help="Enable joint proposal localization and quality refinement.")
+        parser.add_argument("--stage2_dim", type=int, default=128,
+                            help="Hidden dimension for Stage 2 localization and quality heads.")
+        parser.add_argument("--stage2_inner_bins", type=int, default=4,
+                            help="Number of ordered samples pooled inside each proposal.")
+        parser.add_argument("--stage2_boundary_samples", type=int, default=2,
+                            help="Number of samples pooled on each side of each boundary.")
+        parser.add_argument("--stage2_max_shift_clips", type=float, default=1.0,
+                            help="Maximum start/end correction measured in valid video clips.")
+        parser.add_argument("--stage2_shift_frac", type=float, default=0.0,
+                            help="Width-proportional boundary shift fraction for Stage-2 refinement (0 disables).")
+        parser.add_argument("--stage2_positive_iou", type=float, default=0.2,
+                            help="Minimum base-proposal IoU for Stage 2 localization supervision.")
+        parser.add_argument("--stage2_start_epoch", type=int, default=10,
+                            help="Last epoch trained with Stage 1 losses only.")
+        parser.add_argument("--stage2_joint_epoch", type=int, default=30,
+                            help="Last epoch where Stage 2 inputs are detached from Stage 1.")
+        parser.add_argument("--stage2_boundary_loss_coef", type=float, default=0.0)
+        parser.add_argument("--stage2_giou_loss_coef", type=float, default=0.0)
+        parser.add_argument("--stage2_quality_loss_coef", type=float, default=0.0)
+        parser.add_argument("--stage2_at_inference", action="store_true",
+                            help="Use refined spans and class-times-quality scores at inference.")
         parser.add_argument('--no_aux_loss', dest='aux_loss', action='store_false',
                             help="Disables auxiliary decoding losses (loss at each layer)")
         parser.add_argument("--span_loss_type", default="l1", type=str, choices=['l1', 'ce', 'dfl', 'fdr'],
@@ -311,6 +333,7 @@ class BaseOptions(object):
             self._validate_label_loss_options(opt)
             self._validate_fdr_options(opt)
             self._validate_tal_options(opt)
+            self._validate_stage2_options(opt)
         else:
             self._normalize_query_anchor_widths(opt)
             if opt.dfl_num_bins < 2:
@@ -320,6 +343,7 @@ class BaseOptions(object):
             self._validate_label_loss_options(opt)
             self._validate_fdr_options(opt)
             self._validate_tal_options(opt)
+            self._validate_stage2_options(opt)
             if opt.exp_id is None:
                 raise ValueError("--exp_id is required for at a training option!")
 
@@ -404,6 +428,59 @@ class BaseOptions(object):
             raise ValueError("--tal_alpha and --tal_beta must be non-negative.")
         if opt.matching_type == "tal" and opt.span_loss_type not in ("l1", "dfl", "fdr"):
             raise ValueError("--matching_type tal requires --span_loss_type l1, dfl, or fdr.")
+
+    @staticmethod
+    def _validate_stage2_options(opt):
+        defaults = {
+            "use_stage2": False,
+            "stage2_dim": 128,
+            "stage2_inner_bins": 4,
+            "stage2_boundary_samples": 2,
+            "stage2_max_shift_clips": 1.0,
+            "stage2_shift_frac": 0.0,
+            "stage2_positive_iou": 0.2,
+            "stage2_start_epoch": 10,
+            "stage2_joint_epoch": 30,
+            "stage2_boundary_loss_coef": 0.0,
+            "stage2_giou_loss_coef": 0.0,
+            "stage2_quality_loss_coef": 0.0,
+            "stage2_at_inference": False,
+        }
+        for name, value in defaults.items():
+            if not hasattr(opt, name):
+                setattr(opt, name, value)
+
+        if opt.stage2_dim < 1:
+            raise ValueError("--stage2_dim must be >= 1.")
+        if opt.stage2_inner_bins < 1:
+            raise ValueError("--stage2_inner_bins must be >= 1.")
+        if opt.stage2_boundary_samples < 1:
+            raise ValueError("--stage2_boundary_samples must be >= 1.")
+        if opt.stage2_max_shift_clips <= 0:
+            raise ValueError("--stage2_max_shift_clips must be > 0.")
+        if opt.stage2_shift_frac < 0:
+            raise ValueError("--stage2_shift_frac must be >= 0.")
+        if not 0 <= opt.stage2_positive_iou <= 1:
+            raise ValueError("--stage2_positive_iou must be in [0, 1].")
+        if opt.stage2_start_epoch < 0:
+            raise ValueError("--stage2_start_epoch must be >= 0.")
+        if opt.stage2_joint_epoch < opt.stage2_start_epoch:
+            raise ValueError("--stage2_joint_epoch must be >= --stage2_start_epoch.")
+        coefficients = (
+            opt.stage2_boundary_loss_coef,
+            opt.stage2_giou_loss_coef,
+            opt.stage2_quality_loss_coef,
+        )
+        if min(coefficients) < 0:
+            raise ValueError("Stage 2 loss coefficients must be >= 0.")
+        if opt.use_stage2 and opt.span_loss_type not in ("l1", "dfl", "fdr"):
+            raise ValueError("--use_stage2 requires --span_loss_type l1, dfl, or fdr.")
+        if opt.use_stage2 and opt.dset_name == "tvsum":
+            raise ValueError("--use_stage2 is only supported for matcher-based VMR training.")
+        if any(coef > 0 for coef in coefficients) and not opt.use_stage2:
+            raise ValueError("Stage 2 loss coefficients require --use_stage2.")
+        if opt.stage2_at_inference and not opt.use_stage2:
+            raise ValueError("--stage2_at_inference requires --use_stage2.")
 
     @staticmethod
     def _validate_fdr_options(opt):

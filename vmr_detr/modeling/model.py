@@ -142,6 +142,174 @@ def _decode_fdr_cumulative_outputs(span_delta_logits, reference_spans, fdr_num_b
     return span_logits, spans, initial_reference
 
 
+class ProposalRefinementStage(nn.Module):
+    """Joint second-stage localization refinement and localization-quality scoring."""
+
+    def __init__(self, hidden_dim, stage2_dim=128, inner_bins=4,
+                 boundary_samples=2, max_shift_clips=1, span_num_bins=None,
+                 shift_frac=0.0):
+        super().__init__()
+        if inner_bins < 1:
+            raise ValueError("inner_bins must be >= 1.")
+        if boundary_samples < 1:
+            raise ValueError("boundary_samples must be >= 1.")
+        if max_shift_clips <= 0:
+            raise ValueError("max_shift_clips must be > 0.")
+        if shift_frac < 0:
+            raise ValueError("shift_frac must be >= 0.")
+
+        self.hidden_dim = hidden_dim
+        self.inner_bins = inner_bins
+        self.boundary_samples = boundary_samples
+        self.max_shift_clips = max_shift_clips
+        self.span_num_bins = span_num_bins
+        self.shift_frac = shift_frac
+
+        # Query state + four directional pools + ordered inner bins + geometry + entropy.
+        in_dim = hidden_dim * (5 + inner_bins) + 6
+        self.localization_head = nn.Sequential(
+            nn.Linear(in_dim, stage2_dim),
+            nn.ReLU(),
+            nn.Linear(stage2_dim, stage2_dim),
+            nn.ReLU(),
+            nn.Linear(stage2_dim, 2),
+        )
+        self.quality_head = nn.Sequential(
+            nn.Linear(in_dim, stage2_dim),
+            nn.ReLU(),
+            nn.Linear(stage2_dim, stage2_dim),
+            nn.ReLU(),
+            nn.Linear(stage2_dim, 1),
+        )
+        nn.init.zeros_(self.localization_head[-1].weight)
+        nn.init.zeros_(self.localization_head[-1].bias)
+        nn.init.zeros_(self.quality_head[-1].weight)
+        nn.init.zeros_(self.quality_head[-1].bias)
+
+    @staticmethod
+    def _sample_1d(vid_mem, positions, valid_len):
+        """Linearly sample video memory at normalized temporal positions."""
+        bsz, length, _ = vid_mem.shape
+        positions = positions.clamp(0, 1)
+        valid_len = valid_len.to(dtype=positions.dtype).clamp(min=1)
+        sample_idx = positions * valid_len[:, None, None] - 0.5
+        max_idx = (valid_len - 1)[:, None, None]
+        sample_idx = torch.maximum(sample_idx, sample_idx.new_zeros(()))
+        sample_idx = torch.minimum(sample_idx, max_idx)
+
+        if length == 1:
+            grid_x = torch.zeros_like(sample_idx)
+        else:
+            grid_x = sample_idx * (2.0 / float(length - 1)) - 1.0
+        grid = torch.stack([grid_x, torch.zeros_like(grid_x)], dim=-1)
+        memory_2d = vid_mem.transpose(1, 2).unsqueeze(2)
+        sampled = F.grid_sample(
+            memory_2d, grid, mode="bilinear", padding_mode="border", align_corners=True
+        )
+        return sampled.permute(0, 2, 3, 1)
+
+    def _pool_features(self, vid_mem, spans_xx, valid_len):
+        """Return directional boundary pools and ordered inner-region bins."""
+        start = spans_xx[..., 0]
+        end = spans_xx[..., 1]
+        dtype = spans_xx.dtype
+        device = spans_xx.device
+
+        offsets = torch.arange(
+            self.boundary_samples, device=device, dtype=dtype
+        ) + 0.5
+        offsets = offsets[None, None, :] / valid_len.to(dtype).clamp(min=1)[:, None, None]
+
+        start_before = self._sample_1d(vid_mem, start.unsqueeze(-1) - offsets, valid_len).mean(2)
+        start_after = self._sample_1d(vid_mem, start.unsqueeze(-1) + offsets, valid_len).mean(2)
+        end_before = self._sample_1d(vid_mem, end.unsqueeze(-1) - offsets, valid_len).mean(2)
+        end_after = self._sample_1d(vid_mem, end.unsqueeze(-1) + offsets, valid_len).mean(2)
+
+        fractions = (
+            torch.arange(self.inner_bins, device=device, dtype=dtype) + 0.5
+        ) / float(self.inner_bins)
+        inner_positions = (
+            start.unsqueeze(-1)
+            + (end - start).unsqueeze(-1) * fractions[None, None, :]
+        )
+        inner = self._sample_1d(vid_mem, inner_positions, valid_len)
+        inner = inner.flatten(2)
+        directional = torch.cat(
+            [start_before, start_after, end_before, end_after], dim=-1
+        )
+        return directional, inner
+
+    def _boundary_entropy(self, pred_span_logits, reference):
+        if pred_span_logits is None or self.span_num_bins is None:
+            return reference.new_zeros(*reference.shape[:2], 2)
+        logits = pred_span_logits.reshape(
+            *pred_span_logits.shape[:-1], 2, self.span_num_bins
+        )
+        prob = F.softmax(logits, dim=-1).clamp(min=1e-8)
+        entropy = -(prob * prob.log()).sum(dim=-1)
+        return entropy / float(np.log(self.span_num_bins))
+
+    def _assemble_features(self, hs_last, spans, vid_mem, valid_len, entropy):
+        spans_xx = span_cxw_to_xx(spans).clamp(0, 1)
+        directional, inner = self._pool_features(vid_mem, spans_xx, valid_len)
+        geometry = torch.cat([spans, spans_xx], dim=-1)
+        features = torch.cat(
+            [hs_last, directional, inner, geometry, entropy], dim=-1
+        )
+        return features, spans_xx
+
+    def forward(self, hs_last, pred_spans, pred_logits, pred_span_logits,
+                vid_mem, src_vid_mask, detach_stage1=True):
+        if detach_stage1:
+            hs_last = hs_last.detach()
+            pred_spans = pred_spans.detach()
+            pred_logits = pred_logits.detach()
+            pred_span_logits = (
+                pred_span_logits.detach() if pred_span_logits is not None else None
+            )
+            vid_mem = vid_mem.detach()
+
+        valid_len = src_vid_mask.float().sum(1).clamp(min=1)
+        entropy = self._boundary_entropy(pred_span_logits, pred_spans)
+        localization_features, pred_xx = self._assemble_features(
+            hs_last, pred_spans, vid_mem, valid_len, entropy
+        )
+
+        span_width = pred_xx[..., 1] - pred_xx[..., 0]
+        base_shift = (self.max_shift_clips / valid_len).to(pred_spans.dtype)[:, None]
+        max_shift = (base_shift + self.shift_frac * span_width).unsqueeze(-1)
+        boundary_delta = max_shift * torch.tanh(
+            self.localization_head(localization_features)
+        )
+        raw_start = pred_xx[..., 0] + boundary_delta[..., 0]
+        raw_end = pred_xx[..., 1] + boundary_delta[..., 1]
+        lo = torch.minimum(raw_start, raw_end)
+        hi = torch.maximum(raw_start, raw_end)
+        min_width = (1.0 / valid_len.clamp(min=1)).to(pred_spans.dtype)[:, None]
+        center = 0.5 * (lo + hi)
+        half = torch.maximum(0.5 * (hi - lo), 0.5 * min_width)
+        refined_start = (center - half).clamp(0, 1)
+        refined_end = (center + half).clamp(0, 1)
+        refined_xx = torch.stack([refined_start, refined_end], dim=-1)
+        refined_spans = span_xx_to_cxw(refined_xx)
+
+        # Quality predicts the IoU of the exact span used at inference. Coordinates
+        # are detached so quality supervision cannot move localization boundaries.
+        quality_spans = refined_spans.detach()
+        quality_features, _ = self._assemble_features(
+            hs_last, quality_spans, vid_mem, valid_len, entropy.detach()
+        )
+        quality_logits = self.quality_head(quality_features).squeeze(-1)
+        refined_scores = (
+            pred_logits.squeeze(-1).sigmoid() * quality_logits.sigmoid()
+        )
+        return {
+            "refined_spans": refined_spans,
+            "refined_quality_logits": quality_logits,
+            "refined_scores": refined_scores,
+        }
+
+
 class VMRDETR(nn.Module):
     """ VMR DETR. """
 
@@ -150,10 +318,13 @@ class VMRDETR(nn.Module):
                  contrastive_align_loss=False, contrastive_hdim=64,
                  max_v_l=75, span_loss_type="l1", use_txt_pos=False, n_input_proj=2, aud_dim=0,
                  video_input_proj="linear",
-                 use_temporal_comp=False,
                  dfl_num_bins=16, dfl_ref_prior_sigma=2.0,
                  fdr_num_bins=32, fdr_reg_scale=1.5, fdr_min_ref_width=None,
-                 query_init="random", query_anchor_widths=None):
+                 query_init="random", query_anchor_widths=None,
+                 use_stage2=False, stage2_dim=128, stage2_inner_bins=4,
+                 stage2_boundary_samples=2, stage2_max_shift_clips=1,
+                 stage2_shift_frac=0.0,
+                 stage2_joint_epoch=30):
         """ Initializes the model.
         Parameters:
             transformer: torch module of the transformer architecture. See transformer.py
@@ -175,6 +346,7 @@ class VMRDETR(nn.Module):
                 dfl: start/end boundary distributions with expectation decoding.
                 fdr: residual start/end boundary-offset distributions around decoder references.
             query_anchor_widths: optional normalized widths for temporal anchor query initialization.
+            use_stage2: enable joint proposal localization and quality refinement.
             # foreground_thd: float, intersection over prediction >= foreground_thd: labeled as foreground
             # background_thd: float, intersection over prediction <= background_thd: labeled background
         """
@@ -189,7 +361,6 @@ class VMRDETR(nn.Module):
         if video_input_proj not in ("linear", "conv"):
             raise ValueError("video_input_proj must be one of ['linear', 'conv'].")
         self.video_input_proj = video_input_proj
-        self.use_temporal_comp = use_temporal_comp
         if dfl_num_bins < 2:
             raise ValueError("dfl_num_bins must be >= 2.")
         if dfl_ref_prior_sigma <= 0:
@@ -246,9 +417,6 @@ class VMRDETR(nn.Module):
             vid_proj_layer(hidden_dim, hidden_dim, layer_norm=True, dropout=input_dropout, relu=relu_args[1]),
             vid_proj_layer(hidden_dim, hidden_dim, layer_norm=True, dropout=input_dropout, relu=relu_args[2])
         ][:n_input_proj])
-        if use_temporal_comp:
-            self.temporal_comp = TemporalCompensationBlock(hidden_dim, dropout=input_dropout)
-            self.temporal_comp_scale = nn.Parameter(torch.full((1,), 0.01))
 
         self.contrastive_align_loss = contrastive_align_loss
         if contrastive_align_loss:
@@ -263,6 +431,28 @@ class VMRDETR(nn.Module):
         self.hidden_dim = hidden_dim
         self.global_rep_token = torch.nn.Parameter(torch.randn(hidden_dim))
         self.global_rep_pos = torch.nn.Parameter(torch.randn(hidden_dim))
+
+        self.current_epoch = 0
+        self.use_stage2 = use_stage2
+        self.stage2_joint_epoch = stage2_joint_epoch
+        if use_stage2:
+            span_num_bins = None
+            if span_loss_type == "dfl":
+                span_num_bins = dfl_num_bins
+            elif span_loss_type == "fdr":
+                span_num_bins = fdr_num_bins
+            self.stage2 = ProposalRefinementStage(
+                hidden_dim=hidden_dim,
+                stage2_dim=stage2_dim,
+                inner_bins=stage2_inner_bins,
+                boundary_samples=stage2_boundary_samples,
+                max_shift_clips=stage2_max_shift_clips,
+                span_num_bins=span_num_bins,
+                shift_frac=stage2_shift_frac,
+            )
+
+    def set_epoch(self, epoch):
+        self.current_epoch = int(epoch)
 
     def _validate_text_mask(self, src_txt, src_txt_mask):
         if src_txt.shape[1] == 0 or not src_txt_mask.bool().any(dim=1).all():
@@ -311,13 +501,7 @@ class VMRDETR(nn.Module):
 
         self._validate_text_mask(src_txt, src_txt_mask)
         src_txt = self.input_txt_proj(src_txt)
-        src_vid_base = self.input_vid_proj(src_vid)
-        if self.use_temporal_comp:
-            src_vid_temp = self.temporal_comp(src_vid_base, src_vid_mask)
-            src_vid = src_vid_base + self.temporal_comp_scale * (src_vid_temp - src_vid_base)
-            src_vid = src_vid * src_vid_mask.bool().unsqueeze(-1).to(dtype=src_vid.dtype)
-        else:
-            src_vid = src_vid_base
+        src_vid = self.input_vid_proj(src_vid)
 
         hs, reference, vid_mem, memory_global, txt_mem = self._run_text_video_transformer(
             src_vid, src_vid_mask, src_txt, src_txt_mask
@@ -381,6 +565,18 @@ class VMRDETR(nn.Module):
 
         out["saliency_scores_neg"] = (torch.sum(self.saliency_proj1(vid_mem_neg) * self.saliency_proj2(memory_global_neg).unsqueeze(1), dim=-1) / np.sqrt(self.hidden_dim))
 
+        if self.use_stage2:
+            stage2_outputs = self.stage2(
+                hs_last=hs[-1],
+                pred_spans=out["pred_spans"],
+                pred_logits=out["pred_logits"],
+                pred_span_logits=out.get("pred_span_logits"),
+                vid_mem=vid_mem,
+                src_vid_mask=src_vid_mask,
+                detach_stage1=self.current_epoch <= self.stage2_joint_epoch,
+            )
+            out.update(stage2_outputs)
+
         # print(src_vid_mask.shape, src_vid.shape, vid_mem_neg.shape, vid_mem.shape)
         out["video_mask"] = src_vid_mask
         if self.aux_loss:
@@ -430,7 +626,10 @@ class SetCriterion(nn.Module):
                  quality_label_warmup_epoch=10, quality_label_ramp_epoch=30,
                  go_lsd_temperature=2.0, go_lsd_start_epoch=0,
                  saliency_hardneg_margin=0.4, hardneg_loss_coef=0.0,
-                 hardneg_warmup_epoch=0, hardneg_ramp_epoch=-1):
+                 hardneg_warmup_epoch=0, hardneg_ramp_epoch=-1,
+                 stage2_boundary_loss_coef=0.0, stage2_giou_loss_coef=0.0,
+                 stage2_quality_loss_coef=0.0, stage2_positive_iou=0.2,
+                 stage2_start_epoch=10):
         """ Create the criterion.
         Parameters:
             matcher: module able to compute a matching between targets and proposals
@@ -458,6 +657,8 @@ class SetCriterion(nn.Module):
             hardneg_loss_coef: float, coefficient for the hard-negative margin term (0 disables)
             hardneg_warmup_epoch: int, epoch before which hardneg term is zero
             hardneg_ramp_epoch: int, epoch at which hardneg term reaches full strength; <=0 means instant
+            stage2_positive_iou: minimum base-proposal IoU for localization refinement.
+            stage2_start_epoch: last Stage-1-only epoch.
         """
         super().__init__()
         self.matcher = matcher
@@ -554,6 +755,22 @@ class SetCriterion(nn.Module):
         self.hardneg_coef = hardneg_loss_coef
         self.hardneg_warmup_epoch = hardneg_warmup_epoch
         self.hardneg_ramp_epoch = hardneg_ramp_epoch
+
+        if min(
+            stage2_boundary_loss_coef,
+            stage2_giou_loss_coef,
+            stage2_quality_loss_coef,
+        ) < 0:
+            raise ValueError("Stage 2 loss coefficients must be >= 0.")
+        if stage2_positive_iou < 0 or stage2_positive_iou > 1:
+            raise ValueError("stage2_positive_iou must be in [0, 1].")
+        if stage2_start_epoch < 0:
+            raise ValueError("stage2_start_epoch must be >= 0.")
+        self.stage2_boundary_loss_coef = stage2_boundary_loss_coef
+        self.stage2_giou_loss_coef = stage2_giou_loss_coef
+        self.stage2_quality_loss_coef = stage2_quality_loss_coef
+        self.stage2_positive_iou = stage2_positive_iou
+        self.stage2_start_epoch = stage2_start_epoch
 
         # Binary foreground classification.
         self.foreground_label = 0
@@ -904,6 +1121,95 @@ class SetCriterion(nn.Module):
         denom = max(1, self.hardneg_ramp_epoch - self.hardneg_warmup_epoch)
         return float(self.current_epoch - self.hardneg_warmup_epoch) / float(denom)
 
+    def loss_stage2(self, outputs, targets, indices):
+        required = ("refined_spans", "refined_quality_logits")
+        zero = outputs["pred_spans"].sum() * 0.0
+        if not all(key in outputs for key in required):
+            return {
+                "loss_stage2_boundary": zero,
+                "loss_stage2_giou": zero,
+                "loss_stage2_quality": zero,
+            }
+        zero = zero + outputs["refined_quality_logits"].sum() * 0.0
+        if self.current_epoch <= self.stage2_start_epoch:
+            return {
+                "loss_stage2_boundary": zero,
+                "loss_stage2_giou": zero,
+                "loss_stage2_quality": zero,
+            }
+
+        pred_spans = outputs["pred_spans"]
+        refined_spans = outputs["refined_spans"]
+        quality_logits = outputs["refined_quality_logits"]
+        span_labels = targets["span_labels"]
+        bsz, num_queries = pred_spans.shape[:2]
+        device = pred_spans.device
+
+        with torch.no_grad():
+            base_xx = span_cxw_to_xx(pred_spans.detach()).clamp(0, 1)
+            refined_xx_target = span_cxw_to_xx(refined_spans.detach()).clamp(0, 1)
+            best_base_iou = pred_spans.new_zeros(bsz, num_queries)
+            best_gt_idx = torch.zeros(
+                bsz, num_queries, dtype=torch.long, device=device
+            )
+            quality_target = pred_spans.new_zeros(bsz, num_queries)
+            for batch_idx in range(bsz):
+                gt_spans = span_labels[batch_idx]["spans"].to(device)
+                if len(gt_spans) == 0:
+                    continue
+                gt_xx = span_cxw_to_xx(gt_spans).clamp(0, 1)
+                base_iou = temporal_iou(base_xx[batch_idx], gt_xx)[0].clamp(0, 1)
+                refined_iou = temporal_iou(
+                    refined_xx_target[batch_idx], gt_xx
+                )[0].clamp(0, 1)
+                best_base_iou[batch_idx], best_gt_idx[batch_idx] = base_iou.max(dim=1)
+                quality_target[batch_idx] = refined_iou.max(dim=1).values
+
+        positive = best_base_iou > self.stage2_positive_iou
+        if positive.any():
+            refined_xx = span_cxw_to_xx(refined_spans)
+            target_xx = torch.zeros_like(refined_xx)
+            for batch_idx in range(bsz):
+                gt_spans = span_labels[batch_idx]["spans"].to(device)
+                if len(gt_spans) == 0:
+                    continue
+                gt_xx = span_cxw_to_xx(gt_spans).clamp(0, 1)
+                target_xx[batch_idx] = gt_xx[best_gt_idx[batch_idx]]
+
+            weights = best_base_iou[positive].detach().clamp(min=0.1)
+            normalizer = weights.sum().clamp(min=1e-6)
+            boundary = F.smooth_l1_loss(
+                refined_xx[positive],
+                target_xx[positive],
+                reduction="none",
+                beta=1.0 / float(self.max_v_l),
+            ).mean(dim=-1)
+            giou = 1 - torch.diag(generalized_temporal_iou(
+                refined_xx[positive], target_xx[positive]
+            ))
+            loss_boundary = (boundary * weights).sum() / normalizer
+            loss_giou = (giou * weights).sum() / normalizer
+        else:
+            loss_boundary = zero
+            loss_giou = zero
+
+        quality_prob = quality_logits.sigmoid()
+        quality_positive = quality_target > 0
+        quality_weight = torch.where(
+            quality_positive,
+            quality_target,
+            self.vfl_alpha * quality_prob.pow(self.vfl_gamma),
+        )
+        quality_bce = F.binary_cross_entropy_with_logits(
+            quality_logits, quality_target, reduction="none"
+        )
+        loss_quality = (quality_bce * quality_weight).sum() / quality_weight.sum().clamp(min=1e-6)
+        return {
+            "loss_stage2_boundary": loss_boundary,
+            "loss_stage2_giou": loss_giou,
+            "loss_stage2_quality": loss_quality,
+        }
+
     def _hungarian_quality_targets(self, outputs, targets, indices):
         src_logits = outputs['pred_logits']
         target_quality = src_logits.new_zeros(src_logits.shape[:2])
@@ -1175,6 +1481,7 @@ class SetCriterion(nn.Module):
             "labels": self.loss_labels,
             "contrastive_align": self.loss_contrastive_align,
             "saliency": self.loss_saliency,
+            "stage2": self.loss_stage2,
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
         return loss_map[loss](outputs, targets, indices, **kwargs)
@@ -1231,7 +1538,7 @@ class SetCriterion(nn.Module):
                     losses_target = ["saliency"]    
                 # for loss in self.losses:
                 for loss in losses_target:
-                    if loss in ("saliency", "contrastive_align"):  # final layer only
+                    if loss in ("saliency", "contrastive_align", "stage2"):  # final layer only
                         continue
                     kwargs = {}
                     if loss == "labels":
@@ -1319,76 +1626,6 @@ class Conv1DLayer(nn.Module):
         return x  # (N, L, D)
 
 
-class TemporalCompensationBlock(nn.Module):
-    """Mask-safe temporal refinement for video features shaped as (N, L, D)."""
-
-    def __init__(self, dim, dropout=0.1):
-        super().__init__()
-        self.norm = nn.BatchNorm1d(dim)
-        self.dwconv1 = nn.Conv1d(
-            dim,
-            dim,
-            kernel_size=3,
-            padding=1,
-            groups=dim,
-            bias=True,
-        )
-        self.bn1 = nn.BatchNorm1d(dim)
-
-        self.dwconv2 = nn.Conv1d(
-            dim,
-            dim,
-            kernel_size=3,
-            padding=2,
-            dilation=2,
-            groups=dim,
-            bias=True,
-        )
-        self.bn2 = nn.BatchNorm1d(dim)
-
-        self.pointwise = nn.Sequential(
-            nn.Conv1d(dim, dim * 4, kernel_size=1),
-            nn.BatchNorm1d(dim * 4),
-            nn.ReLU(),
-            nn.Conv1d(dim * 4, dim, kernel_size=1),
-        )
-        self.gate = nn.Sequential(
-            nn.Linear(dim * 3, dim),
-            nn.Sigmoid(),
-        )
-
-    def forward(self, x, mask):
-        """Apply gated temporal compensation with mask semantics 1=valid, 0=pad."""
-        valid = mask.bool().unsqueeze(-1)
-        valid_f = valid.to(dtype=x.dtype)
-
-        z = x * valid_f
-
-        prev_z = torch.cat([z[:, :1], z[:, :-1]], dim=1)
-        next_z = torch.cat([z[:, 1:], z[:, -1:]], dim=1)
-
-        prev_valid = torch.cat([valid[:, :1], valid[:, :-1]], dim=1)
-        next_valid = torch.cat([valid[:, 1:], valid[:, -1:]], dim=1)
-        prev_valid_f = prev_valid.to(dtype=x.dtype)
-        next_valid_f = next_valid.to(dtype=x.dtype)
-
-        delta_prev = (z - prev_z) * valid_f * prev_valid_f
-        delta_next = (next_z - z) * valid_f * next_valid_f
-
-        motion_feat = torch.cat([z, delta_prev, delta_next], dim=-1)
-        gate = self.gate(motion_feat) * valid_f
-
-        y = z.transpose(1, 2)
-        y = F.relu(self.bn1(self.dwconv1(y))) + F.relu(self.bn2(self.dwconv2(y)))
-        y = self.pointwise(y)
-        y = y.transpose(1, 2)
-        y = y * valid_f
-
-        comp = self.norm((gate * y).transpose(1, 2)).transpose(1, 2)
-        out = comp + x
-        return out * valid_f
-
-
 def build_model(args):
     # the `num_classes` naming here is somewhat misleading.
     # it indeed corresponds to `max_obj_id + 1`, where max_obj_id
@@ -1410,9 +1647,20 @@ def build_model(args):
     query_init = getattr(args, "query_init", "random")
     query_anchor_widths = getattr(args, "query_anchor_widths", None)
     video_input_proj = getattr(args, "video_input_proj", "linear")
-    use_temporal_comp = getattr(args, "use_temporal_comp", False)
     if fdr_min_ref_width is not None and fdr_min_ref_width <= 0:
         fdr_min_ref_width = 1.0 / float(args.max_v_l)
+
+    use_stage2 = getattr(args, "use_stage2", False)
+    stage2_dim = getattr(args, "stage2_dim", 128)
+    stage2_inner_bins = getattr(args, "stage2_inner_bins", 4)
+    stage2_boundary_samples = getattr(args, "stage2_boundary_samples", 2)
+    stage2_max_shift_clips = getattr(args, "stage2_max_shift_clips", 1)
+    stage2_shift_frac = getattr(args, "stage2_shift_frac", 0.0)
+    stage2_joint_epoch = getattr(args, "stage2_joint_epoch", 30)
+    if use_stage2 and args.span_loss_type not in ("l1", "dfl", "fdr"):
+        raise ValueError("Stage 2 requires span_loss_type l1, dfl, or fdr.")
+    if use_stage2 and args.dset_name == "tvsum":
+        raise ValueError("Stage 2 is only supported for matcher-based VMR training.")
 
     if args.a_feat_dir is None:
         model = VMRDETR(
@@ -1436,9 +1684,15 @@ def build_model(args):
             use_txt_pos=args.use_txt_pos,
             n_input_proj=args.n_input_proj,
             video_input_proj=video_input_proj,
-            use_temporal_comp=use_temporal_comp,
             query_init=query_init,
             query_anchor_widths=query_anchor_widths,
+            use_stage2=use_stage2,
+            stage2_dim=stage2_dim,
+            stage2_inner_bins=stage2_inner_bins,
+            stage2_boundary_samples=stage2_boundary_samples,
+            stage2_max_shift_clips=stage2_max_shift_clips,
+            stage2_shift_frac=stage2_shift_frac,
+            stage2_joint_epoch=stage2_joint_epoch,
         )
     else:
         model = VMRDETR(
@@ -1463,9 +1717,15 @@ def build_model(args):
             use_txt_pos=args.use_txt_pos,
             n_input_proj=args.n_input_proj,
             video_input_proj=video_input_proj,
-            use_temporal_comp=use_temporal_comp,
             query_init=query_init,
             query_anchor_widths=query_anchor_widths,
+            use_stage2=use_stage2,
+            stage2_dim=stage2_dim,
+            stage2_inner_bins=stage2_inner_bins,
+            stage2_boundary_samples=stage2_boundary_samples,
+            stage2_max_shift_clips=stage2_max_shift_clips,
+            stage2_shift_frac=stage2_shift_frac,
+            stage2_joint_epoch=stage2_joint_epoch,
         )
 
     matching_type = getattr(args, "matching_type", "hungarian")
@@ -1494,11 +1754,23 @@ def build_model(args):
         weight_dict["loss_golsd"] = go_lsd_loss_coef
     if args.contrastive_align_loss:
         weight_dict["loss_contrastive_align"] = args.contrastive_align_loss_coef
+    stage2_boundary_loss_coef = getattr(args, "stage2_boundary_loss_coef", 0.0)
+    stage2_giou_loss_coef = getattr(args, "stage2_giou_loss_coef", 0.0)
+    stage2_quality_loss_coef = getattr(args, "stage2_quality_loss_coef", 0.0)
+    if stage2_boundary_loss_coef > 0:
+        weight_dict["loss_stage2_boundary"] = stage2_boundary_loss_coef
+    if stage2_giou_loss_coef > 0:
+        weight_dict["loss_stage2_giou"] = stage2_giou_loss_coef
+    if stage2_quality_loss_coef > 0:
+        weight_dict["loss_stage2_quality"] = stage2_quality_loss_coef
     # TODO this is a hack
     if args.aux_loss:
         aux_excluded_losses = {
             "loss_saliency",
             "loss_contrastive_align",
+            "loss_stage2_boundary",
+            "loss_stage2_giou",
+            "loss_stage2_quality",
         }
         aux_weight_dict = {}
         for i in range(args.dec_layers - 1):
@@ -1511,6 +1783,17 @@ def build_model(args):
     losses = ['spans', 'labels', 'saliency']
     if args.contrastive_align_loss:
         losses += ["contrastive_align"]
+    stage2_loss_enabled = any(
+        coef > 0 for coef in (
+            stage2_boundary_loss_coef,
+            stage2_giou_loss_coef,
+            stage2_quality_loss_coef,
+        )
+    )
+    if stage2_loss_enabled:
+        if not use_stage2:
+            raise ValueError("Stage 2 loss coefficients require --use_stage2.")
+        losses += ["stage2"]
         
     # For tvsum dataset
     use_matcher = not (args.dset_name == 'tvsum')
@@ -1550,6 +1833,11 @@ def build_model(args):
         hardneg_loss_coef=getattr(args, "hardneg_loss_coef", 0.0),
         hardneg_warmup_epoch=getattr(args, "hardneg_warmup_epoch", 0),
         hardneg_ramp_epoch=getattr(args, "hardneg_ramp_epoch", -1),
+        stage2_boundary_loss_coef=stage2_boundary_loss_coef,
+        stage2_giou_loss_coef=stage2_giou_loss_coef,
+        stage2_quality_loss_coef=stage2_quality_loss_coef,
+        stage2_positive_iou=getattr(args, "stage2_positive_iou", 0.2),
+        stage2_start_epoch=getattr(args, "stage2_start_epoch", 10),
     )
     criterion.to(device)
     return model, criterion

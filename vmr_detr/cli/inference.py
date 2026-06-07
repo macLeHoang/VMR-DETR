@@ -99,6 +99,9 @@ def eval_epoch_post_processing(submission, opt, gt_data, save_submission_filenam
 @torch.no_grad()
 def compute_hl_results(model, eval_loader, opt, epoch_i=None, criterion=None, tb_writer=None):
     model.eval()
+    model_for_epoch = model.module if hasattr(model, "module") else model
+    if hasattr(model_for_epoch, "set_epoch"):
+        model_for_epoch.set_epoch(0 if epoch_i is None else epoch_i + 1)
     if criterion:
         assert eval_loader.dataset.load_labels
         criterion.eval()
@@ -187,6 +190,9 @@ def compute_hl_results(model, eval_loader, opt, epoch_i=None, criterion=None, tb
 @torch.no_grad()
 def compute_mr_results(model, eval_loader, opt, epoch_i=None, criterion=None, tb_writer=None):
     model.eval()
+    model_for_epoch = model.module if hasattr(model, "module") else model
+    if hasattr(model_for_epoch, "set_epoch"):
+        model_for_epoch.set_epoch(0 if epoch_i is None else epoch_i + 1)
     if criterion:
         assert eval_loader.dataset.load_labels
         criterion.eval()
@@ -204,9 +210,17 @@ def compute_mr_results(model, eval_loader, opt, epoch_i=None, criterion=None, tb
         else:
             model_inputs, targets = prepare_batch_inputs_audio(batch[1], opt.device, non_blocking=opt.pin_memory)
         outputs = model(**model_inputs)
-        scores = outputs["pred_logits"].squeeze(-1).sigmoid()  # (batch_size, #queries)
+        use_stage2 = (
+            getattr(opt, "stage2_at_inference", False)
+            and "refined_scores" in outputs
+            and "refined_spans" in outputs
+        )
+        if use_stage2:
+            scores = outputs["refined_scores"]
+        else:
+            scores = outputs["pred_logits"].squeeze(-1).sigmoid()  # (batch_size, #queries)
         if opt.span_loss_type in ("l1", "dfl", "fdr"):
-            pred_spans = outputs["pred_spans"]  # (bsz, #queries, 2)
+            pred_spans = outputs["refined_spans"] if use_stage2 else outputs["pred_spans"]
             _saliency_scores = outputs["saliency_scores"].half()  # (bsz, L)
             saliency_scores = []
             valid_vid_lengths = model_inputs["src_vid_mask"].sum(1).cpu().tolist()

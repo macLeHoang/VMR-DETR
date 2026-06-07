@@ -52,6 +52,9 @@ def train_epoch(
     logger.info(f"[Epoch {epoch_i+1}]")
     model.train()
     criterion.train()
+    model_for_epoch = model.module if hasattr(model, "module") else model
+    if hasattr(model_for_epoch, "set_epoch"):
+        model_for_epoch.set_epoch(epoch_i + 1)
     if hasattr(criterion, "set_epoch"):
         criterion.set_epoch(epoch_i + 1)
 
