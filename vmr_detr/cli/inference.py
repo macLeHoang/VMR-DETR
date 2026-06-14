@@ -272,7 +272,7 @@ def compute_mr_results(model, eval_loader, opt, epoch_i=None, criterion=None, tb
     post_processor = PostProcessorDETR(
         clip_length=opt.clip_length, min_ts_val=0, max_ts_val=150,
         min_w_l=2, max_w_l=150, move_window_method="left",
-        process_func_names=("clip_ts", "round_multiple")
+        process_func_names=("clip_ts",)
     )
     mr_res = post_processor(mr_res)
     return mr_res, loss_meters

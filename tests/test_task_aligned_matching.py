@@ -2,7 +2,7 @@ import unittest
 
 import torch
 
-from vmr_detr.modeling.matcher import HungarianMatcher, TaskAlignedMatcher
+from vmr_detr.modeling.matcher import HungarianMatcher, OneToManyMatcher, TaskAlignedMatcher
 from vmr_detr.modeling.model import (
     Conv1DLayer,
     LinearLayer,
@@ -11,6 +11,7 @@ from vmr_detr.modeling.model import (
     _decode_fdr_cumulative_outputs,
     fdr_logits_to_spans,
     fdr_offset_support,
+    init_shifted_temporal_queries,
     init_temporal_queries,
 )
 from vmr_detr.ops.span_utils import span_xx_to_cxw
@@ -43,14 +44,15 @@ class _DummyTransformer(torch.nn.Module):
 
 
 class _CaptureTransformer(torch.nn.Module):
-    def __init__(self, hidden_dim):
+    def __init__(self, hidden_dim, num_layers=1):
         super().__init__()
         self.d_model = hidden_dim
         self.nhead = 1
+        self.num_layers = num_layers
         self.calls = []
 
     def forward(self, src, mask, query_embed, pos_embed,
-                video_length=None, level1_length=None):
+                video_length=None, level1_length=None, query_attn_mask=None):
         bsz, total_length, hidden_dim = src.shape
         video_length = int(video_length)
         level1_length = int(level1_length)
@@ -61,11 +63,21 @@ class _CaptureTransformer(torch.nn.Module):
             src=src.detach().cpu().clone(),
             mask=mask.detach().cpu().clone(),
             pos_shape=tuple(pos_embed.shape),
+            query_shape=tuple(query_embed.shape),
+            query_attn_mask=(
+                None
+                if query_attn_mask is None
+                else query_attn_mask.detach().cpu().clone()
+            ),
             video_length=video_length,
             level1_length=level1_length,
         ))
-        hs = torch.zeros(1, bsz, num_queries, hidden_dim, device=src.device)
-        refs = torch.full((1, bsz, num_queries, 2), 0.5, device=src.device)
+        hs = torch.zeros(
+            self.num_layers, bsz, num_queries, hidden_dim, device=src.device
+        )
+        refs = torch.full(
+            (self.num_layers, bsz, num_queries, 2), 0.5, device=src.device
+        )
         vid_mem = torch.zeros(bsz, level1_length, hidden_dim, device=src.device)
         memory_global = torch.zeros(bsz, hidden_dim, device=src.device)
         txt_mem = torch.zeros(bsz, txt_length, hidden_dim, device=src.device)
@@ -190,6 +202,29 @@ class TemporalQueryInitTest(unittest.TestCase):
         self.assertEqual(model.query_init, "temporal_anchors")
         self.assertTrue(torch.allclose(model.query_embed.weight.detach().sigmoid(), expected_refs, atol=1e-6))
 
+    def test_hybrid_temporal_queries_use_distinct_shifted_references(self):
+        model = VMRDETR(
+            transformer=_DummyTransformer(hidden_dim=4),
+            position_embed=None,
+            txt_position_embed=None,
+            txt_dim=4,
+            vid_dim=4,
+            num_queries=4,
+            input_dropout=0.0,
+            max_v_l=75,
+            n_input_proj=1,
+            query_init="temporal_anchors",
+            use_hybrid_queries=True,
+            hybrid_one_to_many_queries=4,
+        )
+
+        primary_refs = model.query_embed.weight.detach().sigmoid()
+        hybrid_refs = model.one_to_many_query_embed.weight.detach().sigmoid()
+        expected_hybrid_refs = init_shifted_temporal_queries(4).sigmoid()
+
+        self.assertTrue(torch.allclose(hybrid_refs, expected_hybrid_refs, atol=1e-6))
+        self.assertFalse(torch.allclose(primary_refs, hybrid_refs))
+
     def test_invalid_query_init_raises(self):
         with self.assertRaisesRegex(ValueError, "query_init"):
             VMRDETR(
@@ -254,6 +289,75 @@ class VideoInputProjectionTest(unittest.TestCase):
     def test_invalid_video_input_projection_raises(self):
         with self.assertRaisesRegex(ValueError, "video_input_proj"):
             self._build_model(video_input_proj="unsupported")
+
+
+class HybridQueryModelTest(unittest.TestCase):
+    def _build_model(self):
+        transformer = _CaptureTransformer(hidden_dim=4, num_layers=3)
+        model = VMRDETR(
+            transformer=transformer,
+            position_embed=_ZeroPosition(),
+            txt_position_embed=None,
+            txt_dim=4,
+            vid_dim=4,
+            num_queries=2,
+            input_dropout=0.0,
+            aux_loss=True,
+            max_v_l=75,
+            n_input_proj=1,
+            use_hybrid_queries=True,
+            hybrid_one_to_many_queries=3,
+        )
+        return model, transformer
+
+    @staticmethod
+    def _inputs():
+        return (
+            torch.randn(1, 3, 4),
+            torch.ones(1, 3),
+            torch.randn(1, 5, 4),
+            torch.ones(1, 5),
+        )
+
+    def test_training_uses_isolated_primary_and_one_to_many_query_groups(self):
+        model, transformer = self._build_model()
+        model.train()
+
+        outputs = model(*self._inputs())
+        call = transformer.calls[0]
+        attn_mask = call["query_attn_mask"]
+
+        self.assertEqual(call["query_shape"], (5, 2))
+        self.assertEqual(attn_mask.shape, (5, 5))
+        self.assertFalse(attn_mask[:2, :2].any())
+        self.assertFalse(attn_mask[2:, 2:].any())
+        self.assertTrue(attn_mask[:2, 2:].all())
+        self.assertTrue(attn_mask[2:, :2].all())
+        self.assertEqual(outputs["pred_logits"].shape, (1, 2, 1))
+        self.assertEqual(
+            outputs["one_to_many_outputs"]["pred_logits"].shape, (1, 3, 1)
+        )
+        self.assertEqual(len(outputs["aux_outputs"]), 2)
+        self.assertEqual(len(outputs["one_to_many_aux_outputs"]), 2)
+        self.assertEqual(outputs["aux_outputs"][0]["pred_spans"].shape, (1, 2, 2))
+        self.assertEqual(
+            outputs["one_to_many_aux_outputs"][0]["pred_spans"].shape,
+            (1, 3, 2),
+        )
+
+    def test_evaluation_decodes_only_primary_queries(self):
+        model, transformer = self._build_model()
+        model.eval()
+
+        with torch.no_grad():
+            outputs = model(*self._inputs())
+        call = transformer.calls[0]
+
+        self.assertEqual(call["query_shape"], (2, 2))
+        self.assertIsNone(call["query_attn_mask"])
+        self.assertEqual(outputs["pred_logits"].shape, (1, 2, 1))
+        self.assertNotIn("one_to_many_outputs", outputs)
+        self.assertNotIn("one_to_many_aux_outputs", outputs)
 
 
 class SingleLevelVideoMemoryTest(unittest.TestCase):
@@ -439,6 +543,58 @@ class TaskAlignedCriterionTest(unittest.TestCase):
         self.assertIn("loss_span", losses)
         self.assertIn("loss_giou", losses)
         self.assertTrue(torch.isfinite(losses["loss_label"]))
+
+    def test_hybrid_branch_uses_separate_one_to_many_losses(self):
+        primary = {
+            "pred_logits": torch.zeros(1, 1, 1),
+            "pred_spans": _cxw([[0.2, 0.8]]).unsqueeze(0),
+        }
+        one_to_many = {
+            "pred_logits": torch.zeros(1, 2, 1),
+            "pred_spans": _cxw([[0.2, 0.8], [0.1, 0.7]]).unsqueeze(0),
+        }
+        outputs = {
+            **primary,
+            "aux_outputs": [dict(primary)],
+            "one_to_many_outputs": one_to_many,
+            "one_to_many_aux_outputs": [dict(one_to_many)],
+        }
+        targets = {"span_labels": [dict(spans=_cxw([[0.2, 0.8]]))]}
+        criterion = self._criterion(
+            HungarianMatcher(),
+            "hungarian",
+            one_to_many_matcher=OneToManyMatcher(topk=2),
+        )
+
+        losses = criterion(outputs, targets)
+
+        for key in (
+            "loss_span",
+            "loss_label",
+            "loss_span_o2m",
+            "loss_giou_o2m",
+            "loss_label_o2m",
+            "loss_span_o2m_0",
+            "loss_label_o2m_0",
+        ):
+            self.assertIn(key, losses)
+            self.assertTrue(torch.isfinite(losses[key]))
+        self.assertGreater(losses["loss_span_o2m"].item(), 0.0)
+
+    def test_hybrid_branch_requires_one_to_many_matcher(self):
+        outputs = {
+            "pred_logits": torch.zeros(1, 1, 1),
+            "pred_spans": _cxw([[0.2, 0.8]]).unsqueeze(0),
+            "one_to_many_outputs": {
+                "pred_logits": torch.zeros(1, 2, 1),
+                "pred_spans": _cxw([[0.2, 0.8], [0.1, 0.7]]).unsqueeze(0),
+            },
+        }
+        targets = {"span_labels": [dict(spans=_cxw([[0.2, 0.8]]))]}
+        criterion = self._criterion(HungarianMatcher(), "hungarian")
+
+        with self.assertRaisesRegex(ValueError, "one_to_many_matcher"):
+            criterion(outputs, targets)
 
     def test_hungarian_quality_targets_use_softened_matched_iou_after_ramp(self):
         outputs = {

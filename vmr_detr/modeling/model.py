@@ -1543,7 +1543,7 @@ class SetCriterion(nn.Module):
                     kwargs = {}
                     if loss == "labels":
                         kwargs["matching_type"] = "hungarian"
-                        kwargs["use_quality_label_loss"] = False
+                        # kwargs["use_quality_label_loss"] = False
                     loss_indices = indices_go if go_lsd_active and loss == "spans" else aux_indices
                     l_dict = self.get_loss(loss, aux_outputs, targets, loss_indices, **kwargs)
                     l_dict = {k + f'_{i}': v for k, v in l_dict.items()}

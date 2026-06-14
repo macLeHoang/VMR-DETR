@@ -1,8 +1,4 @@
-import pprint
-import numpy as np
 import torch
-from utils.basic_utils import load_jsonl
-from standalone_eval.eval import eval_submission
 from tqdm import tqdm
 
 
@@ -25,14 +21,17 @@ class PostProcessorDETR:
 
     def __call__(self, lines):
         processed_lines = []
-        for line in tqdm(lines, desc=f"convert to multiples of clip_length={self.clip_length}"):
+        for line in tqdm(lines, desc="post-process temporal windows"):
             windows_and_scores = torch.tensor(line["pred_relevant_windows"])
             windows = windows_and_scores[:, :2]
             for func_name in self.process_func_names:
                 windows = self.name2func[func_name](windows)
             line["pred_relevant_windows"] = torch.cat(
                 [windows, windows_and_scores[:, 2:3]], dim=1).tolist()
-            line["pred_relevant_windows"] = [e[:2] + [float(f"{e[2]:.4f}")] for e in line["pred_relevant_windows"]]
+            line["pred_relevant_windows"] = [
+                [float(f"{e[0]:.4f}"), float(f"{e[1]:.4f}"), float(f"{e[2]:.4f}")]
+                for e in line["pred_relevant_windows"]
+            ]
             processed_lines.append(line)
         return processed_lines
 
@@ -52,7 +51,7 @@ class PostProcessorDETR:
 
     def clip_window_lengths(self, windows):
         """
-        windows: (#windows, 2)  np.ndarray
+        windows: (#windows, 2) torch.Tensor
         ensure the final window duration are within [self.min_w_l, self.max_w_l]
         """
         window_lengths = windows[:, 1] - windows[:, 0]

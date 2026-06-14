@@ -307,6 +307,8 @@ class TestStage2ModelIntegration(unittest.TestCase):
             fdr_reg_scale=1.5, fdr_min_ref_width=None,
             query_init="random", query_anchor_widths=None,
             video_input_proj="linear",
+            use_hybrid_queries=False, hybrid_one_to_many_queries=10,
+            hybrid_one_to_many_k=2, hybrid_one_to_many_loss_coef=1.0,
             use_stage2=use_stage2, stage2_dim=16, stage2_inner_bins=2,
             stage2_boundary_samples=1, stage2_max_shift_clips=1.0, stage2_shift_frac=0.0,
             stage2_positive_iou=0.2, stage2_start_epoch=10,
@@ -359,6 +361,37 @@ class TestStage2ModelIntegration(unittest.TestCase):
         self.assertIn("loss_stage2_boundary", criterion.weight_dict)
         self.assertIn("loss_stage2_giou", criterion.weight_dict)
         self.assertIn("loss_stage2_quality", criterion.weight_dict)
+
+    def test_hybrid_queries_run_through_real_decoder_and_keep_primary_outputs(self):
+        args = self._args(use_stage2=False)
+        args.use_hybrid_queries = True
+        args.hybrid_one_to_many_queries = 3
+        args.hybrid_one_to_many_k = 2
+        args.hybrid_one_to_many_loss_coef = 0.5
+        model, criterion = build_model(args)
+        model.train()
+
+        outputs = model(
+            torch.randn(1, 4, 32), torch.ones(1, 4, dtype=torch.bool),
+            torch.randn(1, 12, 32), torch.ones(1, 12),
+        )
+
+        self.assertEqual(outputs["pred_logits"].shape, (1, 5, 1))
+        self.assertEqual(
+            outputs["one_to_many_outputs"]["pred_logits"].shape,
+            (1, 3, 1),
+        )
+        self.assertAlmostEqual(
+            criterion.weight_dict["loss_label_o2m"],
+            0.5 * criterion.weight_dict["loss_label"],
+        )
+        losses = criterion(
+            outputs,
+            {"span_labels": [{"spans": torch.tensor([[0.5, 0.4]])}]},
+        )
+        for key in ("loss_fgl_o2m", "loss_giou_o2m", "loss_label_o2m"):
+            self.assertIn(key, losses)
+            self.assertTrue(torch.isfinite(losses[key]))
 
 
 if __name__ == "__main__":
