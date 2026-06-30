@@ -17,6 +17,13 @@ v_feat_types=slowfast_clip
 t_feat_types=clip
 v_feat_len_mode=min
 
+# Data augmentation
+temporal_aug_prob=0.5
+temporal_aug_min_keep=0.5
+context_extend_prob=0.5
+context_extend_max_frac=1.0
+aug_stop_epoch=30
+
 # Video features
 v_feat_dim=0
 v_feat_dirs=()
@@ -152,6 +159,11 @@ PYTHONPATH="${PYTHONPATH}:." python vmr_detr/cli/train.py \
   --t_feat_dir "${t_feat_dirs[@]}" \
   --t_feat_dim "${t_feat_dim}" \
   --v_feat_len_mode "${v_feat_len_mode}" \
+  --temporal_aug_prob "${temporal_aug_prob}" \
+  --temporal_aug_min_keep "${temporal_aug_min_keep}" \
+  --context_extend_prob "${context_extend_prob}" \
+  --context_extend_max_frac "${context_extend_max_frac}" \
+  --aug_stop_epoch "${aug_stop_epoch}" \
   --results_root "${results_root}" \
   --exp_id "${exp_id}" \
   --input_dropout "${input_dropout}" \

@@ -27,6 +27,13 @@ def set_seed(seed, use_cuda=True):
         torch.cuda.manual_seed_all(seed)
 
 
+def has_nonuniform_weights(weights, atol=1e-12):
+    if weights is None or len(weights) == 0:
+        return False
+    first = float(weights[0])
+    return any(abs(float(w) - first) > atol for w in weights[1:])
+
+
 def _format_float(value, precision=4):
     try:
         return f"{float(value):.{precision}f}"
@@ -286,6 +293,12 @@ def build_datasets(opt):
             intra_video_hard_neg_ratio=opt.intra_video_hard_neg_ratio,
             intra_video_hardneg_iou_thd=opt.intra_video_hardneg_iou_thd,
             emit_hardneg_labels=(opt.hardneg_loss_coef > 0),
+            temporal_aug_prob=opt.temporal_aug_prob,
+            temporal_aug_min_keep=opt.temporal_aug_min_keep,
+            context_extend_prob=opt.context_extend_prob,
+            context_extend_max_frac=opt.context_extend_max_frac,
+            aug_stop_epoch=opt.aug_stop_epoch,
+            length_balance_bins=tuple(opt.length_balance_bins),
         )
         train_dataset = StartEndDataset(**dataset_config)
     else:
@@ -317,6 +330,8 @@ def build_datasets(opt):
     dataset_config["txt_drop_ratio"] = 0
     if opt.a_feat_dir is None:
         dataset_config["intra_video_hard_neg_ratio"] = 0
+        dataset_config["temporal_aug_prob"] = 0
+        dataset_config["context_extend_prob"] = 0
         eval_dataset = StartEndDataset(**dataset_config)
     else:
         eval_dataset = StartEndDataset_audio(**dataset_config)

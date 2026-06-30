@@ -12,6 +12,15 @@ class BaseOptions(object):
     tensorboard_log_dir = "tensorboard_log"
     train_log_filename = "train.log.txt"
     eval_log_filename = "eval.log.txt"
+    train_resume_data_options = (
+        "temporal_aug_prob",
+        "temporal_aug_min_keep",
+        "context_extend_prob",
+        "context_extend_max_frac",
+        "aug_stop_epoch",
+        "length_balance",
+        "length_balance_bins",
+    )
 
     def __init__(self):
         self.parser = None
@@ -133,6 +142,22 @@ class BaseOptions(object):
                             help="Dropout applied in the transformer")
         parser.add_argument("--txt_drop_ratio", default=0, type=float,
                             help="drop txt_drop_ratio tokens from text input. 0.1=10%")
+        parser.add_argument("--temporal_aug_prob", type=float, default=0.0,
+                            help="Probability of applying temporal crop augmentation per sample. 0 disables.")
+        parser.add_argument("--temporal_aug_min_keep", type=float, default=0.5,
+                            help="Minimum fraction of the video to retain after temporal crop (in clips).")
+        parser.add_argument("--context_extend_prob", type=float, default=0.0,
+                            help="Probability of padding context from another video to reduce normalised GT width. 0 disables.")
+        parser.add_argument("--context_extend_max_frac", type=float, default=1.0,
+                            help="Maximum extra clips to add as a fraction of the current video length.")
+        parser.add_argument("--aug_stop_epoch", type=int, default=0,
+                            help="disable temporal-crop & context-extend after this epoch "
+                                 "(1-indexed, inclusive); 0 = keep aug for the whole run. "
+                                 "With --resume_all, restored from the checkpoint opt.")
+        parser.add_argument("--length_balance", action="store_true",
+                            help="Use WeightedRandomSampler when annotation GT-width bins are non-uniform.")
+        parser.add_argument("--length_balance_bins", type=float, nargs="+", default=[0.1, 0.25],
+                            help="Annotation-width bin edges for length-balanced sampling (normalised GT width thresholds).")
         parser.add_argument("--use_txt_pos", action="store_true", help="use position_embedding for text as well.")
         parser.add_argument('--nheads', default=8, type=int,
                             help="Number of attention heads inside the transformer's attentions")
@@ -325,6 +350,7 @@ class BaseOptions(object):
             # opt.no_core_driver = True
             if opt.eval_results_dir is not None:
                 opt.results_dir = opt.eval_results_dir
+            self._validate_aug_options(opt)
             self._normalize_query_anchor_widths(opt)
             if opt.dfl_num_bins < 2:
                 raise ValueError("--dfl_num_bins must be >= 2.")
@@ -335,6 +361,8 @@ class BaseOptions(object):
             self._validate_tal_options(opt)
             self._validate_stage2_options(opt)
         else:
+            self._restore_train_resume_data_options(opt)
+            self._validate_aug_options(opt)
             self._normalize_query_anchor_widths(opt)
             if opt.dfl_num_bins < 2:
                 raise ValueError("--dfl_num_bins must be >= 2.")
@@ -383,6 +411,34 @@ class BaseOptions(object):
 
         self.opt = opt
         return opt
+
+    @classmethod
+    def _restore_train_resume_data_options(cls, opt):
+        if not getattr(opt, "resume_all", False) or getattr(opt, "resume", None) is None:
+            return
+        checkpoint = torch.load(opt.resume, map_location="cpu", weights_only=False)
+        saved_opt = checkpoint.get("opt")
+        if saved_opt is None:
+            return
+        for name in cls.train_resume_data_options:
+            if isinstance(saved_opt, dict):
+                if name in saved_opt:
+                    setattr(opt, name, saved_opt[name])
+            elif hasattr(saved_opt, name):
+                setattr(opt, name, getattr(saved_opt, name))
+
+    @staticmethod
+    def _validate_aug_options(opt):
+        if not 0.0 <= opt.temporal_aug_prob <= 1.0:
+            raise ValueError("--temporal_aug_prob must be in [0, 1].")
+        if not 0.0 <= opt.context_extend_prob <= 1.0:
+            raise ValueError("--context_extend_prob must be in [0, 1].")
+        if not 0.0 < opt.temporal_aug_min_keep <= 1.0:
+            raise ValueError("--temporal_aug_min_keep must be in (0, 1].")
+        if not opt.context_extend_max_frac >= 0.0:
+            raise ValueError("--context_extend_max_frac must be >= 0.")
+        if opt.aug_stop_epoch < 0:
+            raise ValueError("--aug_stop_epoch must be >= 0 (0 disables the cutoff).")
 
     @staticmethod
     def _normalize_query_anchor_widths(opt):

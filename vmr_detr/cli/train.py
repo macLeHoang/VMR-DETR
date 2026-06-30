@@ -23,6 +23,7 @@ from vmr_detr.cli.train_utils import (
     EMAScheduler,
     ModelEMA,
     build_datasets,
+    has_nonuniform_weights,
     log_validation_summary,
     set_seed,
     should_run_eval,
@@ -57,6 +58,8 @@ def train_epoch(
         model_for_epoch.set_epoch(epoch_i + 1)
     if hasattr(criterion, "set_epoch"):
         criterion.set_epoch(epoch_i + 1)
+    if hasattr(train_loader.dataset, "set_epoch"):
+        train_loader.dataset.set_epoch(epoch_i + 1)
 
     # init meters
     time_meters = defaultdict(AverageMeter)
@@ -208,13 +211,23 @@ def train(model, criterion, optimizer, lr_scheduler, train_dataset, val_dataset,
     opt.train_log_txt_formatter = "{time_str} [Epoch] {epoch:03d} [Loss] {loss_str}\n"
     opt.eval_log_txt_formatter = "{time_str} [Epoch] {epoch:03d} [Loss] {loss_str} [Metrics] {eval_metrics_str}\n"
 
+    train_sampler = None
+    if getattr(opt, "length_balance", False):
+        from torch.utils.data import WeightedRandomSampler
+        weights = train_dataset.get_balance_weights()
+        if has_nonuniform_weights(weights):
+            train_sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+        else:
+            logger.info("Length-balanced sampling skipped because weights are unavailable or uniform.")
+
     if opt.a_feat_dir is None:
         train_loader = DataLoader(
             train_dataset,
             collate_fn=start_end_collate,
             batch_size=opt.bsz,
             num_workers=opt.num_workers,
-            shuffle=True,
+            shuffle=(train_sampler is None),
+            sampler=train_sampler,
             pin_memory=opt.pin_memory
         )
     else:
@@ -223,7 +236,8 @@ def train(model, criterion, optimizer, lr_scheduler, train_dataset, val_dataset,
             collate_fn=start_end_collate_audio,
             batch_size=opt.bsz,
             num_workers=opt.num_workers,
-            shuffle=True,
+            shuffle=(train_sampler is None),
+            sampler=train_sampler,
             pin_memory=opt.pin_memory
         )
 

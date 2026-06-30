@@ -5,6 +5,7 @@ from tqdm import tqdm
 import random
 import logging
 from collections import defaultdict
+from math import ceil, floor
 from os.path import join, exists
 from utils.basic_utils import load_jsonl, l2_normalize_np_array
 from utils.tensor_utils import pad_sequences_1d
@@ -33,7 +34,11 @@ class StartEndDataset(Dataset):
                  clip_len=2, max_windows=5, span_loss_type="l1", txt_drop_ratio=0,
                  dset_domain=None, v_feat_len_mode="min",
                  intra_video_hard_neg_ratio=0.0, intra_video_hardneg_iou_thd=0.1,
-                 emit_hardneg_labels=False):
+                 emit_hardneg_labels=False,
+                 temporal_aug_prob=0.0, temporal_aug_min_keep=0.5,
+                 context_extend_prob=0.0, context_extend_max_frac=1.0,
+                 aug_stop_epoch=0,
+                 length_balance_bins=(0.1, 0.25)):
         self.dset_name = dset_name
         self.data_path = data_path
         self.data_ratio = data_ratio
@@ -58,8 +63,18 @@ class StartEndDataset(Dataset):
         self.intra_video_hard_neg_ratio = intra_video_hard_neg_ratio
         self.intra_video_hardneg_iou_thd = intra_video_hardneg_iou_thd
         self.emit_hardneg_labels = emit_hardneg_labels
+        self.temporal_aug_prob = temporal_aug_prob
+        self.temporal_aug_min_keep = temporal_aug_min_keep
+        self.context_extend_prob = context_extend_prob
+        self.context_extend_max_frac = context_extend_max_frac
+        self.aug_stop_epoch = max(0, int(aug_stop_epoch))
+        self._base_temporal_aug_prob = self.temporal_aug_prob
+        self._base_context_extend_prob = self.context_extend_prob
+        self.length_balance_bins = length_balance_bins
         if "val" in data_path or "test" in data_path:
             assert txt_drop_ratio == 0
+            assert temporal_aug_prob == 0 and context_extend_prob == 0, \
+                "augmentation must be disabled for val/test"
 
         # checks
         assert q_feat_type in self.Q_FEAT_TYPES
@@ -71,7 +86,8 @@ class StartEndDataset(Dataset):
         # build per-video window index for intra-video hard negatives
         self.vid2windows = defaultdict(list)
         for d in self.data:
-            self.vid2windows[d["vid"]].append(d["relevant_windows"])
+            if "relevant_windows" in d:
+                self.vid2windows[d["vid"]].append(d["relevant_windows"])
 
         # load specific domain data for tvsum dataset
         if self.dset_name == 'tvsum':
@@ -89,7 +105,10 @@ class StartEndDataset(Dataset):
         datalist = load_jsonl(self.data_path)
         if self.data_ratio != 1:
             n_examples = int(len(datalist) * self.data_ratio)
-            datalist = datalist[:n_examples]
+            rng = random.Random(42)
+            idx = list(range(len(datalist)))
+            rng.shuffle(idx)
+            datalist = [datalist[i] for i in idx[:n_examples]]
             logger.info("Using {}% of the data: {} examples"
                         .format(self.data_ratio * 100, n_examples))
         return datalist
@@ -105,11 +124,14 @@ class StartEndDataset(Dataset):
             return 0.0
         return inter / union
 
-    def _intra_video_hard_pool(self, vid, cur_window, gt_st, gt_ed, ctx_l, clip_len):
+    def _intra_video_hard_pool(self, vid, cur_window, gt_st, gt_ed, ctx_l, clip_len,
+                                crop_offset_sec=0.0):
         """Return a list of clip indices covered by OTHER moments of the same video.
 
         Excludes clips within the current GT range [gt_st, gt_ed] and excludes
         moments whose seconds-IoU with cur_window exceeds self.intra_video_hardneg_iou_thd.
+        When crop_offset_sec != 0.0, other-moment windows are mapped into the
+        cropped/extended timeline before converting to clip indices.
         """
         hard_clips = set()
         for windows_list in self.vid2windows[vid]:
@@ -117,8 +139,13 @@ class StartEndDataset(Dataset):
                 # false-negative guard: skip moments too similar to the current GT
                 if self._seconds_iou(w, cur_window) > self.intra_video_hardneg_iou_thd:
                     continue
-                w_st = int(w[0] / clip_len)
-                w_ed = min(ctx_l, int(w[1] / clip_len) + 1)
+                w_mapped = [w[0] - crop_offset_sec, w[1] - crop_offset_sec]
+                lo = max(0.0, w_mapped[0])
+                hi = min(ctx_l * clip_len, w_mapped[1])
+                if hi <= lo:
+                    continue
+                w_st = max(0, int(floor(lo / clip_len)))
+                w_ed = min(ctx_l, int(ceil(hi / clip_len)))
                 for ci in range(w_st, w_ed):
                     if ci < gt_st or ci > gt_ed:
                         hard_clips.add(ci)
@@ -132,9 +159,35 @@ class StartEndDataset(Dataset):
 
         model_inputs = dict()
         model_inputs["query_feat"] = self._get_query_feat_by_qid(meta["qid"])  # (Dq, ) or (Lq, Dq)
+
+        # Local copies so augmentation never mutates meta. Unlabeled test
+        # splits do not carry relevant_windows and must stay clean.
+        windows = [list(w) for w in meta["relevant_windows"]] if self.load_labels else None
+        duration = meta.get("duration")
+        timeline_offset_sec = 0.0
+
+        _cropped = False   # FIX 1: always defined before conditional block
+        _extended = False  # FIX 1: always defined before conditional block
+
         if self.use_video:
-            model_inputs["video_feat"] = self._get_video_feat_by_vid(meta["vid"], meta.get("duration"))  # (Lv, Dv)
-            ctx_l = len(model_inputs["video_feat"])
+            video_feat = self._get_video_feat_by_vid(meta["vid"], meta.get("duration"))  # (Lv, Dv)
+            ctx_l = len(video_feat)
+
+            # Apply temporal augmentations before TEF only for label paths
+            # that derive saliency supervision from remapped relevant_windows.
+            aug_label_safe = (
+                self.dset_name in ('charades_sta', 'tacos', 'activitynet', 'nlq')
+                or 'subs_train' in str(getattr(self, 'data_path', ''))
+            )
+            if self.load_labels and windows is not None and self.dset_name != 'tvsum' and aug_label_safe:
+                video_feat, windows, duration, ctx_l, _cropped, crop_offset_delta = self._temporal_crop(
+                    video_feat, windows, duration, ctx_l)
+                timeline_offset_sec += crop_offset_delta
+                video_feat, windows, duration, ctx_l, _extended, extend_offset_delta = self._context_extend(
+                    video_feat, windows, duration, ctx_l, index, meta["vid"])
+                timeline_offset_sec += extend_offset_delta
+
+            model_inputs["video_feat"] = video_feat
         else:
             ctx_l = self.max_v_l
 
@@ -149,24 +202,30 @@ class StartEndDataset(Dataset):
                 model_inputs["video_feat"] = tef
 
         if self.load_labels:
-            if self.dset_name == 'tvsum': 
+            if self.dset_name == 'tvsum':
                 model_inputs["span_labels"] = torch.tensor([[0., 0.]])
                 meta_label = meta['label']
                 model_inputs["saliency_pos_labels"], model_inputs["saliency_neg_labels"], model_inputs["saliency_all_labels"] = \
                             self.get_saliency_labels_all_tvsum(meta_label, ctx_l)
             else:
-                model_inputs["span_labels"] = self.get_span_labels(meta["relevant_windows"], ctx_l)  # (#windows, 2)
+                if windows is None:
+                    windows = [list(w) for w in meta["relevant_windows"]]
+                aug_applied = bool(_cropped or _extended)
+                model_inputs["span_labels"] = self.get_span_labels(  # (#windows, 2)
+                    windows, ctx_l, duration=(duration if aug_applied else None))
 
-                if self.dset_name in ['charades_sta', 'tacos', 'activitynet']: ## charades, tacos, nlq
+                if self.dset_name in ['charades_sta', 'tacos', 'activitynet']:  ## charades, tacos, nlq
                     model_inputs["saliency_pos_labels"], model_inputs["saliency_neg_labels"], model_inputs["saliency_all_labels"], hardneg = \
-                        self.get_saliency_labels_sub_as_query(meta["relevant_windows"][0], meta["duration"], ctx_l,
-                                                              vid=meta["vid"], cur_window=meta["relevant_windows"][0])  # only one gt
+                        self.get_saliency_labels_sub_as_query(windows[0], duration, ctx_l,
+                                                              vid=meta["vid"], cur_window=meta["relevant_windows"][0],
+                                                              crop_offset_sec=timeline_offset_sec)  # only one gt
                     if hardneg is not None:
                         model_inputs["saliency_hardneg_labels"] = hardneg
                 elif self.dset_name in ['nlq']:
                     model_inputs["saliency_pos_labels"], model_inputs["saliency_neg_labels"], model_inputs["saliency_all_labels"], hardneg = \
-                        self.get_saliency_labels_sub_as_query(meta["relevant_windows"][0], meta["duration"], ctx_l, 2,
-                                                              vid=meta["vid"], cur_window=meta["relevant_windows"][0])  # only one gt
+                        self.get_saliency_labels_sub_as_query(windows[0], duration, ctx_l, 2,
+                                                              vid=meta["vid"], cur_window=meta["relevant_windows"][0],
+                                                              crop_offset_sec=timeline_offset_sec)  # only one gt
                     if hardneg is not None:
                         model_inputs["saliency_hardneg_labels"] = hardneg
                 elif "subs_train" not in self.data_path:
@@ -175,15 +234,195 @@ class StartEndDataset(Dataset):
                 else:
                     model_inputs["saliency_pos_labels"], model_inputs["saliency_neg_labels"], model_inputs[
                         "saliency_all_labels"], hardneg = \
-                        self.get_saliency_labels_sub_as_query(meta["relevant_windows"][0], meta["duration"], ctx_l,
-                                                              vid=meta["vid"], cur_window=meta["relevant_windows"][0])  # only one gt
+                        self.get_saliency_labels_sub_as_query(windows[0], duration, ctx_l,
+                                                              vid=meta["vid"], cur_window=meta["relevant_windows"][0],
+                                                              crop_offset_sec=timeline_offset_sec)  # only one gt
                     if hardneg is not None:
                         model_inputs["saliency_hardneg_labels"] = hardneg
-                    
+
         return dict(meta=meta, model_inputs=model_inputs)
 
+    # ------------------------------------------------------------------
+    # Temporal data-augmentation helpers
+    # ------------------------------------------------------------------
 
-    def get_saliency_labels_sub_as_query(self, gt_window, duration, ctx_l, max_n=2, vid=None, cur_window=None):
+    def set_epoch(self, epoch):
+        """One-way-style switch re-derived from the epoch each call: disable
+        temporal augmentation once we pass aug_stop_epoch (1-indexed,
+        inclusive), and keep it at the configured strength otherwise.
+        aug_stop_epoch <= 0 means augmentation stays on for the whole run."""
+        if self.aug_stop_epoch > 0 and epoch > self.aug_stop_epoch:
+            self.temporal_aug_prob = 0.0
+            self.context_extend_prob = 0.0
+        else:
+            self.temporal_aug_prob = self._base_temporal_aug_prob
+            self.context_extend_prob = self._base_context_extend_prob
+
+    def _temporal_crop(self, video_feat, windows, duration, ctx_l):
+        """Randomly crop a temporal subwindow that fully contains the GT moment.
+
+        Returns (feat, windows, duration, ctx_l, cropped_bool, offset_delta_sec).
+        All values are unchanged when the augmentation is disabled or skipped.
+        """
+        if (not self.use_video
+                or self.temporal_aug_prob <= 0
+                or random.random() >= self.temporal_aug_prob):
+            return (video_feat, windows, duration, ctx_l, False, 0.0)
+
+        clip_len = duration / ctx_l
+
+        # GT clip span that MUST be fully retained.
+        gt_st = max(0, int(min(w[0] for w in windows) / clip_len))
+        gt_ed = min(ctx_l, int(ceil(max(w[1] for w in windows) / clip_len)))
+
+        min_len = max(gt_ed - gt_st, int(round(self.temporal_aug_min_keep * ctx_l)))
+
+        # Sample start (call randint first, then end — test depends on this order).
+        start = random.randint(0, gt_st)
+        end_lo = max(gt_ed, start + min_len)
+        if end_lo > ctx_l:
+            # Cannot satisfy constraints; skip augmentation for this sample.
+            return (video_feat, windows, duration, ctx_l, False, 0.0)
+        end = random.randint(end_lo, ctx_l)
+
+        new_feat = video_feat[start:end]
+        offset_sec = start * clip_len
+        new_windows = [
+            [max(0.0, w[0] - offset_sec), min((end - start) * clip_len, w[1] - offset_sec)]
+            for w in windows
+        ]
+        new_ctx_l = end - start
+        new_duration = new_ctx_l * clip_len
+
+        return (new_feat, new_windows, new_duration, new_ctx_l, True, offset_sec)
+
+    def _context_extend(self, video_feat, windows, duration, ctx_l, index, current_vid):
+        """Pad context from a random other sample to reduce normalised GT width.
+
+        Returns (feat, windows, duration, ctx_l, extended_bool, offset_delta_sec).
+        All values are unchanged when the augmentation is disabled or skipped.
+        """
+        context_extend_prob = getattr(self, 'context_extend_prob', 0.0)
+        if (not self.use_video
+                or context_extend_prob <= 0
+                or random.random() >= context_extend_prob):
+            return (video_feat, windows, duration, ctx_l, False, 0.0)
+
+        clip_len = duration / ctx_l
+        max_total = int(getattr(self, 'max_v_l', ctx_l))
+        available = max(0, max_total - ctx_l)
+        if available <= 0:
+            return (video_feat, windows, duration, ctx_l, False, 0.0)
+
+        context_extend_max_frac = getattr(self, 'context_extend_max_frac', 1.0)
+        max_extra = min(available, int(round(context_extend_max_frac * ctx_l)))
+        if max_extra < 1:
+            return (video_feat, windows, duration, ctx_l, False, 0.0)
+
+        extra = random.randint(1, max_extra)
+
+        # Source extra clips from a different video so pasted context cannot
+        # contain same-video annotated positives that labels treat as negatives.
+        candidate_indices = [
+            i for i, item in enumerate(self.data)
+            if i != index and item.get("vid") != current_vid
+        ]
+        if not candidate_indices:
+            return (video_feat, windows, duration, ctx_l, False, 0.0)
+        other_index = random.choice(candidate_indices)
+        other_meta = self.data[other_index]
+        try:
+            other_feat = self._get_video_feat_by_vid(other_meta["vid"], other_meta.get("duration"))
+        except Exception:
+            return (video_feat, windows, duration, ctx_l, False, 0.0)
+
+        # Guard feature-dim mismatch.
+        if len(other_feat) == 0 or other_feat.shape[-1] != video_feat.shape[-1]:
+            return (video_feat, windows, duration, ctx_l, False, 0.0)
+
+        # Tile to reach `extra` clips if the other video is too short.
+        if len(other_feat) < extra:
+            n_repeats = (extra + len(other_feat) - 1) // len(other_feat)
+            other_feat = other_feat.repeat(n_repeats, 1)
+        other_feat = other_feat[:extra]
+
+        # Random left/right split.
+        left_extra = random.randint(0, extra)
+        right_extra = extra - left_extra
+
+        parts = []
+        if left_extra > 0:
+            parts.append(other_feat[:left_extra])
+        parts.append(video_feat)
+        if right_extra > 0:
+            parts.append(other_feat[left_extra:])
+
+        new_feat = torch.cat(parts, dim=0)
+        offset = left_extra * clip_len
+        new_ctx_l = len(new_feat)
+        new_duration = new_ctx_l * clip_len
+        new_windows = [
+            [max(0.0, w[0] + offset), min(new_duration, w[1] + offset)]
+            for w in windows
+        ]
+
+        return (new_feat, new_windows, new_duration, new_ctx_l, True, -offset)
+
+    # ------------------------------------------------------------------
+    # Length-balanced sampling weight
+    # ------------------------------------------------------------------
+
+    def get_balance_weights(self):
+        """Return per-sample inverse-frequency weights based on normalised GT width.
+
+        Bins are defined by self.length_balance_bins edges (default (0.1, 0.25)):
+            bin 0 (short):  w_norm < 0.1
+            bin 1 (medium): 0.1 <= w_norm < 0.25
+            bin 2 (long):   w_norm >= 0.25
+        weight_i = total / (num_bins * count_in_bin_of_i).
+        Samples whose metadata is missing or has zero duration get weight 1.0.
+        Return None for datasets where length balancing should be skipped.
+        """
+        if self.dset_name == 'tvsum':
+            return None
+
+        bin_edges = sorted(getattr(self, 'length_balance_bins', (0.1, 0.25)))
+        num_bins = len(bin_edges) + 1
+
+        bin_indices = []
+        for meta in self.data:
+            try:
+                ws = meta["relevant_windows"]
+                dur = float(meta["duration"])
+                if dur <= 0:
+                    bin_indices.append(-1)
+                    continue
+                w_norm = sum((w[1] - w[0]) for w in ws) / (len(ws) * dur)
+                b = 0
+                for edge in bin_edges:
+                    if w_norm >= edge:
+                        b += 1
+                bin_indices.append(b)
+            except (KeyError, IndexError, ZeroDivisionError, TypeError, ValueError):
+                bin_indices.append(-1)
+
+        total = len(self.data)
+        bin_counts = [0] * num_bins
+        for b in bin_indices:
+            if 0 <= b < num_bins:
+                bin_counts[b] += 1
+
+        weights = []
+        for b in bin_indices:
+            if b < 0 or bin_counts[b] == 0:
+                weights.append(1.0)
+            else:
+                weights.append(total / (num_bins * bin_counts[b]))
+        return weights
+
+
+    def get_saliency_labels_sub_as_query(self, gt_window, duration, ctx_l, max_n=2, vid=None,
+                                          cur_window=None, crop_offset_sec=0.0):
         clip_len = duration / ctx_l
         gt_st = int(gt_window[0] / clip_len)
         gt_ed = max(0, min(int(gt_window[1] / clip_len), ctx_l) - 1)
@@ -206,7 +445,8 @@ class StartEndDataset(Dataset):
                           (self.intra_video_hard_neg_ratio > 0 or self.emit_hardneg_labels))
         if need_hard_pool:
             _cur_window = cur_window if cur_window is not None else gt_window
-            hard_pool = self._intra_video_hard_pool(vid, _cur_window, gt_st, gt_ed, ctx_l, clip_len)
+            hard_pool = self._intra_video_hard_pool(vid, _cur_window, gt_st, gt_ed, ctx_l, clip_len,
+                                                     crop_offset_sec=crop_offset_sec)
 
         # Level A: mix hard negatives into the existing neg_clip_indices slots.
         # When Level A is inactive, preserve the exact original sampling (without
@@ -291,28 +531,21 @@ class StartEndDataset(Dataset):
         agg_scores = np.sum(scores, 1)  # (#rel_clips, )
         sort_indices = np.argsort(agg_scores)  # increasing
 
-        # score_array = [min(agg_scores[idx], ctx_l-1) for idx in range(ctx_l)]
+        # FIX 2: clamp all ids to [0, ctx_l-1]; score_array stays exactly length ctx_l
+        rel = [min(max(int(c), 0), ctx_l - 1) for c in rel_clip_ids]
         score_array = np.zeros(ctx_l)
-        for idx in range(len(rel_clip_ids)):
-            if rel_clip_ids[idx] >= ctx_l:
-                score_array_new = np.zeros(ctx_l + 1)
-                score_array_new[:ctx_l] = score_array
-                score_array = score_array_new
-            # if rel_clip_ids[idx] == ctx_l:
-            #     print(rel_clip_ids[idx], ctx_l)
-            score_array[rel_clip_ids[idx]] = agg_scores[idx]
+        for idx in range(len(rel)):
+            score_array[rel[idx]] = agg_scores[idx]
 
         # indices in the whole video
-        # the min(_, ctx_l-1) here is incorrect, but should not cause
-        # much troubles since this should be rarely used.
-        hard_pos_clip_indices = [min(rel_clip_ids[idx], ctx_l-1) for idx in sort_indices[-max_n:]]
-        hard_neg_clip_indices = [min(rel_clip_ids[idx], ctx_l-1) for idx in sort_indices[:max_n]]
+        hard_pos_clip_indices = [rel[idx] for idx in sort_indices[-max_n:]]
+        hard_neg_clip_indices = [rel[idx] for idx in sort_indices[:max_n]]
         easy_pos_clip_indices = []
         easy_neg_clip_indices = []
         if add_easy_negative:
-            easy_neg_pool = list(set(range(ctx_l)) - set(rel_clip_ids))
+            easy_neg_pool = list(set(range(ctx_l)) - set(rel))
             if len(easy_neg_pool) >= max_n:
-                easy_pos_clip_indices = random.sample(rel_clip_ids, k=max_n)
+                easy_pos_clip_indices = random.sample(rel, k=max_n)
                 easy_neg_clip_indices = random.sample(easy_neg_pool, k=max_n)
             else:  # copy the hard ones
                 easy_pos_clip_indices = hard_pos_clip_indices
@@ -345,21 +578,27 @@ class StartEndDataset(Dataset):
 
         return pos_clip_indices, neg_clip_indices, score_array
 
-    def get_span_labels(self, windows, ctx_l):
+    def get_span_labels(self, windows, ctx_l, duration=None):
         """
         windows: list([st, ed]) in seconds. E.g. [[26, 36]], corresponding st_ed clip_indices [[13, 17]] (inclusive)
             Note a maximum of `self.max_windows` windows are used.
+        duration: when provided (after temporal augmentation), use it as the normalisation denominator
+            so that span values remain correct after crop/extend.
         returns Tensor of shape (#windows, 2), each row is [center, width] normalized by video length
         """
+        windows = [list(w) for w in windows]
         if len(windows) > self.max_windows:
-            random.shuffle(windows)
-            windows = windows[:self.max_windows]
+            selected_windows = list(windows)
+            random.shuffle(selected_windows)
+            windows = selected_windows[:self.max_windows]
         if self.span_loss_type in ("l1", "dfl", "fdr"):
-            windows = torch.Tensor(windows) / (ctx_l * self.clip_len)  # normalized windows in xx
+            denom = duration if duration is not None else (ctx_l * self.clip_len)
+            windows = torch.Tensor(windows) / denom  # normalized windows in xx
             windows = span_xx_to_cxw(windows)  # normalized windows in cxw
         elif self.span_loss_type == "ce":
+            eff = (duration / ctx_l) if duration is not None else self.clip_len
             windows = torch.Tensor([
-                [int(w[0] / self.clip_len), min(int(w[1] / self.clip_len), ctx_l) - 1]
+                [int(w[0] / eff), min(int(w[1] / eff), ctx_l) - 1]
                 for w in windows]).long()  # inclusive
         else:
             raise NotImplementedError

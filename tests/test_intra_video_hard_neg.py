@@ -1,5 +1,12 @@
 import unittest
 import random
+import sys
+import types
+
+try:
+    import pandas  # noqa: F401
+except ModuleNotFoundError:
+    sys.modules["pandas"] = types.ModuleType("pandas")
 
 from vmr_detr.data.start_end_dataset import StartEndDataset
 
@@ -68,6 +75,19 @@ class TestIntraVideoHardPool(unittest.TestCase):
         # Clips 6-10 (min(ctx_l, int(10/1)+1)=10) should be present
         for ci in range(6, 10):
             self.assertIn(ci, hard_pool, f"Clip {ci} from other moment should be in pool")
+
+    def test_exact_boundary_window_does_not_include_next_clip(self):
+        ds = self._make_multi_moment_dataset()
+        hard_pool = ds._intra_video_hard_pool(
+            vid="vid_A",
+            cur_window=[0.0, 4.0],
+            gt_st=0,
+            gt_ed=3,
+            ctx_l=12,
+            clip_len=1.0,
+        )
+        self.assertIn(9, hard_pool)
+        self.assertNotIn(10, hard_pool)
 
     def test_hard_pool_excludes_current_gt_clips(self):
         ds = self._make_multi_moment_dataset()
