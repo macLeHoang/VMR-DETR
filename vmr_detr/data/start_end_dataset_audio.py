@@ -30,7 +30,7 @@ class StartEndDataset_audio(Dataset):
                  max_q_l=32, max_v_l=75, data_ratio=1.0, ctx_mode="video",
                  normalize_v=True, normalize_t=True, load_labels=True,
                  clip_len=2, max_windows=5, span_loss_type="l1", txt_drop_ratio=0,
-                 dset_domain=None):
+                 dset_domain=None, aug_stop_epoch=0):
         self.dset_name = dset_name
         self.data_path = data_path
         self.data_ratio = data_ratio
@@ -52,6 +52,8 @@ class StartEndDataset_audio(Dataset):
         self.max_windows = max_windows  # maximum number of windows to use as labels
         self.span_loss_type = span_loss_type
         self.txt_drop_ratio = txt_drop_ratio
+        self.aug_stop_epoch = max(0, int(aug_stop_epoch))
+        self._aug_enabled = True
         if "val" in data_path or "test" in data_path:
             assert txt_drop_ratio == 0
 
@@ -139,6 +141,9 @@ class StartEndDataset_audio(Dataset):
                     model_inputs["saliency_pos_labels"], model_inputs["saliency_neg_labels"], model_inputs["saliency_all_labels"] = \
                         self.get_saliency_labels_sub_as_query(meta["relevant_windows"][0], ctx_l)  # only one gt
         return dict(meta=meta, model_inputs=model_inputs)
+
+    def set_epoch(self, epoch):
+        self._aug_enabled = (self.aug_stop_epoch <= 0) or (epoch <= self.aug_stop_epoch)
 
     def get_saliency_labels_sub_as_query(self, gt_window, ctx_l, max_n=2):
         gt_st = int(gt_window[0] / self.clip_len)
@@ -300,7 +305,7 @@ class StartEndDataset_audio(Dataset):
                 q_feat = q_feat[:self.max_q_l]
             if self.normalize_t:
                 q_feat = l2_normalize_np_array(q_feat)
-            if self.txt_drop_ratio > 0:
+            if self.txt_drop_ratio > 0 and getattr(self, "_aug_enabled", True):
                 q_feat = self.random_drop_rows(q_feat)
         return torch.from_numpy(q_feat)  # (D, ) or (Lq, D)
 

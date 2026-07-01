@@ -297,6 +297,15 @@ def build_datasets(opt):
             temporal_aug_min_keep=opt.temporal_aug_min_keep,
             context_extend_prob=opt.context_extend_prob,
             context_extend_max_frac=opt.context_extend_max_frac,
+            temporal_mask_prob=opt.temporal_mask_prob,
+            temporal_mask_n=opt.temporal_mask_n,
+            temporal_mask_max_len=opt.temporal_mask_max_len,
+            feat_noise_prob=opt.feat_noise_prob,
+            feat_noise_std=opt.feat_noise_std,
+            multi_moment_prob=opt.multi_moment_prob,
+            position_jitter_prob=opt.position_jitter_prob,
+            position_jitter_context_sec=opt.position_jitter_context_sec,
+            position_jitter_max_shift_frac=opt.position_jitter_max_shift_frac,
             aug_stop_epoch=opt.aug_stop_epoch,
             length_balance_bins=tuple(opt.length_balance_bins),
         )
@@ -320,6 +329,7 @@ def build_datasets(opt):
             span_loss_type=opt.span_loss_type,
             txt_drop_ratio=opt.txt_drop_ratio,
             dset_domain=opt.dset_domain,
+            aug_stop_epoch=opt.aug_stop_epoch,
         )
         train_dataset = StartEndDataset_audio(**dataset_config)
 
@@ -332,6 +342,13 @@ def build_datasets(opt):
         dataset_config["intra_video_hard_neg_ratio"] = 0
         dataset_config["temporal_aug_prob"] = 0
         dataset_config["context_extend_prob"] = 0
+        dataset_config["temporal_mask_prob"] = 0
+        dataset_config["temporal_mask_n"] = 0
+        dataset_config["temporal_mask_max_len"] = 0
+        dataset_config["feat_noise_prob"] = 0
+        dataset_config["feat_noise_std"] = 0
+        dataset_config["multi_moment_prob"] = 0
+        dataset_config["position_jitter_prob"] = 0
         eval_dataset = StartEndDataset(**dataset_config)
     else:
         eval_dataset = StartEndDataset_audio(**dataset_config)

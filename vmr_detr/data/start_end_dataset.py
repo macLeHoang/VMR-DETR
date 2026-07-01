@@ -38,7 +38,12 @@ class StartEndDataset(Dataset):
                  temporal_aug_prob=0.0, temporal_aug_min_keep=0.5,
                  context_extend_prob=0.0, context_extend_max_frac=1.0,
                  aug_stop_epoch=0,
-                 length_balance_bins=(0.1, 0.25)):
+                 length_balance_bins=(0.1, 0.25),
+                 temporal_mask_prob=0.0, temporal_mask_n=0,
+                 temporal_mask_max_len=0, feat_noise_prob=0.0,
+                 feat_noise_std=0.0, multi_moment_prob=0.0,
+                 position_jitter_prob=0.0, position_jitter_context_sec=2.0,
+                 position_jitter_max_shift_frac=0.0):
         self.dset_name = dset_name
         self.data_path = data_path
         self.data_ratio = data_ratio
@@ -68,12 +73,24 @@ class StartEndDataset(Dataset):
         self.context_extend_prob = context_extend_prob
         self.context_extend_max_frac = context_extend_max_frac
         self.aug_stop_epoch = max(0, int(aug_stop_epoch))
+        self.temporal_mask_prob = temporal_mask_prob
+        self.temporal_mask_n = temporal_mask_n
+        self.temporal_mask_max_len = temporal_mask_max_len
+        self.feat_noise_prob = feat_noise_prob
+        self.feat_noise_std = feat_noise_std
+        self.multi_moment_prob = multi_moment_prob
+        self.position_jitter_prob = position_jitter_prob
+        self.position_jitter_context_sec = position_jitter_context_sec
+        self.position_jitter_max_shift_frac = position_jitter_max_shift_frac
+        self._aug_enabled = True
         self._base_temporal_aug_prob = self.temporal_aug_prob
         self._base_context_extend_prob = self.context_extend_prob
         self.length_balance_bins = length_balance_bins
         if "val" in data_path or "test" in data_path:
             assert txt_drop_ratio == 0
-            assert temporal_aug_prob == 0 and context_extend_prob == 0, \
+            assert temporal_aug_prob == 0 and context_extend_prob == 0 \
+                and temporal_mask_prob == 0 and feat_noise_prob == 0 \
+                and multi_moment_prob == 0 and position_jitter_prob == 0, \
                 "augmentation must be disabled for val/test"
 
         # checks
@@ -168,6 +185,11 @@ class StartEndDataset(Dataset):
 
         _cropped = False   # FIX 1: always defined before conditional block
         _extended = False  # FIX 1: always defined before conditional block
+        _composed = False
+        _jittered = False
+        _jitter_perm = None
+        sal_windows = None
+        sal_offset = 0.0
 
         if self.use_video:
             video_feat = self._get_video_feat_by_vid(meta["vid"], meta.get("duration"))  # (Lv, Dv)
@@ -183,9 +205,22 @@ class StartEndDataset(Dataset):
                 video_feat, windows, duration, ctx_l, _cropped, crop_offset_delta = self._temporal_crop(
                     video_feat, windows, duration, ctx_l)
                 timeline_offset_sec += crop_offset_delta
-                video_feat, windows, duration, ctx_l, _extended, extend_offset_delta = self._context_extend(
+                video_feat, windows, duration, ctx_l, _composed, compose_offset_delta = self._multi_moment_paste(
                     video_feat, windows, duration, ctx_l, index, meta["vid"])
-                timeline_offset_sec += extend_offset_delta
+                timeline_offset_sec += compose_offset_delta
+                if not _composed:
+                    video_feat, windows, duration, ctx_l, _extended, extend_offset_delta = self._context_extend(
+                        video_feat, windows, duration, ctx_l, index, meta["vid"])
+                    timeline_offset_sec += extend_offset_delta
+                sal_windows = [list(w) for w in windows]
+                sal_offset = timeline_offset_sec
+                if 'subs_train' not in str(getattr(self, 'data_path', '')):
+                    video_feat, windows, _jitter_perm, _jittered = self._position_jitter(
+                        video_feat, windows, duration, ctx_l)
+
+            video_feat = self._feature_noise(video_feat)
+            if self.load_labels and windows is not None and self.dset_name != 'tvsum':
+                video_feat = self._temporal_mask(video_feat, windows, duration, ctx_l)
 
             model_inputs["video_feat"] = video_feat
         else:
@@ -210,22 +245,42 @@ class StartEndDataset(Dataset):
             else:
                 if windows is None:
                     windows = [list(w) for w in meta["relevant_windows"]]
-                aug_applied = bool(_cropped or _extended)
+                aug_applied = bool(_cropped or _extended or _composed or _jittered)
                 model_inputs["span_labels"] = self.get_span_labels(  # (#windows, 2)
                     windows, ctx_l, duration=(duration if aug_applied else None))
 
                 if self.dset_name in ['charades_sta', 'tacos', 'activitynet']:  ## charades, tacos, nlq
-                    model_inputs["saliency_pos_labels"], model_inputs["saliency_neg_labels"], model_inputs["saliency_all_labels"], hardneg = \
-                        self.get_saliency_labels_sub_as_query(windows[0], duration, ctx_l,
-                                                              vid=meta["vid"], cur_window=meta["relevant_windows"][0],
-                                                              crop_offset_sec=timeline_offset_sec)  # only one gt
+                    pos_l, neg_l, score_l, hardneg = self.get_saliency_labels_sub_as_query(
+                        (sal_windows[0] if sal_windows is not None else windows[0]), duration, ctx_l,
+                        vid=meta["vid"], cur_window=meta["relevant_windows"][0],
+                        crop_offset_sec=(sal_offset if sal_windows is not None else timeline_offset_sec))
+                    if _jittered and _jitter_perm is not None:
+                        inv = [0] * ctx_l
+                        for _i, _p in enumerate(_jitter_perm):
+                            inv[_p] = _i
+                        pos_l = [inv[i] for i in pos_l]
+                        neg_l = [inv[i] for i in neg_l]
+                        if hardneg is not None:
+                            hardneg = [inv[i] for i in hardneg]
+                        score_l = score_l[_jitter_perm]
+                    model_inputs["saliency_pos_labels"], model_inputs["saliency_neg_labels"], model_inputs["saliency_all_labels"] = pos_l, neg_l, score_l
                     if hardneg is not None:
                         model_inputs["saliency_hardneg_labels"] = hardneg
                 elif self.dset_name in ['nlq']:
-                    model_inputs["saliency_pos_labels"], model_inputs["saliency_neg_labels"], model_inputs["saliency_all_labels"], hardneg = \
-                        self.get_saliency_labels_sub_as_query(windows[0], duration, ctx_l, 2,
-                                                              vid=meta["vid"], cur_window=meta["relevant_windows"][0],
-                                                              crop_offset_sec=timeline_offset_sec)  # only one gt
+                    pos_l, neg_l, score_l, hardneg = self.get_saliency_labels_sub_as_query(
+                        (sal_windows[0] if sal_windows is not None else windows[0]), duration, ctx_l, 2,
+                        vid=meta["vid"], cur_window=meta["relevant_windows"][0],
+                        crop_offset_sec=(sal_offset if sal_windows is not None else timeline_offset_sec))
+                    if _jittered and _jitter_perm is not None:
+                        inv = [0] * ctx_l
+                        for _i, _p in enumerate(_jitter_perm):
+                            inv[_p] = _i
+                        pos_l = [inv[i] for i in pos_l]
+                        neg_l = [inv[i] for i in neg_l]
+                        if hardneg is not None:
+                            hardneg = [inv[i] for i in hardneg]
+                        score_l = score_l[_jitter_perm]
+                    model_inputs["saliency_pos_labels"], model_inputs["saliency_neg_labels"], model_inputs["saliency_all_labels"] = pos_l, neg_l, score_l
                     if hardneg is not None:
                         model_inputs["saliency_hardneg_labels"] = hardneg
                 elif "subs_train" not in self.data_path:
@@ -251,12 +306,60 @@ class StartEndDataset(Dataset):
         temporal augmentation once we pass aug_stop_epoch (1-indexed,
         inclusive), and keep it at the configured strength otherwise.
         aug_stop_epoch <= 0 means augmentation stays on for the whole run."""
+        self._aug_enabled = (self.aug_stop_epoch <= 0) or (epoch <= self.aug_stop_epoch)
         if self.aug_stop_epoch > 0 and epoch > self.aug_stop_epoch:
             self.temporal_aug_prob = 0.0
             self.context_extend_prob = 0.0
         else:
             self.temporal_aug_prob = self._base_temporal_aug_prob
             self.context_extend_prob = self._base_context_extend_prob
+
+    def _feature_noise(self, feat):
+        """Add small Gaussian noise to normalized video features."""
+        feat_noise_prob = getattr(self, 'feat_noise_prob', 0.0)
+        feat_noise_std = getattr(self, 'feat_noise_std', 0.0)
+        if (not getattr(self, "_aug_enabled", True)
+                or feat_noise_prob <= 0
+                or feat_noise_std <= 0
+                or random.random() >= feat_noise_prob):
+            return feat
+        return feat + torch.randn_like(feat) * feat_noise_std
+
+    def _temporal_mask(self, feat, windows, duration, ctx_l):
+        """Zero random non-GT clip spans without changing geometry."""
+        temporal_mask_prob = getattr(self, 'temporal_mask_prob', 0.0)
+        temporal_mask_n = int(getattr(self, 'temporal_mask_n', 0))
+        temporal_mask_max_len = int(getattr(self, 'temporal_mask_max_len', 0))
+        if (not getattr(self, "_aug_enabled", True)
+                or temporal_mask_prob <= 0
+                or temporal_mask_n <= 0
+                or temporal_mask_max_len <= 0
+                or duration is None
+                or ctx_l <= 0
+                or random.random() >= temporal_mask_prob):
+            return feat
+
+        clip_len = duration / ctx_l
+        if clip_len <= 0:
+            return feat
+
+        gt_st = max(0, int(floor(min(w[0] for w in windows) / clip_len)))
+        gt_ed = min(ctx_l, int(ceil(max(w[1] for w in windows) / clip_len)))
+        max_len = min(temporal_mask_max_len, ctx_l)
+        valid_spans = [
+            (start, start + span_len)
+            for span_len in range(1, max_len + 1)
+            for start in range(0, ctx_l - span_len + 1)
+            if start + span_len <= gt_st or start >= gt_ed
+        ]
+        if not valid_spans:
+            return feat
+
+        masked = feat.clone()
+        for _ in range(temporal_mask_n):
+            start, end = random.choice(valid_spans)
+            masked[start:end] = 0
+        return masked
 
     def _temporal_crop(self, video_feat, windows, duration, ctx_l):
         """Randomly crop a temporal subwindow that fully contains the GT moment.
@@ -265,6 +368,7 @@ class StartEndDataset(Dataset):
         All values are unchanged when the augmentation is disabled or skipped.
         """
         if (not self.use_video
+                or not getattr(self, "_aug_enabled", True)
                 or self.temporal_aug_prob <= 0
                 or random.random() >= self.temporal_aug_prob):
             return (video_feat, windows, duration, ctx_l, False, 0.0)
@@ -304,6 +408,7 @@ class StartEndDataset(Dataset):
         """
         context_extend_prob = getattr(self, 'context_extend_prob', 0.0)
         if (not self.use_video
+                or not getattr(self, "_aug_enabled", True)
                 or context_extend_prob <= 0
                 or random.random() >= context_extend_prob):
             return (video_feat, windows, duration, ctx_l, False, 0.0)
@@ -367,6 +472,135 @@ class StartEndDataset(Dataset):
         ]
 
         return (new_feat, new_windows, new_duration, new_ctx_l, True, -offset)
+
+    def _multi_moment_paste(self, video_feat, windows, duration, ctx_l, index, current_vid):
+        """Paste another video's GT region as hard negative context.
+
+        The pasted moment is intentionally excluded from `windows`; only the
+        original moment remains positive after shifting by any left-side paste.
+        """
+        multi_moment_prob = getattr(self, 'multi_moment_prob', 0.0)
+        if (not getattr(self, "_aug_enabled", True)
+                or not self.use_video
+                or multi_moment_prob <= 0
+                or random.random() >= multi_moment_prob):
+            return (video_feat, windows, duration, ctx_l, False, 0.0)
+
+        if duration is None or ctx_l <= 0:
+            return (video_feat, windows, duration, ctx_l, False, 0.0)
+
+        clip_len = duration / ctx_l
+        if clip_len <= 0:
+            return (video_feat, windows, duration, ctx_l, False, 0.0)
+
+        max_total = int(getattr(self, 'max_v_l', ctx_l))
+        available = max(0, max_total - ctx_l)
+        if available <= 0:
+            return (video_feat, windows, duration, ctx_l, False, 0.0)
+
+        candidate_indices = [
+            i for i, item in enumerate(self.data)
+            if i != index and item.get("vid") != current_vid and item.get("relevant_windows")
+        ]
+        if not candidate_indices:
+            return (video_feat, windows, duration, ctx_l, False, 0.0)
+
+        other_index = random.choice(candidate_indices)
+        other_meta = self.data[other_index]
+        try:
+            other_feat = self._get_video_feat_by_vid(other_meta["vid"], other_meta.get("duration"))
+        except Exception:
+            return (video_feat, windows, duration, ctx_l, False, 0.0)
+
+        if len(other_feat) == 0 or other_feat.shape[-1] != video_feat.shape[-1]:
+            return (video_feat, windows, duration, ctx_l, False, 0.0)
+
+        other_duration = other_meta.get("duration")
+        if other_duration is None:
+            other_clip_len = getattr(self, "clip_len", clip_len)
+        else:
+            other_clip_len = float(other_duration) / len(other_feat)
+        if other_clip_len <= 0:
+            return (video_feat, windows, duration, ctx_l, False, 0.0)
+
+        other_window = other_meta["relevant_windows"][0]
+        src_st = max(0, int(floor(other_window[0] / other_clip_len)))
+        src_ed = min(len(other_feat), int(ceil(other_window[1] / other_clip_len)))
+        if src_ed <= src_st:
+            return (video_feat, windows, duration, ctx_l, False, 0.0)
+
+        pasted_feat = other_feat[src_st:src_ed][:available]
+        extra = len(pasted_feat)
+        if extra <= 0:
+            return (video_feat, windows, duration, ctx_l, False, 0.0)
+
+        left_extra = random.randint(0, extra)
+        right_extra = extra - left_extra
+
+        parts = []
+        if left_extra > 0:
+            parts.append(pasted_feat[:left_extra])
+        parts.append(video_feat)
+        if right_extra > 0:
+            parts.append(pasted_feat[left_extra:])
+
+        new_feat = torch.cat(parts, dim=0)
+        offset = left_extra * clip_len
+        new_ctx_l = len(new_feat)
+        new_duration = new_ctx_l * clip_len
+        new_windows = [
+            [max(0.0, w[0] + offset), min(new_duration, w[1] + offset)]
+            for w in windows
+        ]
+
+        return (new_feat, new_windows, new_duration, new_ctx_l, True, -offset)
+
+    def _position_jitter(self, video_feat, windows, duration, ctx_l):
+        """Relocate the GT moment (+ ±context reserve) to a new position via a pure
+        clip permutation. Returns (feat, new_windows, perm, jittered_bool). Length-preserving."""
+        prob = getattr(self, 'position_jitter_prob', 0.0)
+        if (not self.use_video
+                or not getattr(self, "_aug_enabled", True)
+                or prob <= 0
+                or duration is None or ctx_l <= 0
+                or len(windows) != 1
+                or random.random() >= prob):
+            return video_feat, windows, None, False
+        clip_len = duration / ctx_l
+        if clip_len <= 0:
+            return video_feat, windows, None, False
+        gt_st = max(0, int(floor(windows[0][0] / clip_len)))
+        gt_ed = min(ctx_l, int(ceil(windows[0][1] / clip_len)))
+        m = gt_ed - gt_st
+        if m <= 0:
+            return video_feat, windows, None, False
+        r = int(round(getattr(self, 'position_jitter_context_sec', 2.0) / clip_len))
+        core_st = max(0, gt_st - r)
+        core_ed = min(ctx_l, gt_ed + r)
+        M = core_ed - core_st
+        if M >= ctx_l:
+            return video_feat, windows, None, False
+        rest_idx = list(range(0, core_st)) + list(range(core_ed, ctx_l))
+        core_idx = list(range(core_st, core_ed))
+        max_shift = getattr(self, 'position_jitter_max_shift_frac', 0.0)
+        if max_shift and max_shift > 0:
+            lo = max(0, core_st - int(round(max_shift * ctx_l)))
+            hi = min(ctx_l - M, core_st + int(round(max_shift * ctx_l)))
+        else:
+            lo, hi = 0, ctx_l - M
+        if hi < lo:
+            return video_feat, windows, None, False
+        new_core_st = random.randint(lo, hi)
+        if new_core_st == core_st:
+            return video_feat, windows, None, False
+        perm = rest_idx[:new_core_st] + core_idx + rest_idx[new_core_st:]
+        new_feat = video_feat[torch.as_tensor(perm, dtype=torch.long)]
+        delta_sec = (new_core_st - core_st) * clip_len
+        new_windows = [[
+            max(0.0, min(float(duration), windows[0][0] + delta_sec)),
+            max(0.0, min(float(duration), windows[0][1] + delta_sec)),
+        ]]
+        return new_feat, new_windows, perm, True
 
     # ------------------------------------------------------------------
     # Length-balanced sampling weight
@@ -629,6 +863,8 @@ class StartEndDataset(Dataset):
         min_len = min([len(e) for e in q_feat_list])
         q_feat_list = [e[:min_len] for e in q_feat_list]
         q_feat = np.concatenate(q_feat_list, axis=1)
+        if self.txt_drop_ratio > 0 and getattr(self, "_aug_enabled", True):
+            q_feat = self.random_drop_rows(q_feat)
         return torch.from_numpy(q_feat)  # (Lv, D)
 
     def random_drop_rows(self, embeddings):

@@ -18,11 +18,21 @@ t_feat_types=clip
 v_feat_len_mode=min
 
 # Data augmentation
-temporal_aug_prob=0.5
+txt_drop_ratio=0.1
+temporal_aug_prob=0.7
 temporal_aug_min_keep=0.5
-context_extend_prob=0.5
+context_extend_prob=0.7
 context_extend_max_frac=1.0
-aug_stop_epoch=30
+temporal_mask_prob=0.0
+temporal_mask_n=1
+temporal_mask_max_len=3
+feat_noise_prob=0.01
+feat_noise_std=0.02
+multi_moment_prob=0.5
+position_jitter_prob=0.01
+position_jitter_context_sec=2.0
+position_jitter_max_shift_frac=0
+aug_stop_epoch=40
 
 # Video features
 v_feat_dim=0
@@ -163,6 +173,16 @@ PYTHONPATH="${PYTHONPATH}:." python vmr_detr/cli/train.py \
   --temporal_aug_min_keep "${temporal_aug_min_keep}" \
   --context_extend_prob "${context_extend_prob}" \
   --context_extend_max_frac "${context_extend_max_frac}" \
+  --txt_drop_ratio "${txt_drop_ratio}" \
+  --temporal_mask_prob "${temporal_mask_prob}" \
+  --temporal_mask_n "${temporal_mask_n}" \
+  --temporal_mask_max_len "${temporal_mask_max_len}" \
+  --feat_noise_prob "${feat_noise_prob}" \
+  --feat_noise_std "${feat_noise_std}" \
+  --multi_moment_prob "${multi_moment_prob}" \
+  --position_jitter_prob "${position_jitter_prob}" \
+  --position_jitter_context_sec "${position_jitter_context_sec}" \
+  --position_jitter_max_shift_frac "${position_jitter_max_shift_frac}" \
   --aug_stop_epoch "${aug_stop_epoch}" \
   --results_root "${results_root}" \
   --exp_id "${exp_id}" \

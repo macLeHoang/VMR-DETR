@@ -17,9 +17,18 @@ class BaseOptions(object):
         "temporal_aug_min_keep",
         "context_extend_prob",
         "context_extend_max_frac",
+        "temporal_mask_prob",
+        "temporal_mask_n",
+        "temporal_mask_max_len",
+        "feat_noise_prob",
+        "feat_noise_std",
+        "multi_moment_prob",
         "aug_stop_epoch",
         "length_balance",
         "length_balance_bins",
+        "position_jitter_prob",
+        "position_jitter_context_sec",
+        "position_jitter_max_shift_frac",
     )
 
     def __init__(self):
@@ -150,8 +159,26 @@ class BaseOptions(object):
                             help="Probability of padding context from another video to reduce normalised GT width. 0 disables.")
         parser.add_argument("--context_extend_max_frac", type=float, default=1.0,
                             help="Maximum extra clips to add as a fraction of the current video length.")
+        parser.add_argument("--temporal_mask_prob", type=float, default=0.0,
+                            help="Probability of masking non-GT temporal clips per sample. 0 disables.")
+        parser.add_argument("--temporal_mask_n", type=int, default=0,
+                            help="Number of non-GT temporal spans to mask per augmented sample.")
+        parser.add_argument("--temporal_mask_max_len", type=int, default=0,
+                            help="Maximum masked temporal span length in clips. 0 disables.")
+        parser.add_argument("--feat_noise_prob", type=float, default=0.0,
+                            help="Probability of adding Gaussian noise to video features. 0 disables.")
+        parser.add_argument("--feat_noise_std", type=float, default=0.0,
+                            help="Stddev for Gaussian video feature noise.")
+        parser.add_argument("--multi_moment_prob", type=float, default=0.0,
+                            help="Probability of pasting another video's GT region as hard negative context. 0 disables.")
+        parser.add_argument("--position_jitter_prob", type=float, default=0.0,
+                            help="Probability of applying position-jitter augmentation per sample. 0 disables.")
+        parser.add_argument("--position_jitter_context_sec", type=float, default=2.0,
+                            help="Context reserve (seconds) on each side of the GT moment moved with it during jitter.")
+        parser.add_argument("--position_jitter_max_shift_frac", type=float, default=0.0,
+                            help="Maximum slide distance as fraction of ctx_l. 0 means relocate anywhere.")
         parser.add_argument("--aug_stop_epoch", type=int, default=0,
-                            help="disable temporal-crop & context-extend after this epoch "
+                            help="disable train-time augmentations after this epoch "
                                  "(1-indexed, inclusive); 0 = keep aug for the whole run. "
                                  "With --resume_all, restored from the checkpoint opt.")
         parser.add_argument("--length_balance", action="store_true",
@@ -433,12 +460,30 @@ class BaseOptions(object):
             raise ValueError("--temporal_aug_prob must be in [0, 1].")
         if not 0.0 <= opt.context_extend_prob <= 1.0:
             raise ValueError("--context_extend_prob must be in [0, 1].")
+        if not 0.0 <= opt.temporal_mask_prob <= 1.0:
+            raise ValueError("--temporal_mask_prob must be in [0, 1].")
+        if not 0.0 <= opt.feat_noise_prob <= 1.0:
+            raise ValueError("--feat_noise_prob must be in [0, 1].")
+        if not 0.0 <= opt.multi_moment_prob <= 1.0:
+            raise ValueError("--multi_moment_prob must be in [0, 1].")
         if not 0.0 < opt.temporal_aug_min_keep <= 1.0:
             raise ValueError("--temporal_aug_min_keep must be in (0, 1].")
         if not opt.context_extend_max_frac >= 0.0:
             raise ValueError("--context_extend_max_frac must be >= 0.")
+        if opt.temporal_mask_n < 0:
+            raise ValueError("--temporal_mask_n must be >= 0.")
+        if opt.temporal_mask_max_len < 0:
+            raise ValueError("--temporal_mask_max_len must be >= 0.")
+        if opt.feat_noise_std < 0:
+            raise ValueError("--feat_noise_std must be >= 0.")
         if opt.aug_stop_epoch < 0:
             raise ValueError("--aug_stop_epoch must be >= 0 (0 disables the cutoff).")
+        if not 0.0 <= opt.position_jitter_prob <= 1.0:
+            raise ValueError("--position_jitter_prob must be in [0, 1].")
+        if opt.position_jitter_context_sec < 0:
+            raise ValueError("--position_jitter_context_sec must be >= 0.")
+        if opt.position_jitter_max_shift_frac < 0:
+            raise ValueError("--position_jitter_max_shift_frac must be >= 0.")
 
     @staticmethod
     def _normalize_query_anchor_widths(opt):
