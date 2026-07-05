@@ -20,7 +20,7 @@ v_feat_len_mode=min
 # Data augmentation
 txt_drop_ratio=0.1
 temporal_aug_prob=0.7
-temporal_aug_min_keep=0.5
+temporal_aug_min_keep=0.3
 context_extend_prob=0.7
 context_extend_max_frac=1.0
 temporal_mask_prob=0.0
@@ -123,6 +123,8 @@ stage2_inner_bins=4
 stage2_boundary_samples=4
 stage2_max_shift_clips=3
 stage2_shift_frac=0.25
+stage2_exp_width_flag=--stage2_exp_width
+stage2_width_beta=0.7
 stage2_positive_iou=0.4
 stage2_start_epoch=10
 stage2_joint_epoch=20
@@ -137,7 +139,7 @@ eval_bsz=32
 n_epoch=100
 lr=1.5e-4
 lr_drop=100
-lr_scheduler=step
+lr_scheduler=cosine
 lrf=0.01
 num_workers=2
 eval_every_epoch_after=40
@@ -231,6 +233,8 @@ PYTHONPATH="${PYTHONPATH}:." python vmr_detr/cli/train.py \
   --stage2_boundary_samples "${stage2_boundary_samples}" \
   --stage2_max_shift_clips "${stage2_max_shift_clips}" \
   --stage2_shift_frac "${stage2_shift_frac}" \
+  ${stage2_exp_width_flag} \
+  --stage2_width_beta "${stage2_width_beta}" \
   --stage2_positive_iou "${stage2_positive_iou}" \
   --stage2_start_epoch "${stage2_start_epoch}" \
   --stage2_joint_epoch "${stage2_joint_epoch}" \

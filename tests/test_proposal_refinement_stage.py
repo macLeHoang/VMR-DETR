@@ -14,7 +14,8 @@ from vmr_detr.ops.span_utils import span_cxw_to_xx, span_xx_to_cxw
 
 
 def _make_stage(hidden_dim=16, inner_bins=3, boundary_samples=2,
-                max_shift_clips=1, span_num_bins=8, shift_frac=0.0):
+                max_shift_clips=1, span_num_bins=8, shift_frac=0.0,
+                exp_width=False, width_beta=0.7):
     return ProposalRefinementStage(
         hidden_dim=hidden_dim,
         stage2_dim=12,
@@ -23,6 +24,8 @@ def _make_stage(hidden_dim=16, inner_bins=3, boundary_samples=2,
         max_shift_clips=max_shift_clips,
         span_num_bins=span_num_bins,
         shift_frac=shift_frac,
+        exp_width=exp_width,
+        width_beta=width_beta,
     )
 
 
@@ -232,6 +235,64 @@ class TestProposalRefinementStage(unittest.TestCase):
             msg="refined start must be strictly less than refined end"
         )
 
+    def test_exp_width_refinement_scales_width_multiplicatively(self):
+        hidden_dim = 16
+        length = 50
+        bsz = 1
+        queries = 1
+        hs = torch.randn(bsz, queries, hidden_dim)
+        logits = torch.randn(bsz, queries, 1)
+        memory = torch.randn(bsz, length, hidden_dim)
+        mask = torch.ones(bsz, length)
+        spans = torch.tensor([[[0.5, 0.2]]])
+        base_width = spans[..., 1]
+
+        configs = [
+            (0.7, -2.0),
+            (0.7, 0.0),
+            (0.7, 2.0),
+            (1.4, 2.0),
+        ]
+        measured_widths = []
+        for width_beta, raw_width in configs:
+            with self.subTest(width_beta=width_beta, raw_width=raw_width):
+                stage = _make_stage(
+                    exp_width=True,
+                    width_beta=width_beta,
+                    span_num_bins=None,
+                    shift_frac=0.0,
+                )
+                torch.nn.init.zeros_(stage.localization_head[-1].weight)
+                stage.localization_head[-1].bias.data.copy_(
+                    torch.tensor([0.0, raw_width])
+                )
+
+                outputs = stage(
+                    hs, spans, logits, None, memory, mask, detach_stage1=False
+                )
+                refined_xx = span_cxw_to_xx(outputs["refined_spans"])
+                refined_width = refined_xx[..., 1] - refined_xx[..., 0]
+                raw_width_tensor = torch.tensor(raw_width, dtype=base_width.dtype)
+                expected_width = base_width * torch.exp(
+                    width_beta * torch.tanh(raw_width_tensor)
+                )
+
+                self.assertTrue((refined_xx[..., 0] <= refined_xx[..., 1]).all())
+                self.assertTrue((refined_xx >= 0).all())
+                self.assertTrue((refined_xx <= 1).all())
+                self.assertTrue(
+                    torch.allclose(refined_width, expected_width, atol=1e-5),
+                    msg=(
+                        f"width {refined_width.item():.6f} did not match "
+                        f"multiplicative expectation {expected_width.item():.6f}"
+                    ),
+                )
+                measured_widths.append(refined_width.item())
+
+        self.assertLess(measured_widths[0], measured_widths[1])
+        self.assertLess(measured_widths[1], measured_widths[2])
+        self.assertLess(measured_widths[2], measured_widths[3])
+
 
 class TestStage2Loss(unittest.TestCase):
     @staticmethod
@@ -311,6 +372,7 @@ class TestStage2ModelIntegration(unittest.TestCase):
             hybrid_one_to_many_k=2, hybrid_one_to_many_loss_coef=1.0,
             use_stage2=use_stage2, stage2_dim=16, stage2_inner_bins=2,
             stage2_boundary_samples=1, stage2_max_shift_clips=1.0, stage2_shift_frac=0.0,
+            stage2_exp_width=False, stage2_width_beta=0.7,
             stage2_positive_iou=0.2, stage2_start_epoch=10,
             stage2_joint_epoch=30, stage2_boundary_loss_coef=0.5 if use_stage2 else 0.0,
             stage2_giou_loss_coef=0.5 if use_stage2 else 0.0,

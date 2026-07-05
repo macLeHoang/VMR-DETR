@@ -147,7 +147,7 @@ class ProposalRefinementStage(nn.Module):
 
     def __init__(self, hidden_dim, stage2_dim=128, inner_bins=4,
                  boundary_samples=2, max_shift_clips=1, span_num_bins=None,
-                 shift_frac=0.0):
+                 shift_frac=0.0, exp_width=False, width_beta=0.7):
         super().__init__()
         if inner_bins < 1:
             raise ValueError("inner_bins must be >= 1.")
@@ -157,6 +157,8 @@ class ProposalRefinementStage(nn.Module):
             raise ValueError("max_shift_clips must be > 0.")
         if shift_frac < 0:
             raise ValueError("shift_frac must be >= 0.")
+        if width_beta < 0:
+            raise ValueError("width_beta must be >= 0.")
 
         self.hidden_dim = hidden_dim
         self.inner_bins = inner_bins
@@ -164,6 +166,8 @@ class ProposalRefinementStage(nn.Module):
         self.max_shift_clips = max_shift_clips
         self.span_num_bins = span_num_bins
         self.shift_frac = shift_frac
+        self.exp_width = exp_width
+        self.width_beta = width_beta
 
         # Query state + four directional pools + ordered inner bins + geometry + entropy.
         in_dim = hidden_dim * (5 + inner_bins) + 6
@@ -277,17 +281,24 @@ class ProposalRefinementStage(nn.Module):
 
         span_width = pred_xx[..., 1] - pred_xx[..., 0]
         base_shift = (self.max_shift_clips / valid_len).to(pred_spans.dtype)[:, None]
-        max_shift = (base_shift + self.shift_frac * span_width).unsqueeze(-1)
-        boundary_delta = max_shift * torch.tanh(
-            self.localization_head(localization_features)
-        )
-        raw_start = pred_xx[..., 0] + boundary_delta[..., 0]
-        raw_end = pred_xx[..., 1] + boundary_delta[..., 1]
-        lo = torch.minimum(raw_start, raw_end)
-        hi = torch.maximum(raw_start, raw_end)
         min_width = (1.0 / valid_len.clamp(min=1)).to(pred_spans.dtype)[:, None]
-        center = 0.5 * (lo + hi)
-        half = torch.maximum(0.5 * (hi - lo), 0.5 * min_width)
+        raw = self.localization_head(localization_features)
+        if self.exp_width:
+            pred_center = 0.5 * (pred_xx[..., 0] + pred_xx[..., 1])
+            half_pred = 0.5 * span_width
+            center_budget = base_shift + self.shift_frac * span_width
+            center = pred_center + center_budget * torch.tanh(raw[..., 0])
+            half = half_pred * torch.exp(self.width_beta * torch.tanh(raw[..., 1]))
+            half = torch.maximum(half, 0.5 * min_width)
+        else:
+            max_shift = (base_shift + self.shift_frac * span_width).unsqueeze(-1)
+            boundary_delta = max_shift * torch.tanh(raw)
+            raw_start = pred_xx[..., 0] + boundary_delta[..., 0]
+            raw_end = pred_xx[..., 1] + boundary_delta[..., 1]
+            lo = torch.minimum(raw_start, raw_end)
+            hi = torch.maximum(raw_start, raw_end)
+            center = 0.5 * (lo + hi)
+            half = torch.maximum(0.5 * (hi - lo), 0.5 * min_width)
         refined_start = (center - half).clamp(0, 1)
         refined_end = (center + half).clamp(0, 1)
         refined_xx = torch.stack([refined_start, refined_end], dim=-1)
@@ -323,7 +334,8 @@ class VMRDETR(nn.Module):
                  query_init="random", query_anchor_widths=None,
                  use_stage2=False, stage2_dim=128, stage2_inner_bins=4,
                  stage2_boundary_samples=2, stage2_max_shift_clips=1,
-                 stage2_shift_frac=0.0,
+                 stage2_shift_frac=0.0, stage2_exp_width=False,
+                 stage2_width_beta=0.7,
                  stage2_joint_epoch=30):
         """ Initializes the model.
         Parameters:
@@ -449,6 +461,8 @@ class VMRDETR(nn.Module):
                 max_shift_clips=stage2_max_shift_clips,
                 span_num_bins=span_num_bins,
                 shift_frac=stage2_shift_frac,
+                exp_width=stage2_exp_width,
+                width_beta=stage2_width_beta,
             )
 
     def set_epoch(self, epoch):
@@ -1656,6 +1670,8 @@ def build_model(args):
     stage2_boundary_samples = getattr(args, "stage2_boundary_samples", 2)
     stage2_max_shift_clips = getattr(args, "stage2_max_shift_clips", 1)
     stage2_shift_frac = getattr(args, "stage2_shift_frac", 0.0)
+    stage2_exp_width = getattr(args, "stage2_exp_width", False)
+    stage2_width_beta = getattr(args, "stage2_width_beta", 0.7)
     stage2_joint_epoch = getattr(args, "stage2_joint_epoch", 30)
     if use_stage2 and args.span_loss_type not in ("l1", "dfl", "fdr"):
         raise ValueError("Stage 2 requires span_loss_type l1, dfl, or fdr.")
@@ -1692,6 +1708,8 @@ def build_model(args):
             stage2_boundary_samples=stage2_boundary_samples,
             stage2_max_shift_clips=stage2_max_shift_clips,
             stage2_shift_frac=stage2_shift_frac,
+            stage2_exp_width=stage2_exp_width,
+            stage2_width_beta=stage2_width_beta,
             stage2_joint_epoch=stage2_joint_epoch,
         )
     else:
@@ -1725,6 +1743,8 @@ def build_model(args):
             stage2_boundary_samples=stage2_boundary_samples,
             stage2_max_shift_clips=stage2_max_shift_clips,
             stage2_shift_frac=stage2_shift_frac,
+            stage2_exp_width=stage2_exp_width,
+            stage2_width_beta=stage2_width_beta,
             stage2_joint_epoch=stage2_joint_epoch,
         )
 

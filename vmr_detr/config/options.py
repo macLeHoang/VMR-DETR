@@ -230,6 +230,10 @@ class BaseOptions(object):
                             help="Maximum start/end correction measured in valid video clips.")
         parser.add_argument("--stage2_shift_frac", type=float, default=0.0,
                             help="Width-proportional boundary shift fraction for Stage-2 refinement (0 disables).")
+        parser.add_argument("--stage2_exp_width", action="store_true",
+                            help="Decode Stage 2 as bounded center shift plus multiplicative-exp width refinement.")
+        parser.add_argument("--stage2_width_beta", type=float, default=0.7,
+                            help="Scale for bounded multiplicative-exp Stage 2 width refinement.")
         parser.add_argument("--stage2_positive_iou", type=float, default=0.2,
                             help="Minimum base-proposal IoU for Stage 2 localization supervision.")
         parser.add_argument("--stage2_start_epoch", type=int, default=10,
@@ -539,6 +543,8 @@ class BaseOptions(object):
             "stage2_boundary_samples": 2,
             "stage2_max_shift_clips": 1.0,
             "stage2_shift_frac": 0.0,
+            "stage2_exp_width": False,
+            "stage2_width_beta": 0.7,
             "stage2_positive_iou": 0.2,
             "stage2_start_epoch": 10,
             "stage2_joint_epoch": 30,
@@ -561,6 +567,8 @@ class BaseOptions(object):
             raise ValueError("--stage2_max_shift_clips must be > 0.")
         if opt.stage2_shift_frac < 0:
             raise ValueError("--stage2_shift_frac must be >= 0.")
+        if opt.stage2_width_beta < 0:
+            raise ValueError("--stage2_width_beta must be >= 0.")
         if not 0 <= opt.stage2_positive_iou <= 1:
             raise ValueError("--stage2_positive_iou must be in [0, 1].")
         if opt.stage2_start_epoch < 0:
