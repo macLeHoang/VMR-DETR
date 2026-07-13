@@ -145,6 +145,9 @@ Current recipe:
 --fgl_loss_coef 1.5
 ```
 
+Here `--fdr_num_bins` follows D-FINE's `reg_max` convention, so each
+start/end boundary predicts `fdr_num_bins + 1` offset classes.
+
 ## 4. Auxiliary Localization Objectives
 
 ### GIoU loss

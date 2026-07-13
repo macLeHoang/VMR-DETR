@@ -10,6 +10,7 @@ from vmr_detr.modeling.model import (
     VMRDETR,
     _decode_fdr_cumulative_outputs,
     fdr_logits_to_spans,
+    fdr_num_logits,
     fdr_offset_support,
     init_shifted_temporal_queries,
     init_temporal_queries,
@@ -113,14 +114,15 @@ class _FixedFDRVMRDETR(VMRDETR):
             max_v_l=75,
             span_loss_type="fdr",
             n_input_proj=1,
-            fdr_num_bins=delta_logits.shape[-1] // 2,
+            fdr_num_bins=delta_logits.shape[-1] // 2 - 1,
             fdr_reg_scale=1.5,
             fdr_min_ref_width=1.0 / 75,
         )
         self.register_buffer("refs", refs)
         self.span_embed = _FixedSpanEmbed(delta_logits)
 
-    def _run_text_video_transformer(self, src_vid, src_vid_mask, src_txt, src_txt_mask):
+    def _run_text_video_transformer(self, src_vid, src_vid_mask, src_txt, src_txt_mask,
+                                    fdr_guide_head=None):
         bsz = src_vid.shape[0]
         n_layers = self.refs.shape[0]
         refs = self.refs.to(device=src_vid.device, dtype=src_vid.dtype).expand(-1, bsz, -1, -1)
@@ -1024,16 +1026,17 @@ class TemporalFDRTest(unittest.TestCase):
     def test_support_is_symmetric_sorted_and_dense_near_zero(self):
         support = fdr_offset_support(32, 1.5)
 
-        self.assertEqual(support.numel(), 32)
+        self.assertEqual(support.numel(), fdr_num_logits(32))
         self.assertTrue(torch.all(support[1:] > support[:-1]))
         self.assertTrue(torch.allclose(support, -support.flip(0), atol=1e-6))
-        center_gap = support[16] - support[15]
+        center = support.numel() // 2
+        center_gap = support[center + 1] - support[center]
         edge_gap = support[-1] - support[-2]
         self.assertLess(center_gap, edge_gap)
 
     def test_zero_logits_decode_to_reference_span(self):
         refs = _cxw([[0.25, 0.75]]).unsqueeze(0)
-        logits = torch.zeros(1, 1, 64)
+        logits = torch.zeros(1, 1, 2 * fdr_num_logits(32))
 
         pred = fdr_logits_to_spans(logits, refs, 32, 1.5, 1.0 / 75)
 
@@ -1062,11 +1065,11 @@ class TemporalFDRTest(unittest.TestCase):
 
     def test_boundary_offsets_expand_reference_span(self):
         refs = _cxw([[0.4, 0.6]]).unsqueeze(0)
-        logits = torch.zeros(1, 1, 2, 32)
+        logits = torch.zeros(1, 1, 2, fdr_num_logits(32))
         logits[..., 0, 0] = 20.0
         logits[..., 1, -1] = 20.0
 
-        pred = fdr_logits_to_spans(logits.reshape(1, 1, 64), refs, 32, 1.5, 1.0 / 75)
+        pred = fdr_logits_to_spans(logits.reshape(1, 1, 2 * fdr_num_logits(32)), refs, 32, 1.5, 1.0 / 75)
         pred_xx = pred[..., 0] - pred[..., 1] * 0.5, pred[..., 0] + pred[..., 1] * 0.5
 
         self.assertLess(pred_xx[0].item(), 0.4)
@@ -1074,11 +1077,12 @@ class TemporalFDRTest(unittest.TestCase):
 
     def test_cumulative_fdr_outputs_use_initial_reference_for_all_layers(self):
         fdr_num_bins = 32
+        num_logits = fdr_num_logits(fdr_num_bins)
         refs = _cxw([[0.20, 0.40], [0.55, 0.75], [0.05, 0.25]])[:, None, None, :]
-        delta_logits = torch.zeros(3, 1, 1, 2 * fdr_num_bins)
+        delta_logits = torch.zeros(3, 1, 1, 2 * num_logits)
         delta_logits[0, 0, 0, 0] = 8.0
-        delta_logits[1, 0, 0, fdr_num_bins - 1] = 4.0
-        delta_logits[2, 0, 0, fdr_num_bins + fdr_num_bins // 2] = 6.0
+        delta_logits[1, 0, 0, num_logits - 1] = 4.0
+        delta_logits[2, 0, 0, num_logits + num_logits // 2] = 6.0
 
         span_logits, spans, span_refs = _decode_fdr_cumulative_outputs(
             delta_logits,
@@ -1100,11 +1104,12 @@ class TemporalFDRTest(unittest.TestCase):
 
     def test_fdr_forward_exports_initial_reference_for_aux_outputs(self):
         fdr_num_bins = 32
+        num_logits = fdr_num_logits(fdr_num_bins)
         refs = _cxw([[0.20, 0.40], [0.55, 0.75], [0.05, 0.25]])[:, None, None, :]
-        delta_logits = torch.zeros(3, 1, 1, 2 * fdr_num_bins)
+        delta_logits = torch.zeros(3, 1, 1, 2 * num_logits)
         delta_logits[0, 0, 0, 0] = 8.0
-        delta_logits[1, 0, 0, fdr_num_bins - 1] = 4.0
-        delta_logits[2, 0, 0, fdr_num_bins + fdr_num_bins // 2] = 6.0
+        delta_logits[1, 0, 0, num_logits - 1] = 4.0
+        delta_logits[2, 0, 0, num_logits + num_logits // 2] = 6.0
         model = _FixedFDRVMRDETR(refs, delta_logits)
 
         outputs = model(
@@ -1126,7 +1131,7 @@ class TemporalFDRTest(unittest.TestCase):
     def test_fdr_criterion_returns_finite_losses_and_backpropagates(self):
         fdr_num_bins = 32
         refs = _cxw([[0.3, 0.7]]).unsqueeze(0)
-        pred_logits = torch.zeros(1, 1, 2 * fdr_num_bins, requires_grad=True)
+        pred_logits = torch.zeros(1, 1, 2 * fdr_num_logits(fdr_num_bins), requires_grad=True)
         pred_spans = fdr_logits_to_spans(pred_logits, refs, fdr_num_bins, 1.5, 1.0 / 75)
         outputs = {
             "pred_logits": _logits_from_fg_scores([0.80]).unsqueeze(0).requires_grad_(),
@@ -1161,7 +1166,7 @@ class TemporalFDRTest(unittest.TestCase):
         pred_spans = _cxw([[0.2, 0.4]]).unsqueeze(0).requires_grad_()
         outputs = {
             "pred_spans": pred_spans,
-            "pred_span_logits": torch.zeros(1, 1, 64),
+            "pred_span_logits": torch.zeros(1, 1, 2 * fdr_num_logits(32)),
             "pred_span_refs": _cxw([[0.2, 0.4]]).unsqueeze(0),
         }
         targets = {"span_labels": [dict(spans=_cxw([[0.2, 0.4]]))]}
@@ -1185,7 +1190,7 @@ class TemporalFDRTest(unittest.TestCase):
         pred_spans = _cxw([[0.1, 0.5]]).unsqueeze(0).requires_grad_()
         outputs = {
             "pred_spans": pred_spans,
-            "pred_span_logits": torch.zeros(1, 1, 64),
+            "pred_span_logits": torch.zeros(1, 1, 2 * fdr_num_logits(32)),
             "pred_span_refs": _cxw([[0.1, 0.5]]).unsqueeze(0),
         }
         targets = {"span_labels": [dict(spans=_cxw([[0.2, 0.4]]))]}
@@ -1208,7 +1213,7 @@ class TemporalFDRTest(unittest.TestCase):
         pred_spans = _cxw([[0.1, 0.5]]).unsqueeze(0).requires_grad_()
         outputs = {
             "pred_spans": pred_spans,
-            "pred_span_logits": torch.zeros(1, 1, 64),
+            "pred_span_logits": torch.zeros(1, 1, 2 * fdr_num_logits(32)),
             "pred_span_refs": _cxw([[0.1, 0.5]]).unsqueeze(0),
         }
         targets = {"span_labels": [dict(spans=_cxw([[0.2, 0.4]]))]}
@@ -1231,7 +1236,7 @@ class TemporalFDRTest(unittest.TestCase):
 
     def test_fdr_empty_targets_return_zero_finite_losses(self):
         refs = _cxw([[0.3, 0.7]]).unsqueeze(0)
-        pred_logits = torch.zeros(1, 1, 64)
+        pred_logits = torch.zeros(1, 1, 2 * fdr_num_logits(32))
         outputs = {
             "pred_logits": _logits_from_fg_scores([0.80]).unsqueeze(0),
             "pred_spans": fdr_logits_to_spans(pred_logits, refs, 32, 1.5, 1.0 / 75),
@@ -1256,7 +1261,7 @@ class TemporalFDRTest(unittest.TestCase):
 
     def test_fdr_empty_targets_return_zero_width_loss_when_enabled(self):
         refs = _cxw([[0.3, 0.7]]).unsqueeze(0)
-        pred_logits = torch.zeros(1, 1, 64)
+        pred_logits = torch.zeros(1, 1, 2 * fdr_num_logits(32))
         outputs = {
             "pred_logits": _logits_from_fg_scores([0.80]).unsqueeze(0),
             "pred_spans": fdr_logits_to_spans(pred_logits, refs, 32, 1.5, 1.0 / 75),
@@ -1281,7 +1286,7 @@ class TemporalFDRTest(unittest.TestCase):
 
     def test_fdr_empty_targets_return_zero_span_xx_loss_when_enabled(self):
         refs = _cxw([[0.3, 0.7]]).unsqueeze(0)
-        pred_logits = torch.zeros(1, 1, 64)
+        pred_logits = torch.zeros(1, 1, 2 * fdr_num_logits(32))
         outputs = {
             "pred_logits": _logits_from_fg_scores([0.80]).unsqueeze(0),
             "pred_spans": fdr_logits_to_spans(pred_logits, refs, 32, 1.5, 1.0 / 75),
@@ -1305,7 +1310,7 @@ class TemporalFDRTest(unittest.TestCase):
 
     def test_width_loss_is_repeated_for_auxiliary_outputs(self):
         refs = _cxw([[0.2, 0.6], [0.1, 0.5]]).unsqueeze(0)
-        pred_logits = torch.zeros(1, 2, 64)
+        pred_logits = torch.zeros(1, 2, 2 * fdr_num_logits(32))
         outputs = {
             "pred_logits": _logits_from_fg_scores([0.80, 0.20]).unsqueeze(0),
             "pred_spans": fdr_logits_to_spans(pred_logits, refs, 32, 1.5, 1.0 / 75),
@@ -1396,7 +1401,7 @@ class TemporalFDRTest(unittest.TestCase):
 
     def test_go_lsd_loss_is_zero_for_identical_teacher_logits(self):
         refs = _cxw([[0.2, 0.6], [0.6, 0.8]]).unsqueeze(0)
-        logits = torch.randn(1, 2, 64)
+        logits = torch.randn(1, 2, 2 * fdr_num_logits(32))
         spans = fdr_logits_to_spans(logits, refs, 32, 1.5, 1.0 / 75)
         outputs = {
             "pred_logits": _logits_from_fg_scores([0.80, 0.20]).unsqueeze(0),
@@ -1427,8 +1432,8 @@ class TemporalFDRTest(unittest.TestCase):
 
     def test_go_lsd_loss_is_positive_and_detaches_teacher(self):
         refs = _cxw([[0.2, 0.6], [0.6, 0.8]]).unsqueeze(0)
-        teacher_logits = torch.zeros(1, 2, 64, requires_grad=True)
-        student_logits = torch.zeros(1, 2, 64, requires_grad=True)
+        teacher_logits = torch.zeros(1, 2, 2 * fdr_num_logits(32), requires_grad=True)
+        student_logits = torch.zeros(1, 2, 2 * fdr_num_logits(32), requires_grad=True)
         student_logits.data[:, :, 0] = 3.0
         spans = fdr_logits_to_spans(teacher_logits.detach(), refs, 32, 1.5, 1.0 / 75)
         outputs = {
@@ -1463,7 +1468,7 @@ class TemporalFDRTest(unittest.TestCase):
 
     def test_go_lsd_matched_and_unmatched_queries_can_contribute(self):
         refs = _cxw([[0.2, 0.6], [0.6, 0.8]]).unsqueeze(0)
-        teacher_logits = torch.zeros(1, 2, 64)
+        teacher_logits = torch.zeros(1, 2, 2 * fdr_num_logits(32))
         spans = fdr_logits_to_spans(teacher_logits, refs, 32, 1.5, 1.0 / 75)
         outputs = {
             "pred_logits": _logits_from_fg_scores([0.80, 0.90]).unsqueeze(0),
@@ -1504,7 +1509,7 @@ class TemporalFDRTest(unittest.TestCase):
 
     def test_go_lsd_forward_emits_aux_losses_when_enabled(self):
         refs = _cxw([[0.2, 0.6], [0.6, 0.8]]).unsqueeze(0)
-        teacher_logits = torch.zeros(1, 2, 64)
+        teacher_logits = torch.zeros(1, 2, 2 * fdr_num_logits(32))
         aux_logits_0 = teacher_logits.clone()
         aux_logits_1 = teacher_logits.clone()
         aux_logits_0[:, :, 0] = 2.0
@@ -1555,7 +1560,7 @@ class TemporalFDRTest(unittest.TestCase):
 
     def test_go_lsd_forward_omits_aux_losses_when_disabled(self):
         refs = _cxw([[0.2, 0.6], [0.6, 0.8]]).unsqueeze(0)
-        pred_logits = torch.zeros(1, 2, 64)
+        pred_logits = torch.zeros(1, 2, 2 * fdr_num_logits(32))
         outputs = {
             "pred_logits": _logits_from_fg_scores([0.80, 0.20]).unsqueeze(0),
             "pred_spans": fdr_logits_to_spans(pred_logits, refs, 32, 1.5, 1.0 / 75),

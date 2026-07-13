@@ -8,6 +8,12 @@ from torch import nn
 
 from vmr_detr.ops.span_utils import generalized_temporal_iou, span_cxw_to_xx, span_xx_to_cxw, temporal_iou
 
+from vmr_detr.modeling.fdr import (
+    _decode_fdr_cumulative_outputs,
+    fdr_logits_to_spans,
+    fdr_num_logits,
+    fdr_offset_support,
+)
 from vmr_detr.modeling.matcher import build_matcher, build_hungarian_matcher, build_one_to_many_matcher
 from vmr_detr.modeling.transformer import build_transformer
 from vmr_detr.modeling.position_encoding import build_position_encoding
@@ -97,57 +103,14 @@ def dfl_reference_prior_logits(reference_spans, dfl_num_bins, sigma):
     return prior.reshape(*reference_spans.shape[:-1], 2 * dfl_num_bins)
 
 
-def fdr_offset_support(num_bins, reg_scale, device=None, dtype=None):
-    """Symmetric non-uniform FDR offset bins, dense around zero."""
-    if num_bins < 2:
-        raise ValueError("num_bins must be >= 2.")
-    if reg_scale <= 0:
-        raise ValueError("reg_scale must be > 0.")
-    base = torch.linspace(-1.0, 1.0, num_bins, device=device, dtype=dtype)
-    return base.sign() * base.abs().pow(float(reg_scale))
-
-
-def fdr_logits_to_spans(span_logits, reference_spans, fdr_num_bins, fdr_reg_scale, fdr_min_ref_width):
-    """Decode residual start/end offset distributions around decoder references."""
-    if fdr_min_ref_width <= 0:
-        raise ValueError("fdr_min_ref_width must be > 0.")
-    logits = span_logits.reshape(*span_logits.shape[:-1], 2, fdr_num_bins)
-    prob = F.softmax(logits, dim=-1)
-    support = fdr_offset_support(
-        fdr_num_bins, fdr_reg_scale, device=prob.device, dtype=prob.dtype
-    )
-    offsets = (prob * support.view(*([1] * (prob.dim() - 1)), fdr_num_bins)).sum(dim=-1)
-
-    ref_xx = span_cxw_to_xx(reference_spans).clamp(0, 1)
-    ref_width = (ref_xx[..., 1] - ref_xx[..., 0]).clamp(min=fdr_min_ref_width)
-    pred_start = ref_xx[..., 0] + offsets[..., 0] * ref_width
-    pred_end = ref_xx[..., 1] + offsets[..., 1] * ref_width
-    start = torch.minimum(pred_start, pred_end).clamp(0, 1)
-    end = torch.maximum(pred_start, pred_end).clamp(0, 1)
-    return span_xx_to_cxw(torch.stack([start, end], dim=-1))
-
-
-def _decode_fdr_cumulative_outputs(span_delta_logits, reference_spans, fdr_num_bins,
-                                   fdr_reg_scale, fdr_min_ref_width):
-    """Decode cumulative FDR logits against the initial decoder reference."""
-    span_logits = torch.cumsum(span_delta_logits, dim=0)
-    initial_reference = reference_spans[:1].expand_as(reference_spans)
-    spans = fdr_logits_to_spans(
-        span_logits,
-        initial_reference,
-        fdr_num_bins,
-        fdr_reg_scale,
-        fdr_min_ref_width,
-    )
-    return span_logits, spans, initial_reference
-
-
 class ProposalRefinementStage(nn.Module):
     """Joint second-stage localization refinement and localization-quality scoring."""
 
-    def __init__(self, hidden_dim, stage2_dim=128, inner_bins=4,
+    def __init__(self, hidden_dim, stage2_dim=128, inner_bins=8,
                  boundary_samples=2, max_shift_clips=1, span_num_bins=None,
-                 shift_frac=0.0, exp_width=False, width_beta=0.7):
+                 shift_frac=0.0, exp_width=False, width_beta=0.7,
+                 samples_per_bin=4, num_heads=4, encoder_layers=1,
+                 offset_bins=9):
         super().__init__()
         if inner_bins < 1:
             raise ValueError("inner_bins must be >= 1.")
@@ -159,8 +122,17 @@ class ProposalRefinementStage(nn.Module):
             raise ValueError("shift_frac must be >= 0.")
         if width_beta < 0:
             raise ValueError("width_beta must be >= 0.")
+        if samples_per_bin < 1:
+            raise ValueError("samples_per_bin must be >= 1.")
+        if num_heads < 1 or stage2_dim % num_heads != 0:
+            raise ValueError("num_heads must divide stage2_dim.")
+        if encoder_layers < 1:
+            raise ValueError("encoder_layers must be >= 1.")
+        if offset_bins < 3 or offset_bins % 2 == 0:
+            raise ValueError("offset_bins must be an odd integer >= 3.")
 
         self.hidden_dim = hidden_dim
+        self.stage2_dim = stage2_dim
         self.inner_bins = inner_bins
         self.boundary_samples = boundary_samples
         self.max_shift_clips = max_shift_clips
@@ -168,15 +140,35 @@ class ProposalRefinementStage(nn.Module):
         self.shift_frac = shift_frac
         self.exp_width = exp_width
         self.width_beta = width_beta
+        self.samples_per_bin = samples_per_bin
+        self.offset_bins = offset_bins
 
-        # Query state + four directional pools + ordered inner bins + geometry + entropy.
-        in_dim = hidden_dim * (5 + inner_bins) + 6
+        self.token_proj = nn.Linear(hidden_dim, stage2_dim)
+        self.position_proj = nn.Linear(1, stage2_dim)
+        # query, start-before, start-after, interior, end-before, end-after
+        self.role_embed = nn.Embedding(6, stage2_dim)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=stage2_dim,
+            nhead=num_heads,
+            dim_feedforward=4 * stage2_dim,
+            dropout=0.1,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.proposal_encoder = nn.TransformerEncoder(
+            encoder_layer, num_layers=encoder_layers
+        )
+
+        # Encoded query, start, interior and end summaries + geometry + entropy.
+        in_dim = 4 * stage2_dim + 6
+        localization_outputs = 2 if exp_width else 2 * offset_bins
         self.localization_head = nn.Sequential(
             nn.Linear(in_dim, stage2_dim),
             nn.ReLU(),
             nn.Linear(stage2_dim, stage2_dim),
             nn.ReLU(),
-            nn.Linear(stage2_dim, 2),
+            nn.Linear(stage2_dim, localization_outputs),
         )
         self.quality_head = nn.Sequential(
             nn.Linear(in_dim, stage2_dim),
@@ -213,7 +205,7 @@ class ProposalRefinementStage(nn.Module):
         return sampled.permute(0, 2, 3, 1)
 
     def _pool_features(self, vid_mem, spans_xx, valid_len):
-        """Return directional boundary pools and ordered inner-region bins."""
+        """Return ordered boundary samples and interval-pooled interior bins."""
         start = spans_xx[..., 0]
         end = spans_xx[..., 1]
         dtype = spans_xx.dtype
@@ -224,24 +216,56 @@ class ProposalRefinementStage(nn.Module):
         ) + 0.5
         offsets = offsets[None, None, :] / valid_len.to(dtype).clamp(min=1)[:, None, None]
 
-        start_before = self._sample_1d(vid_mem, start.unsqueeze(-1) - offsets, valid_len).mean(2)
-        start_after = self._sample_1d(vid_mem, start.unsqueeze(-1) + offsets, valid_len).mean(2)
-        end_before = self._sample_1d(vid_mem, end.unsqueeze(-1) - offsets, valid_len).mean(2)
-        end_after = self._sample_1d(vid_mem, end.unsqueeze(-1) + offsets, valid_len).mean(2)
+        start_before_pos = start.unsqueeze(-1) - offsets
+        start_after_pos = start.unsqueeze(-1) + offsets
+        end_before_pos = end.unsqueeze(-1) - offsets
+        end_after_pos = end.unsqueeze(-1) + offsets
 
+        # Flip the "before" groups so all boundary tokens are chronological.
+        start_before_pos = start_before_pos.flip(-1)
+        end_before_pos = end_before_pos.flip(-1)
+        boundary_positions = torch.cat(
+            [start_before_pos, start_after_pos, end_before_pos, end_after_pos],
+            dim=-1,
+        )
+        boundary = self._sample_1d(
+            vid_mem, boundary_positions, valid_len
+        )
+
+        bin_ids = torch.arange(self.inner_bins, device=device, dtype=dtype)
+        sample_ids = torch.arange(
+            self.samples_per_bin, device=device, dtype=dtype
+        )
         fractions = (
-            torch.arange(self.inner_bins, device=device, dtype=dtype) + 0.5
+            bin_ids[:, None]
+            + (sample_ids[None, :] + 0.5) / float(self.samples_per_bin)
         ) / float(self.inner_bins)
         inner_positions = (
+            start[..., None, None]
+            + (end - start)[..., None, None] * fractions
+        )
+        bsz, queries = start.shape
+        sampled_inner = self._sample_1d(
+            vid_mem,
+            inner_positions.reshape(
+                bsz, queries, self.inner_bins * self.samples_per_bin
+            ),
+            valid_len,
+        )
+        sampled_inner = sampled_inner.reshape(
+            bsz,
+            queries,
+            self.inner_bins,
+            self.samples_per_bin,
+            self.hidden_dim,
+        )
+        inner = sampled_inner.mean(dim=3)
+        inner_bin_positions = (
             start.unsqueeze(-1)
-            + (end - start).unsqueeze(-1) * fractions[None, None, :]
+            + (end - start).unsqueeze(-1)
+            * ((bin_ids + 0.5) / float(self.inner_bins))
         )
-        inner = self._sample_1d(vid_mem, inner_positions, valid_len)
-        inner = inner.flatten(2)
-        directional = torch.cat(
-            [start_before, start_after, end_before, end_after], dim=-1
-        )
-        return directional, inner
+        return boundary, inner, boundary_positions, inner_bin_positions
 
     def _boundary_entropy(self, pred_span_logits, reference):
         if pred_span_logits is None or self.span_num_bins is None:
@@ -255,10 +279,66 @@ class ProposalRefinementStage(nn.Module):
 
     def _assemble_features(self, hs_last, spans, vid_mem, valid_len, entropy):
         spans_xx = span_cxw_to_xx(spans).clamp(0, 1)
-        directional, inner = self._pool_features(vid_mem, spans_xx, valid_len)
+        boundary, inner, boundary_positions, inner_positions = self._pool_features(
+            vid_mem, spans_xx, valid_len
+        )
+        boundary_split = 2 * self.boundary_samples
+        start_boundary = boundary[:, :, :boundary_split]
+        end_boundary = boundary[:, :, boundary_split:]
+        start_boundary_positions = boundary_positions[:, :, :boundary_split]
+        end_boundary_positions = boundary_positions[:, :, boundary_split:]
+        query = hs_last.unsqueeze(2)
+        tokens = torch.cat(
+            [query, start_boundary, inner, end_boundary], dim=2
+        )
+
+        bsz, queries = spans.shape[:2]
+        query_positions = spans_xx.mean(dim=-1, keepdim=True)
+        positions = torch.cat(
+            [query_positions, start_boundary_positions, inner_positions,
+             end_boundary_positions],
+            dim=-1,
+        )
+        min_width = 1.0 / valid_len[:, None]
+        span_width = (spans_xx[..., 1] - spans_xx[..., 0]).clamp(min=min_width)
+        relative_positions = (
+            positions - spans_xx[..., :1]
+        ) / span_width.unsqueeze(-1)
+        role_ids = torch.cat([
+            torch.zeros(1, device=spans.device, dtype=torch.long),
+            torch.ones(self.boundary_samples, device=spans.device, dtype=torch.long),
+            torch.full(
+                (self.boundary_samples,), 2, device=spans.device, dtype=torch.long
+            ),
+            torch.full((self.inner_bins,), 3, device=spans.device, dtype=torch.long),
+            torch.full(
+                (self.boundary_samples,), 4, device=spans.device, dtype=torch.long
+            ),
+            torch.full(
+                (self.boundary_samples,), 5, device=spans.device, dtype=torch.long
+            ),
+        ])
+        token_features = (
+            self.token_proj(tokens)
+            + self.position_proj(relative_positions.unsqueeze(-1))
+            + self.role_embed(role_ids)[None, None]
+        )
+        encoded = self.proposal_encoder(
+            token_features.flatten(0, 1)
+        ).reshape(bsz, queries, tokens.shape[2], self.stage2_dim)
+
+        start_begin = 1
+        start_end = start_begin + 2 * self.boundary_samples
+        inner_end = start_end + self.inner_bins
+        query_feature = encoded[:, :, 0]
+        start_feature = encoded[:, :, start_begin:start_end].mean(dim=2)
+        inner_feature = encoded[:, :, start_end:inner_end].mean(dim=2)
+        end_feature = encoded[:, :, inner_end:].mean(dim=2)
         geometry = torch.cat([spans, spans_xx], dim=-1)
         features = torch.cat(
-            [hs_last, directional, inner, geometry, entropy], dim=-1
+            [query_feature, start_feature, inner_feature, end_feature,
+             geometry, entropy],
+            dim=-1,
         )
         return features, spans_xx
 
@@ -291,8 +371,21 @@ class ProposalRefinementStage(nn.Module):
             half = half_pred * torch.exp(self.width_beta * torch.tanh(raw[..., 1]))
             half = torch.maximum(half, 0.5 * min_width)
         else:
-            max_shift = (base_shift + self.shift_frac * span_width).unsqueeze(-1)
-            boundary_delta = max_shift * torch.tanh(raw)
+            max_shift = base_shift + self.shift_frac * span_width
+            offset_logits = raw.reshape(
+                *raw.shape[:-1], 2, self.offset_bins
+            )
+            support = torch.linspace(
+                -1.0,
+                1.0,
+                self.offset_bins,
+                device=raw.device,
+                dtype=raw.dtype,
+            )
+            normalized_delta = (
+                offset_logits.softmax(dim=-1) * support
+            ).sum(dim=-1)
+            boundary_delta = max_shift.unsqueeze(-1) * normalized_delta
             raw_start = pred_xx[..., 0] + boundary_delta[..., 0]
             raw_end = pred_xx[..., 1] + boundary_delta[..., 1]
             lo = torch.minimum(raw_start, raw_end)
@@ -314,11 +407,15 @@ class ProposalRefinementStage(nn.Module):
         refined_scores = (
             pred_logits.squeeze(-1).sigmoid() * quality_logits.sigmoid()
         )
-        return {
+        outputs = {
             "refined_spans": refined_spans,
             "refined_quality_logits": quality_logits,
             "refined_scores": refined_scores,
         }
+        if not self.exp_width:
+            outputs["refinement_budget"] = max_shift
+            outputs["refined_offset_logits"] = offset_logits
+        return outputs
 
 
 class VMRDETR(nn.Module):
@@ -332,10 +429,13 @@ class VMRDETR(nn.Module):
                  dfl_num_bins=16, dfl_ref_prior_sigma=2.0,
                  fdr_num_bins=32, fdr_reg_scale=1.5, fdr_min_ref_width=None,
                  query_init="random", query_anchor_widths=None,
-                 use_stage2=False, stage2_dim=128, stage2_inner_bins=4,
+                 query_text_init="none",
+                 use_stage2=False, stage2_dim=128, stage2_inner_bins=8,
                  stage2_boundary_samples=2, stage2_max_shift_clips=1,
                  stage2_shift_frac=0.0, stage2_exp_width=False,
-                 stage2_width_beta=0.7,
+                 stage2_width_beta=0.7, stage2_samples_per_bin=4,
+                 stage2_num_heads=4, stage2_encoder_layers=1,
+                 stage2_offset_bins=9,
                  stage2_joint_epoch=30):
         """ Initializes the model.
         Parameters:
@@ -358,6 +458,9 @@ class VMRDETR(nn.Module):
                 dfl: start/end boundary distributions with expectation decoding.
                 fdr: residual start/end boundary-offset distributions around decoder references.
             query_anchor_widths: optional normalized widths for temporal anchor query initialization.
+            query_text_init: str, one of [none, mean, last]; initializes decoder query content from
+                              pooled projected text (zero-initialized, so "none" behavior is preserved
+                              until the model learns to use it).
             use_stage2: enable joint proposal localization and quality refinement.
             # foreground_thd: float, intersection over prediction >= foreground_thd: labeled as foreground
             # background_thd: float, intersection over prediction <= background_thd: labeled background
@@ -379,8 +482,8 @@ class VMRDETR(nn.Module):
             raise ValueError("dfl_ref_prior_sigma must be > 0.")
         self.dfl_num_bins = dfl_num_bins
         self.dfl_ref_prior_sigma = dfl_ref_prior_sigma
-        if fdr_num_bins < 2:
-            raise ValueError("fdr_num_bins must be >= 2.")
+        if fdr_num_bins < 1:
+            raise ValueError("fdr_num_bins/reg_max must be >= 1.")
         if fdr_reg_scale <= 0:
             raise ValueError("fdr_reg_scale must be > 0.")
         if fdr_min_ref_width is None:
@@ -395,7 +498,7 @@ class VMRDETR(nn.Module):
         elif span_loss_type == "dfl":
             span_pred_dim = 2 * dfl_num_bins
         elif span_loss_type == "fdr":
-            span_pred_dim = 2 * fdr_num_bins
+            span_pred_dim = 2 * fdr_num_logits(fdr_num_bins)
         else:
             span_pred_dim = max_v_l * 2
         self.span_embed = MLP(hidden_dim, hidden_dim, span_pred_dim, 3)
@@ -414,7 +517,23 @@ class VMRDETR(nn.Module):
         if query_init == "temporal_anchors":
             with torch.no_grad():
                 self.query_embed.weight.copy_(init_temporal_queries(num_queries, anchor_widths=query_anchor_widths))
-        
+        if query_text_init not in ("none", "mean", "last"):
+            raise ValueError("query_text_init must be one of ['none', 'mean', 'last'].")
+        self.query_text_init = query_text_init
+        if query_text_init != "none":
+            # These modules start as an exact no-op. Preserve the global RNG state
+            # so enabling the no-op path does not shift initialization of the
+            # pre-existing model layers in seed-controlled ablations.
+            rng_state = torch.get_rng_state()
+            try:
+                self.query_content_embed = nn.Embedding(num_queries, hidden_dim)
+                self.txt_query_proj = nn.Linear(hidden_dim, hidden_dim)
+            finally:
+                torch.set_rng_state(rng_state)
+            nn.init.zeros_(self.query_content_embed.weight)
+            nn.init.zeros_(self.txt_query_proj.weight)
+            nn.init.zeros_(self.txt_query_proj.bias)
+
         relu_args = [True] * 3
         relu_args[n_input_proj-1] = False
         relu_args[n_input_proj-2] = False
@@ -452,7 +571,7 @@ class VMRDETR(nn.Module):
             if span_loss_type == "dfl":
                 span_num_bins = dfl_num_bins
             elif span_loss_type == "fdr":
-                span_num_bins = fdr_num_bins
+                span_num_bins = fdr_num_logits(fdr_num_bins)
             self.stage2 = ProposalRefinementStage(
                 hidden_dim=hidden_dim,
                 stage2_dim=stage2_dim,
@@ -463,16 +582,40 @@ class VMRDETR(nn.Module):
                 shift_frac=stage2_shift_frac,
                 exp_width=stage2_exp_width,
                 width_beta=stage2_width_beta,
+                samples_per_bin=stage2_samples_per_bin,
+                num_heads=stage2_num_heads,
+                encoder_layers=stage2_encoder_layers,
+                offset_bins=stage2_offset_bins,
             )
 
     def set_epoch(self, epoch):
         self.current_epoch = int(epoch)
+        if hasattr(self.transformer, "set_epoch"):
+            self.transformer.set_epoch(epoch)
 
     def _validate_text_mask(self, src_txt, src_txt_mask):
         if src_txt.shape[1] == 0 or not src_txt_mask.bool().any(dim=1).all():
             raise ValueError("Each sample must contain at least one valid text token.")
 
-    def _run_text_video_transformer(self, src_vid, src_vid_mask, src_txt, src_txt_mask):
+    def _pool_query_text(self, src_txt, src_txt_mask):
+        """Pool already-projected per-token text features into a single (bs, d) vector.
+
+        "mean" is the masked mean over valid tokens. "last" gathers each sample's
+        last valid token; valid tokens are prefix-contiguous in this dataloader, so
+        this is the EOT position of the stored per-token CLIP text features.
+        """
+        if self.query_text_init == "mean":
+            mask = src_txt_mask.float()
+            return (src_txt * mask.unsqueeze(-1)).sum(1) / mask.sum(1, keepdim=True).clamp(min=1.0)
+        elif self.query_text_init == "last":
+            last_idx = (src_txt_mask.bool().sum(dim=1) - 1).clamp(min=0)
+            batch_idx = torch.arange(src_txt.shape[0], device=src_txt.device)
+            return src_txt[batch_idx, last_idx]
+        else:
+            raise ValueError("query_text_init must be one of ['none', 'mean', 'last'].")
+
+    def _run_text_video_transformer(self, src_vid, src_vid_mask, src_txt, src_txt_mask,
+                                    fdr_guide_head=None):
         src_vid_mask_for_transformer = src_vid_mask.bool()
         pos_vid = self.position_embed(src_vid, src_vid_mask_for_transformer)
         video_length = src_vid.shape[1]
@@ -488,9 +631,20 @@ class VMRDETR(nn.Module):
         pos_global = self.global_rep_pos.reshape([1, 1, self.hidden_dim]).repeat(pos.shape[0], 1, 1)
         pos = torch.cat([pos_global, pos], dim=1)
 
+        transformer_kwargs = {
+            "video_length": video_length,
+            "level1_length": video_length,
+        }
+        if fdr_guide_head is not None:
+            transformer_kwargs["fdr_guide_head"] = fdr_guide_head
+        if self.query_text_init != "none":
+            pooled = self._pool_query_text(src_txt, src_txt_mask)
+            transformer_kwargs["tgt_init"] = (
+                self.query_content_embed.weight.unsqueeze(1)
+                + self.txt_query_proj(pooled).unsqueeze(0)
+            )  # (num_queries, bs, d)
         return self.transformer(
-            src, ~mask, self.query_embed.weight, pos,
-            video_length=video_length, level1_length=video_length
+            src, ~mask, self.query_embed.weight, pos, **transformer_kwargs
         )
 
     def forward(self, src_txt, src_txt_mask, src_vid, src_vid_mask, src_aud=None, src_aud_mask=None):
@@ -517,9 +671,17 @@ class VMRDETR(nn.Module):
         src_txt = self.input_txt_proj(src_txt)
         src_vid = self.input_vid_proj(src_vid)
 
-        hs, reference, vid_mem, memory_global, txt_mem = self._run_text_video_transformer(
-            src_vid, src_vid_mask, src_txt, src_txt_mask
-        )
+        fdr_guide_head = self.span_embed if self.span_loss_type == "fdr" else None
+        if fdr_guide_head is None:
+            transformer_outputs = self._run_text_video_transformer(
+                src_vid, src_vid_mask, src_txt, src_txt_mask
+            )
+        else:
+            transformer_outputs = self._run_text_video_transformer(
+                src_vid, src_vid_mask, src_txt, src_txt_mask,
+                fdr_guide_head=fdr_guide_head,
+            )
+        hs, reference, vid_mem, memory_global, txt_mem = transformer_outputs
 
         outputs_class = self.class_embed(hs)  # (#layers, batch_size, #queries, 1 foreground logit)
         reference_before_sigmoid = inverse_sigmoid(reference)
@@ -745,8 +907,8 @@ class SetCriterion(nn.Module):
         if dfl_num_bins < 2:
             raise ValueError("dfl_num_bins must be >= 2.")
         self.dfl_num_bins = dfl_num_bins
-        if fdr_num_bins < 2:
-            raise ValueError("fdr_num_bins must be >= 2.")
+        if fdr_num_bins < 1:
+            raise ValueError("fdr_num_bins/reg_max must be >= 1.")
         if fdr_reg_scale <= 0:
             raise ValueError("fdr_reg_scale must be > 0.")
         if fdr_min_ref_width is None:
@@ -853,7 +1015,8 @@ class SetCriterion(nn.Module):
             dtype=target_offsets.dtype,
         )
         flat_offsets = target_offsets.reshape(-1).clamp(min=support[0].item(), max=support[-1].item())
-        target_right = torch.searchsorted(support, flat_offsets).clamp(min=1, max=self.fdr_num_bins - 1)
+        num_logits = fdr_num_logits(self.fdr_num_bins)
+        target_right = torch.searchsorted(support, flat_offsets).clamp(min=1, max=num_logits - 1)
         target_left = target_right - 1
         left_values = support[target_left]
         right_values = support[target_right]
@@ -864,7 +1027,8 @@ class SetCriterion(nn.Module):
 
     def _loss_fgl(self, src_span_logits, src_span_refs, src_spans, tgt_spans):
         n_spans = src_span_logits.shape[0]
-        logits = src_span_logits.reshape(n_spans, 2, self.fdr_num_bins).reshape(-1, self.fdr_num_bins)
+        num_logits = fdr_num_logits(self.fdr_num_bins)
+        logits = src_span_logits.reshape(n_spans, 2, num_logits).reshape(-1, num_logits)
         target_left, target_right, weight_left, weight_right = self._fdr_offset_targets(
             src_span_refs.detach(), tgt_spans
         )
@@ -879,7 +1043,7 @@ class SetCriterion(nn.Module):
             ).clamp(0, 1)
             weights = ious.unsqueeze(-1).expand(-1, 2).reshape(-1)
         loss = loss * weights
-        return (loss / float(np.log(self.fdr_num_bins))).view(n_spans, 2)
+        return (loss / float(np.log(num_logits))).view(n_spans, 2)
 
     def _loss_width(self, src_spans, tgt_spans):
         pred_width = src_spans[:, 1]
@@ -965,8 +1129,9 @@ class SetCriterion(nn.Module):
         bsz, num_queries = student_logits.shape[:2]
         temperature = self.go_lsd_temperature
 
-        student = student_logits.reshape(bsz, num_queries, 2, self.fdr_num_bins).reshape(-1, self.fdr_num_bins)
-        teacher = teacher_logits.reshape(bsz, num_queries, 2, self.fdr_num_bins).reshape(-1, self.fdr_num_bins)
+        num_logits = fdr_num_logits(self.fdr_num_bins)
+        student = student_logits.reshape(bsz, num_queries, 2, num_logits).reshape(-1, num_logits)
+        teacher = teacher_logits.reshape(bsz, num_queries, 2, num_logits).reshape(-1, num_logits)
         kl = F.kl_div(
             F.log_softmax(student / temperature, dim=-1),
             F.softmax(teacher / temperature, dim=-1),
@@ -1144,7 +1309,13 @@ class SetCriterion(nn.Module):
                 "loss_stage2_giou": zero,
                 "loss_stage2_quality": zero,
             }
-        zero = zero + outputs["refined_quality_logits"].sum() * 0.0
+        zero = (
+            zero
+            + outputs["refined_spans"].sum() * 0.0
+            + outputs["refined_quality_logits"].sum() * 0.0
+        )
+        if "refined_offset_logits" in outputs:
+            zero = zero + outputs["refined_offset_logits"].sum() * 0.0
         if self.current_epoch <= self.stage2_start_epoch:
             return {
                 "loss_stage2_boundary": zero,
@@ -1166,6 +1337,7 @@ class SetCriterion(nn.Module):
             best_gt_idx = torch.zeros(
                 bsz, num_queries, dtype=torch.long, device=device
             )
+            closest_target_xx = torch.zeros_like(base_xx)
             quality_target = pred_spans.new_zeros(bsz, num_queries)
             for batch_idx in range(bsz):
                 gt_spans = span_labels[batch_idx]["spans"].to(device)
@@ -1177,18 +1349,17 @@ class SetCriterion(nn.Module):
                     refined_xx_target[batch_idx], gt_xx
                 )[0].clamp(0, 1)
                 best_base_iou[batch_idx], best_gt_idx[batch_idx] = base_iou.max(dim=1)
+                closest_target_xx[batch_idx] = gt_xx[best_gt_idx[batch_idx]]
                 quality_target[batch_idx] = refined_iou.max(dim=1).values
 
         positive = best_base_iou > self.stage2_positive_iou
+        if "refinement_budget" in outputs:
+            budget = outputs["refinement_budget"].detach().unsqueeze(-1)
+            required_shift = (closest_target_xx - base_xx).abs()
+            positive = positive & (required_shift <= budget + 1e-6).all(dim=-1)
         if positive.any():
             refined_xx = span_cxw_to_xx(refined_spans)
-            target_xx = torch.zeros_like(refined_xx)
-            for batch_idx in range(bsz):
-                gt_spans = span_labels[batch_idx]["spans"].to(device)
-                if len(gt_spans) == 0:
-                    continue
-                gt_xx = span_cxw_to_xx(gt_spans).clamp(0, 1)
-                target_xx[batch_idx] = gt_xx[best_gt_idx[batch_idx]]
+            target_xx = closest_target_xx
 
             weights = best_base_iou[positive].detach().clamp(min=0.1)
             normalizer = weights.sum().clamp(min=1e-6)
@@ -1198,6 +1369,33 @@ class SetCriterion(nn.Module):
                 reduction="none",
                 beta=1.0 / float(self.max_v_l),
             ).mean(dim=-1)
+            if (
+                "refined_offset_logits" in outputs
+                and "refinement_budget" in outputs
+            ):
+                offset_logits = outputs["refined_offset_logits"][positive]
+                num_offsets = offset_logits.shape[-1]
+                positive_budget = outputs["refinement_budget"][positive].detach()
+                normalized_target = (
+                    target_xx[positive] - base_xx[positive]
+                ) / positive_budget.unsqueeze(-1).clamp(min=1e-8)
+                target_bins = (
+                    normalized_target.clamp(-1, 1) + 1.0
+                ) * (0.5 * float(num_offsets - 1))
+                target_left = target_bins.floor().long()
+                target_right = (target_left + 1).clamp(max=num_offsets - 1)
+                weight_right = target_bins - target_left.float()
+                weight_left = 1.0 - weight_right
+                flat_logits = offset_logits.reshape(-1, num_offsets)
+                distribution = (
+                    F.cross_entropy(
+                        flat_logits, target_left.reshape(-1), reduction="none"
+                    ) * weight_left.reshape(-1)
+                    + F.cross_entropy(
+                        flat_logits, target_right.reshape(-1), reduction="none"
+                    ) * weight_right.reshape(-1)
+                ).reshape(-1, 2).mean(dim=-1)
+                boundary = boundary + distribution / float(np.log(num_offsets))
             giou = 1 - torch.diag(generalized_temporal_iou(
                 refined_xx[positive], target_xx[positive]
             ))
@@ -1660,18 +1858,23 @@ def build_model(args):
     fdr_min_ref_width = getattr(args, "fdr_min_ref_width", None)
     query_init = getattr(args, "query_init", "random")
     query_anchor_widths = getattr(args, "query_anchor_widths", None)
+    query_text_init = getattr(args, "query_text_init", "none")
     video_input_proj = getattr(args, "video_input_proj", "linear")
     if fdr_min_ref_width is not None and fdr_min_ref_width <= 0:
         fdr_min_ref_width = 1.0 / float(args.max_v_l)
 
     use_stage2 = getattr(args, "use_stage2", False)
     stage2_dim = getattr(args, "stage2_dim", 128)
-    stage2_inner_bins = getattr(args, "stage2_inner_bins", 4)
+    stage2_inner_bins = getattr(args, "stage2_inner_bins", 8)
     stage2_boundary_samples = getattr(args, "stage2_boundary_samples", 2)
     stage2_max_shift_clips = getattr(args, "stage2_max_shift_clips", 1)
     stage2_shift_frac = getattr(args, "stage2_shift_frac", 0.0)
     stage2_exp_width = getattr(args, "stage2_exp_width", False)
     stage2_width_beta = getattr(args, "stage2_width_beta", 0.7)
+    stage2_samples_per_bin = getattr(args, "stage2_samples_per_bin", 4)
+    stage2_num_heads = getattr(args, "stage2_num_heads", 4)
+    stage2_encoder_layers = getattr(args, "stage2_encoder_layers", 1)
+    stage2_offset_bins = getattr(args, "stage2_offset_bins", 9)
     stage2_joint_epoch = getattr(args, "stage2_joint_epoch", 30)
     if use_stage2 and args.span_loss_type not in ("l1", "dfl", "fdr"):
         raise ValueError("Stage 2 requires span_loss_type l1, dfl, or fdr.")
@@ -1702,6 +1905,7 @@ def build_model(args):
             video_input_proj=video_input_proj,
             query_init=query_init,
             query_anchor_widths=query_anchor_widths,
+            query_text_init=query_text_init,
             use_stage2=use_stage2,
             stage2_dim=stage2_dim,
             stage2_inner_bins=stage2_inner_bins,
@@ -1710,6 +1914,10 @@ def build_model(args):
             stage2_shift_frac=stage2_shift_frac,
             stage2_exp_width=stage2_exp_width,
             stage2_width_beta=stage2_width_beta,
+            stage2_samples_per_bin=stage2_samples_per_bin,
+            stage2_num_heads=stage2_num_heads,
+            stage2_encoder_layers=stage2_encoder_layers,
+            stage2_offset_bins=stage2_offset_bins,
             stage2_joint_epoch=stage2_joint_epoch,
         )
     else:
@@ -1737,6 +1945,7 @@ def build_model(args):
             video_input_proj=video_input_proj,
             query_init=query_init,
             query_anchor_widths=query_anchor_widths,
+            query_text_init=query_text_init,
             use_stage2=use_stage2,
             stage2_dim=stage2_dim,
             stage2_inner_bins=stage2_inner_bins,
@@ -1745,6 +1954,10 @@ def build_model(args):
             stage2_shift_frac=stage2_shift_frac,
             stage2_exp_width=stage2_exp_width,
             stage2_width_beta=stage2_width_beta,
+            stage2_samples_per_bin=stage2_samples_per_bin,
+            stage2_num_heads=stage2_num_heads,
+            stage2_encoder_layers=stage2_encoder_layers,
+            stage2_offset_bins=stage2_offset_bins,
             stage2_joint_epoch=stage2_joint_epoch,
         )
 

@@ -16,6 +16,7 @@ from torch import nn, Tensor
 import math
 import numpy as np
 from .attention import MultiheadAttention
+from .fdr import fdr_logits_to_spans
 
 class MLP(nn.Module):
     """ Very simple multi-layer perceptron (also called FFN)"""
@@ -65,6 +66,12 @@ class Transformer(nn.Module):
                  num_patterns=0,
                  modulate_t_attn=True,
                  bbox_embed_diff_each_layer=False,
+                 fdr_decoder_refine=False,
+                 fdr_num_bins=32,
+                 fdr_reg_scale=1.5,
+                 fdr_min_ref_width=1.0 / 75.0,
+                 fdr_guide_start_epoch=0,
+                 fdr_guide_ramp_epochs=0,
                  ):
         super().__init__()
 
@@ -88,7 +95,13 @@ class Transformer(nn.Module):
                                           return_intermediate=return_intermediate_dec,
                                           d_model=d_model, query_dim=query_dim, keep_query_pos=keep_query_pos, query_scale_type=query_scale_type,
                                           modulate_t_attn=modulate_t_attn,
-                                          bbox_embed_diff_each_layer=bbox_embed_diff_each_layer)
+                                          bbox_embed_diff_each_layer=bbox_embed_diff_each_layer,
+                                          fdr_decoder_refine=fdr_decoder_refine,
+                                          fdr_num_bins=fdr_num_bins,
+                                          fdr_reg_scale=fdr_reg_scale,
+                                          fdr_min_ref_width=fdr_min_ref_width,
+                                          fdr_guide_start_epoch=fdr_guide_start_epoch,
+                                          fdr_guide_ramp_epochs=fdr_guide_ramp_epochs)
 
         self._reset_parameters()
 
@@ -103,15 +116,21 @@ class Transformer(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
+    def set_epoch(self, epoch):
+        self.decoder.set_epoch(epoch)
+
     # for tvsum, add video_length in argument
     def forward(self, src, mask, query_embed, pos_embed,
-                video_length=None, level1_length=None):
+                video_length=None, level1_length=None, fdr_guide_head=None,
+                tgt_init=None):
         """
         Args:
             src: (batch_size, L, d)
             mask: (batch_size, L)
             query_embed: (#queries, d)
             pos_embed: (batch_size, L, d) the same as src
+            tgt_init: optional (#queries, batch_size, d) initial decoder query content,
+                      defaults to zeros.
 
         Returns:
 
@@ -140,9 +159,16 @@ class Transformer(nn.Module):
         mask_local = mask[:, 1:]
         pos_embed_local = pos_embed[1:]
 
-        tgt = torch.zeros(refpoint_embed.shape[0], bs, d, device=src.device)
+        if tgt_init is not None:
+            if tuple(tgt_init.shape) != (refpoint_embed.shape[0], bs, d):
+                raise ValueError("tgt_init.shape must be {}, got {}.".format(
+                    (refpoint_embed.shape[0], bs, d), tuple(tgt_init.shape)))
+            tgt = tgt_init
+        else:
+            tgt = torch.zeros(refpoint_embed.shape[0], bs, d, device=src.device)
         hs, references = self.decoder(tgt, memory_local, memory_key_padding_mask=mask_local,
-                          pos=pos_embed_local, refpoints_unsigmoid=refpoint_embed)  # (#layers, #queries, batch_size, d)
+                          pos=pos_embed_local, refpoints_unsigmoid=refpoint_embed,
+                          fdr_guide_head=fdr_guide_head)  # (#layers, #queries, batch_size, d)
         # hs = hs.transpose(1, 2)  # (#layers, batch_size, #qeries, d)
         # memory = memory.permute(1, 2, 0)  # (batch_size, d, L)
         memory_local = memory_local[:level1_length].transpose(0, 1)  # (batch_size, L_level1, d)
@@ -190,6 +216,12 @@ class TransformerDecoder(nn.Module):
                  d_model=256, query_dim=2, keep_query_pos=False, query_scale_type='cond_elewise',
                  modulate_t_attn=False,
                  bbox_embed_diff_each_layer=False,
+                 fdr_decoder_refine=False,
+                 fdr_num_bins=32,
+                 fdr_reg_scale=1.5,
+                 fdr_min_ref_width=1.0 / 75.0,
+                 fdr_guide_start_epoch=0,
+                 fdr_guide_ramp_epochs=0,
                  ):
         super().__init__()
         self.layers = _get_clones(decoder_layer, num_layers)
@@ -212,23 +244,46 @@ class TransformerDecoder(nn.Module):
 
         self.ref_point_head = MLP(d_model, d_model, d_model, 2)
 
-        # self.bbox_embed = None
-        # for DAB-deter
-        if bbox_embed_diff_each_layer:
+        self.fdr_decoder_refine = bool(fdr_decoder_refine)
+
+        # FDR supplies its own iterative references, so the legacy DAB refiner
+        # would be both unused and disconnected from the loss in this mode.
+        if self.fdr_decoder_refine:
+            self.bbox_embed = None
+        elif bbox_embed_diff_each_layer:
             self.bbox_embed = nn.ModuleList([MLP(d_model, d_model, 2, 3) for i in range(num_layers)])
         else:
             self.bbox_embed = MLP(d_model, d_model, 2, 3)
-        # init bbox_embed
-        if bbox_embed_diff_each_layer:
-            for bbox_embed in self.bbox_embed:
-                nn.init.constant_(bbox_embed.layers[-1].weight.data, 0)
-                nn.init.constant_(bbox_embed.layers[-1].bias.data, 0)
-        else:
-            nn.init.constant_(self.bbox_embed.layers[-1].weight.data, 0)
-            nn.init.constant_(self.bbox_embed.layers[-1].bias.data, 0)
+
+        if self.bbox_embed is not None:
+            if bbox_embed_diff_each_layer:
+                for bbox_embed in self.bbox_embed:
+                    nn.init.constant_(bbox_embed.layers[-1].weight.data, 0)
+                    nn.init.constant_(bbox_embed.layers[-1].bias.data, 0)
+            else:
+                nn.init.constant_(self.bbox_embed.layers[-1].weight.data, 0)
+                nn.init.constant_(self.bbox_embed.layers[-1].bias.data, 0)
         self.d_model = d_model
         self.modulate_t_attn = modulate_t_attn
         self.bbox_embed_diff_each_layer = bbox_embed_diff_each_layer
+        if fdr_num_bins < 1:
+            raise ValueError("fdr_num_bins/reg_max must be >= 1.")
+        if fdr_reg_scale <= 0:
+            raise ValueError("fdr_reg_scale must be > 0.")
+        if fdr_min_ref_width is None:
+            fdr_min_ref_width = 1.0 / 75.0
+        if fdr_min_ref_width <= 0:
+            raise ValueError("fdr_min_ref_width must be > 0.")
+        if fdr_guide_start_epoch < 0:
+            raise ValueError("fdr_guide_start_epoch must be >= 0.")
+        if fdr_guide_ramp_epochs < 0:
+            raise ValueError("fdr_guide_ramp_epochs must be >= 0.")
+        self.fdr_num_bins = fdr_num_bins
+        self.fdr_reg_scale = fdr_reg_scale
+        self.fdr_min_ref_width = fdr_min_ref_width
+        self.fdr_guide_start_epoch = int(fdr_guide_start_epoch)
+        self.fdr_guide_ramp_epochs = int(fdr_guide_ramp_epochs)
+        self.current_epoch = None
 
         if modulate_t_attn:
             self.ref_anchor_head = MLP(d_model, d_model, 1, 2)
@@ -237,6 +292,12 @@ class TransformerDecoder(nn.Module):
             for layer_id in range(num_layers - 1):
                 self.layers[layer_id + 1].ca_qpos_proj = None
 
+    def set_epoch(self, epoch):
+        self.current_epoch = int(epoch)
+
+    def _guide_attention_strength(self):
+        return 1.0 if self.fdr_decoder_refine else 0.0
+
     def forward(self, tgt, memory,
                 tgt_mask: Optional[Tensor] = None,
                 memory_mask: Optional[Tensor] = None,
@@ -244,12 +305,15 @@ class TransformerDecoder(nn.Module):
                 memory_key_padding_mask: Optional[Tensor] = None,
                 pos: Optional[Tensor] = None,
                 refpoints_unsigmoid: Optional[Tensor] = None,  # num_queries, bs, 2
+                fdr_guide_head=None,
                 ):
         output = tgt
 
         intermediate = []
         reference_points = refpoints_unsigmoid.sigmoid()
         ref_points = [reference_points]
+        initial_reference_points = reference_points.detach()
+        fdr_logits_accum = None
 
         # import ipdb; ipdb.set_trace()
 
@@ -280,7 +344,10 @@ class TransformerDecoder(nn.Module):
                 # print(obj_center.shape, obj_center[..., 1].shape) # 10 32 2, 10 32
                 # print(query_sine_embed.shape) # 10 32 256
 
-                query_sine_embed *= (reft_cond[..., 0] / obj_center[..., 1]).unsqueeze(-1)
+                reference_width = obj_center[..., 1]
+                if self.fdr_decoder_refine:
+                    reference_width = reference_width.clamp_min(self.fdr_min_ref_width)
+                query_sine_embed *= (reft_cond[..., 0] / reference_width).unsqueeze(-1)
 
             output = layer(output, memory, tgt_mask=tgt_mask,
                            memory_mask=memory_mask,
@@ -289,8 +356,32 @@ class TransformerDecoder(nn.Module):
                            pos=pos, query_pos=query_pos, query_sine_embed=query_sine_embed,
                            is_first=(layer_id == 0))
 
+            fdr_reference_points = None
+            guide_strength = self._guide_attention_strength()
+            if (guide_strength > 0 and fdr_guide_head is not None
+                    and layer_id != self.num_layers - 1):
+                with torch.no_grad():
+                    guide_output = self.norm(output) if self.norm is not None else output
+                    fdr_delta_logits = fdr_guide_head(guide_output)
+                    fdr_logits_accum = (
+                        fdr_delta_logits if fdr_logits_accum is None
+                        else fdr_logits_accum + fdr_delta_logits
+                    )
+                    fdr_reference_points = fdr_logits_to_spans(
+                        fdr_logits_accum,
+                        initial_reference_points,
+                        self.fdr_num_bins,
+                        self.fdr_reg_scale,
+                        self.fdr_min_ref_width,
+                    )
+
             # iter update
-            if self.bbox_embed is not None:
+            if fdr_reference_points is not None:
+                reference_points = fdr_reference_points.detach()
+                ref_points.append(reference_points)
+            elif self.fdr_decoder_refine and layer_id != self.num_layers - 1:
+                ref_points.append(reference_points)
+            elif self.bbox_embed is not None:
                 if self.bbox_embed_diff_each_layer:
                     tmp = self.bbox_embed[layer_id](output)
                 else:
@@ -312,7 +403,7 @@ class TransformerDecoder(nn.Module):
                 intermediate.append(output)
 
         if self.return_intermediate:
-            if self.bbox_embed is not None:
+            if self.fdr_decoder_refine or self.bbox_embed is not None:
                 return [
                     torch.stack(intermediate).transpose(1, 2),
                     torch.stack(ref_points).transpose(1, 2),
@@ -771,6 +862,9 @@ def _get_clones(module, N):
 #     )
 
 def build_transformer(args):
+    fdr_min_ref_width = getattr(args, "fdr_min_ref_width", -1.0)
+    if fdr_min_ref_width is None or fdr_min_ref_width <= 0:
+        fdr_min_ref_width = 1.0 / float(args.max_v_l)
     return Transformer(
         d_model=args.hidden_dim,
         dropout=args.dropout,
@@ -781,6 +875,15 @@ def build_transformer(args):
         normalize_before=args.pre_norm,
         return_intermediate_dec=True,
         activation='prelu',
+        fdr_decoder_refine=(
+            getattr(args, "fdr_decoder_refine", False)
+            or getattr(args, "span_loss_type", None) == "fdr"
+        ),
+        fdr_num_bins=getattr(args, "fdr_num_bins", 32),
+        fdr_reg_scale=getattr(args, "fdr_reg_scale", 1.5),
+        fdr_min_ref_width=fdr_min_ref_width,
+        fdr_guide_start_epoch=getattr(args, "fdr_guide_start_epoch", 0),
+        fdr_guide_ramp_epochs=getattr(args, "fdr_guide_ramp_epochs", 0),
     )
 
 

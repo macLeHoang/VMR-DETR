@@ -15,7 +15,8 @@ from vmr_detr.ops.span_utils import span_cxw_to_xx, span_xx_to_cxw
 
 def _make_stage(hidden_dim=16, inner_bins=3, boundary_samples=2,
                 max_shift_clips=1, span_num_bins=8, shift_frac=0.0,
-                exp_width=False, width_beta=0.7):
+                exp_width=False, width_beta=0.7, samples_per_bin=4,
+                offset_bins=9):
     return ProposalRefinementStage(
         hidden_dim=hidden_dim,
         stage2_dim=12,
@@ -26,7 +27,18 @@ def _make_stage(hidden_dim=16, inner_bins=3, boundary_samples=2,
         shift_frac=shift_frac,
         exp_width=exp_width,
         width_beta=width_beta,
+        samples_per_bin=samples_per_bin,
+        offset_bins=offset_bins,
     )
+
+
+def _set_extreme_boundary_bias(stage, start_right=True, end_right=False):
+    """Make each boundary distribution select one end of its support."""
+    bias = torch.full((2, stage.offset_bins), -20.0)
+    bias[0, -1 if start_right else 0] = 20.0
+    bias[1, -1 if end_right else 0] = 20.0
+    torch.nn.init.zeros_(stage.localization_head[-1].weight)
+    stage.localization_head[-1].bias.data.copy_(bias.flatten())
 
 
 def _make_inputs(bsz=2, queries=5, hidden_dim=16, length=12, bins=8):
@@ -80,18 +92,31 @@ class TestProposalRefinementStage(unittest.TestCase):
         )
         memory = torch.arange(8, dtype=torch.float32).view(1, 8, 1)
         spans_xx = torch.tensor([[[0.25, 0.75]]])
-        directional, inner = stage._pool_features(
+        boundary, inner, _, _ = stage._pool_features(
             memory, spans_xx, torch.tensor([8.0])
         )
-        start_before, start_after, end_before, end_after = directional[0, 0]
+        start_before, start_after, end_before, end_after = boundary[0, 0, :, 0]
         self.assertLess(start_before.item(), start_after.item())
         self.assertLess(end_before.item(), end_after.item())
-        self.assertLess(inner[0, 0, 0].item(), inner[0, 0, 1].item())
+        self.assertLess(inner[0, 0, 0, 0].item(), inner[0, 0, 1, 0].item())
+
+    def test_inner_bins_pool_multiple_samples_across_long_span(self):
+        stage = _make_stage(
+            hidden_dim=1, inner_bins=2, boundary_samples=1,
+            span_num_bins=None, samples_per_bin=4,
+        )
+        memory = torch.zeros(1, 8, 1)
+        memory[0, 0, 0] = 8.0
+        spans_xx = torch.tensor([[[0.0, 1.0]]])
+        _, inner, _, _ = stage._pool_features(
+            memory, spans_xx, torch.tensor([8.0])
+        )
+
+        self.assertTrue(torch.allclose(inner[0, 0, :, 0], torch.tensor([2.0, 0.0])))
 
     def test_shift_is_bounded_and_boundaries_remain_ordered(self):
         stage = _make_stage(max_shift_clips=1)
-        torch.nn.init.zeros_(stage.localization_head[-1].weight)
-        stage.localization_head[-1].bias.data.copy_(torch.tensor([20.0, -20.0]))
+        _set_extreme_boundary_bias(stage)
         hs, spans, logits, span_logits, memory, mask = _make_inputs()
         # Use wide spans (>= 0.3) and a full mask so the min-width clamp does not
         # push boundaries beyond base_shift, keeping the bound assertion valid.
@@ -102,6 +127,7 @@ class TestProposalRefinementStage(unittest.TestCase):
         outputs = stage(
             hs, spans, logits, span_logits, memory, mask, detach_stage1=False
         )
+        self.assertEqual(outputs["refined_offset_logits"].shape, (2, 5, 2, 9))
         base_xx = span_cxw_to_xx(spans)
         refined_xx = span_cxw_to_xx(outputs["refined_spans"])
         valid_len = mask.sum(1)
@@ -165,9 +191,7 @@ class TestProposalRefinementStage(unittest.TestCase):
     def test_width_proportional_shift_scales_with_span(self):
         """Wider spans should receive a larger max per-boundary movement when shift_frac > 0."""
         stage = _make_stage(shift_frac=0.5)
-        torch.nn.init.zeros_(stage.localization_head[-1].weight)
-        # Bias saturates tanh: start pushed right (+1), end pushed left (-1)
-        stage.localization_head[-1].bias.data.copy_(torch.tensor([20.0, -20.0]))
+        _set_extreme_boundary_bias(stage)
 
         hidden_dim = 16
         length = 12
@@ -200,9 +224,7 @@ class TestProposalRefinementStage(unittest.TestCase):
     def test_min_width_enforced(self):
         """After boundary collapse, refined span should still have width >= 1/valid_len."""
         stage = _make_stage()
-        torch.nn.init.zeros_(stage.localization_head[-1].weight)
-        # Bias collapses the span: start pushed right, end pushed left
-        stage.localization_head[-1].bias.data.copy_(torch.tensor([20.0, -20.0]))
+        _set_extreme_boundary_bias(stage)
 
         hidden_dim = 16
         length = 12
@@ -351,6 +373,38 @@ class TestStage2Loss(unittest.TestCase):
         self.assertIsNone(base.grad)
         self.assertIsNone(refined.grad)
         self.assertGreater(quality.grad.abs().sum().item(), 0)
+
+    def test_unreachable_target_is_excluded_from_localization_loss(self):
+        criterion = self._criterion()
+        base = torch.tensor([[[0.5, 0.2]]])
+        outputs = {
+            "pred_spans": base,
+            "refined_spans": base.clone().requires_grad_(True),
+            "refined_quality_logits": torch.zeros(1, 1, requires_grad=True),
+            "refinement_budget": torch.tensor([[0.05]]),
+        }
+        targets = {"span_labels": [{"spans": torch.tensor([[0.5, 0.6]])}]}
+        losses = criterion.loss_stage2(outputs, targets, None)
+
+        self.assertEqual(losses["loss_stage2_boundary"].item(), 0.0)
+        self.assertEqual(losses["loss_stage2_giou"].item(), 0.0)
+
+    def test_offset_distribution_receives_localization_gradient(self):
+        criterion = self._criterion()
+        base = torch.tensor([[[0.5, 0.4]]])
+        offset_logits = torch.zeros(1, 1, 2, 9, requires_grad=True)
+        outputs = {
+            "pred_spans": base,
+            "refined_spans": base.clone().requires_grad_(True),
+            "refined_quality_logits": torch.zeros(1, 1, requires_grad=True),
+            "refinement_budget": torch.tensor([[0.1]]),
+            "refined_offset_logits": offset_logits,
+        }
+        targets = {"span_labels": [{"spans": base[0].clone()}]}
+        loss = criterion.loss_stage2(outputs, targets, None)["loss_stage2_boundary"]
+        loss.backward()
+
+        self.assertGreater(offset_logits.grad.abs().sum().item(), 0)
 
 
 class TestStage2ModelIntegration(unittest.TestCase):

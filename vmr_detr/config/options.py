@@ -194,6 +194,9 @@ class BaseOptions(object):
                             help="Query reference initialization strategy.")
         parser.add_argument("--query_anchor_widths", default="", type=str,
                             help="Comma-separated normalized widths for temporal anchor query initialization.")
+        parser.add_argument("--query_text_init", type=str, default="none", choices=["none", "mean", "last"],
+                            help="Initialize decoder query content from pooled projected text "
+                                 "(mean = masked mean over valid tokens, last = last valid token / EOT position).")
         parser.add_argument('--pre_norm', action='store_true')
         # other model configs
         parser.add_argument("--n_input_proj", type=int, default=2, help="#layers to encoder input")
@@ -222,10 +225,18 @@ class BaseOptions(object):
                             help="Enable joint proposal localization and quality refinement.")
         parser.add_argument("--stage2_dim", type=int, default=128,
                             help="Hidden dimension for Stage 2 localization and quality heads.")
-        parser.add_argument("--stage2_inner_bins", type=int, default=4,
-                            help="Number of ordered samples pooled inside each proposal.")
+        parser.add_argument("--stage2_inner_bins", type=int, default=8,
+                            help="Number of interval-pooled bins inside each proposal.")
+        parser.add_argument("--stage2_samples_per_bin", type=int, default=4,
+                            help="Number of temporal samples averaged inside each Stage-2 interior bin.")
         parser.add_argument("--stage2_boundary_samples", type=int, default=2,
                             help="Number of samples pooled on each side of each boundary.")
+        parser.add_argument("--stage2_num_heads", type=int, default=4,
+                            help="Number of attention heads in the Stage-2 proposal encoder.")
+        parser.add_argument("--stage2_encoder_layers", type=int, default=1,
+                            help="Number of Transformer layers in the Stage-2 proposal encoder.")
+        parser.add_argument("--stage2_offset_bins", type=int, default=9,
+                            help="Odd number of local offset classes per refined boundary.")
         parser.add_argument("--stage2_max_shift_clips", type=float, default=1.0,
                             help="Maximum start/end correction measured in valid video clips.")
         parser.add_argument("--stage2_shift_frac", type=float, default=0.0,
@@ -256,11 +267,18 @@ class BaseOptions(object):
         parser.add_argument("--dfl_ref_prior_sigma", default=2.0, type=float,
                             help="Gaussian prior sigma in DFL bins for decoder reference-conditioned logits.")
         parser.add_argument("--fdr_num_bins", default=32, type=int,
-                            help="Number of offset distribution bins for --span_loss_type fdr.")
+                            help="FDR reg_max. Each boundary predicts fdr_num_bins + 1 offset classes.")
         parser.add_argument("--fdr_reg_scale", default=1.5, type=float,
                             help="Curvature for non-uniform FDR offset bins; >1 is denser around zero.")
         parser.add_argument("--fdr_min_ref_width", default=-1.0, type=float,
                             help="Minimum reference width for FDR offset scaling. <=0 uses 1 / max_v_l.")
+        parser.add_argument("--fdr_decoder_refine", action="store_true",
+                            help="Use cumulative FDR logits to update decoder attention references between layers. "
+                                 "Enabled automatically when --span_loss_type fdr.")
+        parser.add_argument("--fdr_guide_start_epoch", default=0, type=int,
+                            help="Deprecated compatibility option; FDR decoder reference updates run from epoch 0.")
+        parser.add_argument("--fdr_guide_ramp_epochs", default=0, type=int,
+                            help="Deprecated compatibility option; FDR decoder reference updates are not ramped.")
         parser.add_argument("--contrastive_align_loss", action="store_true",
                             help="Enable contrastive_align_loss between matched query spans and text.")
         parser.add_argument("--contrastive_start_epoch", default=0, type=int,
@@ -539,8 +557,12 @@ class BaseOptions(object):
         defaults = {
             "use_stage2": False,
             "stage2_dim": 128,
-            "stage2_inner_bins": 4,
+            "stage2_inner_bins": 8,
+            "stage2_samples_per_bin": 4,
             "stage2_boundary_samples": 2,
+            "stage2_num_heads": 4,
+            "stage2_encoder_layers": 1,
+            "stage2_offset_bins": 9,
             "stage2_max_shift_clips": 1.0,
             "stage2_shift_frac": 0.0,
             "stage2_exp_width": False,
@@ -561,8 +583,16 @@ class BaseOptions(object):
             raise ValueError("--stage2_dim must be >= 1.")
         if opt.stage2_inner_bins < 1:
             raise ValueError("--stage2_inner_bins must be >= 1.")
+        if opt.stage2_samples_per_bin < 1:
+            raise ValueError("--stage2_samples_per_bin must be >= 1.")
         if opt.stage2_boundary_samples < 1:
             raise ValueError("--stage2_boundary_samples must be >= 1.")
+        if opt.stage2_num_heads < 1 or opt.stage2_dim % opt.stage2_num_heads != 0:
+            raise ValueError("--stage2_num_heads must divide --stage2_dim.")
+        if opt.stage2_encoder_layers < 1:
+            raise ValueError("--stage2_encoder_layers must be >= 1.")
+        if opt.stage2_offset_bins < 3 or opt.stage2_offset_bins % 2 == 0:
+            raise ValueError("--stage2_offset_bins must be an odd integer >= 3.")
         if opt.stage2_max_shift_clips <= 0:
             raise ValueError("--stage2_max_shift_clips must be > 0.")
         if opt.stage2_shift_frac < 0:
@@ -593,12 +623,18 @@ class BaseOptions(object):
 
     @staticmethod
     def _validate_fdr_options(opt):
-        if opt.fdr_num_bins < 2:
-            raise ValueError("--fdr_num_bins must be >= 2.")
+        if opt.fdr_num_bins < 1:
+            raise ValueError("--fdr_num_bins/reg_max must be >= 1.")
         if opt.fdr_reg_scale <= 0:
             raise ValueError("--fdr_reg_scale must be > 0.")
         if opt.fdr_min_ref_width <= 0:
             opt.fdr_min_ref_width = 1.0 / float(opt.max_v_l)
+        if opt.fdr_decoder_refine and opt.span_loss_type != "fdr":
+            raise ValueError("--fdr_decoder_refine requires --span_loss_type fdr.")
+        if opt.fdr_guide_start_epoch < 0:
+            raise ValueError("--fdr_guide_start_epoch must be >= 0.")
+        if opt.fdr_guide_ramp_epochs < 0:
+            raise ValueError("--fdr_guide_ramp_epochs must be >= 0.")
         if opt.fgl_loss_coef is not None and opt.fgl_loss_coef < 0:
             raise ValueError("--fgl_loss_coef must be >= 0.")
         if opt.go_lsd_loss_coef < 0:

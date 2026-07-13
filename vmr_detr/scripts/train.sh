@@ -72,7 +72,12 @@ span_loss_type=fdr
 fdr_num_bins=32
 fdr_reg_scale=1.5
 fdr_min_ref_width=0.0
+fdr_decoder_refine_flag=--fdr_decoder_refine
+fdr_guide_start_epoch=0
+fdr_guide_ramp_epochs=0
 query_anchor_widths=0.08,0.22,0.48
+# Pooled-text decoder query content initialization: none | mean | last
+query_text_init=mean
 matching_type=hungarian
 aux_matching_type=one_to_many
 aux_one_to_many_k=3
@@ -93,9 +98,9 @@ label_loss_coef=12.0
 label_loss_type=vfl
 
 # Losses: GO-LSD self-distillation, disabled by default here
-go_lsd_loss_coef=0.0
-go_lsd_temperature=3.0
-go_lsd_start_epoch=10
+go_lsd_loss_coef=1.0
+go_lsd_temperature=4.0
+go_lsd_start_epoch=0
 
 # Losses: contrastive query/text alignment
 contrastive_align_loss_flag=--contrastive_align_loss
@@ -119,15 +124,20 @@ hardneg_ramp_epoch=20
 # Unified localization and confidence refinement stage
 stage2_flag=--use_stage2
 stage2_dim=128
-stage2_inner_bins=4
-stage2_boundary_samples=4
-stage2_max_shift_clips=3
-stage2_shift_frac=0.25
-stage2_exp_width_flag=--stage2_exp_width
+stage2_inner_bins=8
+stage2_samples_per_bin=4
+stage2_boundary_samples=3
+stage2_num_heads=4
+stage2_encoder_layers=1
+stage2_offset_bins=9
+stage2_max_shift_clips=4
+stage2_shift_frac=0.0
+# Leave empty to use independent start/end offset distributions.
+stage2_exp_width_flag=
 stage2_width_beta=0.7
 stage2_positive_iou=0.4
-stage2_start_epoch=10
-stage2_joint_epoch=20
+stage2_start_epoch=20
+stage2_joint_epoch=30
 stage2_boundary_loss_coef=0.5
 stage2_giou_loss_coef=0.5
 stage2_quality_loss_coef=1.0
@@ -159,6 +169,18 @@ if [[ -n "${query_anchor_widths}" ]]; then
 else
   echo "Using default temporal anchor widths."
 fi
+
+query_text_init_args=()
+case "${query_text_init}" in
+  none|mean|last)
+    echo "Using query_text_init=${query_text_init}"
+    query_text_init_args=(--query_text_init "${query_text_init}")
+    ;;
+  *)
+    echo "Invalid query_text_init=${query_text_init}; expected one of: none, mean, last." >&2
+    exit 1
+    ;;
+esac
 
 PYTHONPATH="${PYTHONPATH}:." python vmr_detr/cli/train.py \
   --dset_name "${dset_name}" \
@@ -192,6 +214,7 @@ PYTHONPATH="${PYTHONPATH}:." python vmr_detr/cli/train.py \
   --video_input_proj "${video_input_proj}" \
   --query_init temporal_anchors \
   "${query_anchor_widths_args[@]}" \
+  "${query_text_init_args[@]}" \
   --bsz "${bsz}" \
   --eval_bsz "${eval_bsz}" \
   --n_epoch "${n_epoch}" \
@@ -202,6 +225,9 @@ PYTHONPATH="${PYTHONPATH}:." python vmr_detr/cli/train.py \
   --fdr_num_bins "${fdr_num_bins}" \
   --fdr_reg_scale "${fdr_reg_scale}" \
   --fdr_min_ref_width "${fdr_min_ref_width}" \
+  ${fdr_decoder_refine_flag} \
+  --fdr_guide_start_epoch "${fdr_guide_start_epoch}" \
+  --fdr_guide_ramp_epochs "${fdr_guide_ramp_epochs}" \
   --matching_type "${matching_type}" \
   --aux_matching_type "${aux_matching_type}" \
   --aux_one_to_many_k "${aux_one_to_many_k}" \
@@ -230,7 +256,11 @@ PYTHONPATH="${PYTHONPATH}:." python vmr_detr/cli/train.py \
   ${stage2_flag} \
   --stage2_dim "${stage2_dim}" \
   --stage2_inner_bins "${stage2_inner_bins}" \
+  --stage2_samples_per_bin "${stage2_samples_per_bin}" \
   --stage2_boundary_samples "${stage2_boundary_samples}" \
+  --stage2_num_heads "${stage2_num_heads}" \
+  --stage2_encoder_layers "${stage2_encoder_layers}" \
+  --stage2_offset_bins "${stage2_offset_bins}" \
   --stage2_max_shift_clips "${stage2_max_shift_clips}" \
   --stage2_shift_frac "${stage2_shift_frac}" \
   ${stage2_exp_width_flag} \
