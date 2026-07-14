@@ -72,6 +72,7 @@ class Transformer(nn.Module):
                  fdr_min_ref_width=1.0 / 75.0,
                  fdr_guide_start_epoch=0,
                  fdr_guide_ramp_epochs=0,
+                 decoder_text_xattn=False,
                  ):
         super().__init__()
 
@@ -89,7 +90,8 @@ class Transformer(nn.Module):
 
         # TransformerDecoderLayerThin
         decoder_layer = TransformerDecoderLayer(d_model, nhead, dim_feedforward,
-                                                dropout, activation, normalize_before, keep_query_pos=keep_query_pos)
+                                                dropout, activation, normalize_before, keep_query_pos=keep_query_pos,
+                                                text_xattn=decoder_text_xattn)
         decoder_norm = nn.LayerNorm(d_model)
         self.decoder = TransformerDecoder(decoder_layer, num_decoder_layers, decoder_norm,
                                           return_intermediate=return_intermediate_dec,
@@ -150,6 +152,7 @@ class Transformer(nn.Module):
         txt_memory = src[video_length + 1:]
         # print('after encoder : ',src.shape)
         src = src[:video_length + 1]
+        txt_key_padding_mask = mask[:, video_length + 1:]
         mask = mask[:, :video_length + 1]
         pos_embed = pos_embed[:video_length + 1]
 
@@ -168,7 +171,9 @@ class Transformer(nn.Module):
             tgt = torch.zeros(refpoint_embed.shape[0], bs, d, device=src.device)
         hs, references = self.decoder(tgt, memory_local, memory_key_padding_mask=mask_local,
                           pos=pos_embed_local, refpoints_unsigmoid=refpoint_embed,
-                          fdr_guide_head=fdr_guide_head)  # (#layers, #queries, batch_size, d)
+                          fdr_guide_head=fdr_guide_head,
+                          txt_memory=txt_memory,
+                          txt_key_padding_mask=txt_key_padding_mask)  # (#layers, #queries, batch_size, d)
         # hs = hs.transpose(1, 2)  # (#layers, batch_size, #qeries, d)
         # memory = memory.permute(1, 2, 0)  # (batch_size, d, L)
         memory_local = memory_local[:level1_length].transpose(0, 1)  # (batch_size, L_level1, d)
@@ -306,6 +311,8 @@ class TransformerDecoder(nn.Module):
                 pos: Optional[Tensor] = None,
                 refpoints_unsigmoid: Optional[Tensor] = None,  # num_queries, bs, 2
                 fdr_guide_head=None,
+                txt_memory=None,
+                txt_key_padding_mask=None,
                 ):
         output = tgt
 
@@ -354,7 +361,8 @@ class TransformerDecoder(nn.Module):
                            tgt_key_padding_mask=tgt_key_padding_mask,
                            memory_key_padding_mask=memory_key_padding_mask,
                            pos=pos, query_pos=query_pos, query_sine_embed=query_sine_embed,
-                           is_first=(layer_id == 0))
+                           is_first=(layer_id == 0),
+                           txt_memory=txt_memory, txt_key_padding_mask=txt_key_padding_mask)
 
             fdr_reference_points = None
             guide_strength = self._guide_attention_strength()
@@ -635,7 +643,7 @@ class TransformerDecoderLayer(nn.Module):
 
     def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1,
                  activation="relu", normalize_before=False, keep_query_pos=False,
-                 rm_self_attn_decoder=False):
+                 rm_self_attn_decoder=False, text_xattn=False):
         super().__init__()
         # Decoder Self-Attention
         if not rm_self_attn_decoder:
@@ -675,6 +683,15 @@ class TransformerDecoderLayer(nn.Module):
         self.normalize_before = normalize_before
         self.keep_query_pos = keep_query_pos
 
+        self.text_xattn = bool(text_xattn)
+        if self.text_xattn:
+            self.ca_text_qcontent_proj = nn.Linear(d_model, d_model)
+            self.ca_text_kcontent_proj = nn.Linear(d_model, d_model)
+            self.ca_text_v_proj = nn.Linear(d_model, d_model)
+            self.text_cross_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+            self.dropout_text = nn.Dropout(dropout)
+            self.text_gate = nn.Parameter(torch.zeros(d_model))
+
     def with_pos_embed(self, tensor, pos: Optional[Tensor]):
         return tensor if pos is None else tensor + pos
 
@@ -686,7 +703,9 @@ class TransformerDecoderLayer(nn.Module):
                 pos: Optional[Tensor] = None,
                 query_pos: Optional[Tensor] = None,
                 query_sine_embed=None,
-                is_first=False):
+                is_first=False,
+                txt_memory=None,
+                txt_key_padding_mask=None):
 
         # ========== Begin of Self-Attention =============
         if not self.rm_self_attn_decoder:
@@ -749,6 +768,14 @@ class TransformerDecoderLayer(nn.Module):
 
         tgt = tgt + self.dropout2(tgt2)
         tgt = self.norm2(tgt)
+
+        if getattr(self, "text_xattn", False) and txt_memory is not None:
+            q_t = self.ca_text_qcontent_proj(tgt)
+            k_t = self.ca_text_kcontent_proj(txt_memory)
+            v_t = self.ca_text_v_proj(txt_memory)
+            tgt2 = self.text_cross_attn(q_t, k_t, value=v_t, key_padding_mask=txt_key_padding_mask)[0]
+            tgt = tgt + self.dropout_text(self.text_gate * tgt2)
+
         tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
         tgt = tgt + self.dropout3(tgt2)
         tgt = self.norm3(tgt)
@@ -884,6 +911,7 @@ def build_transformer(args):
         fdr_min_ref_width=fdr_min_ref_width,
         fdr_guide_start_epoch=getattr(args, "fdr_guide_start_epoch", 0),
         fdr_guide_ramp_epochs=getattr(args, "fdr_guide_ramp_epochs", 0),
+        decoder_text_xattn=getattr(args, "decoder_text_xattn", False),
     )
 
 

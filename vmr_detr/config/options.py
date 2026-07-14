@@ -208,6 +208,8 @@ class BaseOptions(object):
         parser.add_argument("--lw_saliency", type=float, default=1.,
                             help="weight for saliency loss, set to 0 will ignore")
         parser.add_argument("--saliency_margin", type=float, default=0.2)
+        parser.add_argument("--rank_within_margin", type=float, default=0.2,
+                            help="Margin for the within-group hard-negative ranking loss on pred_logits.")
         parser.add_argument("--intra_video_hard_neg_ratio", type=float, default=0.0,
                             help="Fraction of neg clips drawn from other moments of the same video (Level A). 0 disables.")
         parser.add_argument("--intra_video_hardneg_iou_thd", type=float, default=0.1,
@@ -275,6 +277,8 @@ class BaseOptions(object):
         parser.add_argument("--fdr_decoder_refine", action="store_true",
                             help="Use cumulative FDR logits to update decoder attention references between layers. "
                                  "Enabled automatically when --span_loss_type fdr.")
+        parser.add_argument("--decoder_text_xattn", action="store_true",
+                            help="Lever B: add a text cross-attention sub-layer to each decoder layer.")
         parser.add_argument("--fdr_guide_start_epoch", default=0, type=int,
                             help="Deprecated compatibility option; FDR decoder reference updates run from epoch 0.")
         parser.add_argument("--fdr_guide_ramp_epochs", default=0, type=int,
@@ -350,6 +354,17 @@ class BaseOptions(object):
         parser.add_argument('--eos_coef', default=0.1, type=float,
                             help="Relative classification weight of the no-object class")
         parser.add_argument("--contrastive_align_loss_coef", default=0.0, type=float)
+        parser.add_argument("--rank_within_loss_coef", type=float, default=0.0,
+                            help="Coefficient for the within-group hard-negative ranking margin loss "
+                                 "on pred_logits. 0 disables (the loss is not added to criterion.losses).")
+        parser.add_argument("--rank_within_neg_iou", type=float, default=0.3,
+                            help="Below this matched-GT IoU, a query counts as a wrong-region "
+                                 "(hard-negative) candidate for the rank_within loss.")
+        parser.add_argument("--rank_within_pos_iou", type=float, default=0.5,
+                            help="Minimum Hungarian-matched-pair IoU required to supervise ranking "
+                                 "for that pair with the rank_within loss.")
+        parser.add_argument("--rank_within_warmup_epoch", type=int, default=0,
+                            help="Epoch before which the rank_within loss is zero.")
         parser.add_argument("--best_metric", default="MR-full-mAP",
                             help="metric key from validation brief metrics used for best checkpoint/early stopping. "
                                  "Also supports MR-full-R1@0.5+0.7.")

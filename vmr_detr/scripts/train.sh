@@ -253,30 +253,13 @@ PYTHONPATH="${PYTHONPATH}:." python vmr_detr/cli/train.py \
   --hardneg_loss_coef "${hardneg_loss_coef}" \
   --hardneg_warmup_epoch "${hardneg_warmup_epoch}" \
   --hardneg_ramp_epoch "${hardneg_ramp_epoch}" \
-  ${stage2_flag} \
-  --stage2_dim "${stage2_dim}" \
-  --stage2_inner_bins "${stage2_inner_bins}" \
-  --stage2_samples_per_bin "${stage2_samples_per_bin}" \
-  --stage2_boundary_samples "${stage2_boundary_samples}" \
-  --stage2_num_heads "${stage2_num_heads}" \
-  --stage2_encoder_layers "${stage2_encoder_layers}" \
-  --stage2_offset_bins "${stage2_offset_bins}" \
-  --stage2_max_shift_clips "${stage2_max_shift_clips}" \
-  --stage2_shift_frac "${stage2_shift_frac}" \
-  ${stage2_exp_width_flag} \
-  --stage2_width_beta "${stage2_width_beta}" \
-  --stage2_positive_iou "${stage2_positive_iou}" \
-  --stage2_start_epoch "${stage2_start_epoch}" \
-  --stage2_joint_epoch "${stage2_joint_epoch}" \
-  --stage2_boundary_loss_coef "${stage2_boundary_loss_coef}" \
-  --stage2_giou_loss_coef "${stage2_giou_loss_coef}" \
-  --stage2_quality_loss_coef "${stage2_quality_loss_coef}" \
-  ${stage2_at_inference_flag} \
   ${contrastive_align_loss_flag} \
   --contrastive_align_loss_coef "${contrastive_align_loss_coef}" \
   --contrastive_start_epoch "${contrastive_start_epoch}" \
   --contrastive_decay_epoch "${contrastive_decay_epoch}" \
   --contrastive_decay_coef "${contrastive_decay_coef}" \
+  --decoder_text_xattn \
+  --rank_within_loss_coef 0.5 \
   --lr "${lr}" \
   --lr_drop "${lr_drop}" \
   --lr_scheduler "${lr_scheduler}" \
@@ -293,3 +276,23 @@ PYTHONPATH="${PYTHONPATH}:." python vmr_detr/cli/train.py \
   --max_es_cnt "${max_es_cnt}" \
   --best_metric "${best_metric}" \
   "$@"
+
+  # ${stage2_flag} \
+  # --stage2_dim "${stage2_dim}" \
+  # --stage2_inner_bins "${stage2_inner_bins}" \
+  # --stage2_samples_per_bin "${stage2_samples_per_bin}" \
+  # --stage2_boundary_samples "${stage2_boundary_samples}" \
+  # --stage2_num_heads "${stage2_num_heads}" \
+  # --stage2_encoder_layers "${stage2_encoder_layers}" \
+  # --stage2_offset_bins "${stage2_offset_bins}" \
+  # --stage2_max_shift_clips "${stage2_max_shift_clips}" \
+  # --stage2_shift_frac "${stage2_shift_frac}" \
+  # ${stage2_exp_width_flag} \
+  # --stage2_width_beta "${stage2_width_beta}" \
+  # --stage2_positive_iou "${stage2_positive_iou}" \
+  # --stage2_start_epoch "${stage2_start_epoch}" \
+  # --stage2_joint_epoch "${stage2_joint_epoch}" \
+  # --stage2_boundary_loss_coef "${stage2_boundary_loss_coef}" \
+  # --stage2_giou_loss_coef "${stage2_giou_loss_coef}" \
+  # --stage2_quality_loss_coef "${stage2_quality_loss_coef}" \
+  # ${stage2_at_inference_flag} \

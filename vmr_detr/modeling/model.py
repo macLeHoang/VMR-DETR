@@ -805,7 +805,9 @@ class SetCriterion(nn.Module):
                  hardneg_warmup_epoch=0, hardneg_ramp_epoch=-1,
                  stage2_boundary_loss_coef=0.0, stage2_giou_loss_coef=0.0,
                  stage2_quality_loss_coef=0.0, stage2_positive_iou=0.2,
-                 stage2_start_epoch=10):
+                 stage2_start_epoch=10,
+                 rank_within_margin=0.2, rank_within_neg_iou=0.3,
+                 rank_within_pos_iou=0.5, rank_within_warmup_epoch=0):
         """ Create the criterion.
         Parameters:
             matcher: module able to compute a matching between targets and proposals
@@ -835,6 +837,10 @@ class SetCriterion(nn.Module):
             hardneg_ramp_epoch: int, epoch at which hardneg term reaches full strength; <=0 means instant
             stage2_positive_iou: minimum base-proposal IoU for localization refinement.
             stage2_start_epoch: last Stage-1-only epoch.
+            rank_within_margin: float, margin for the within-group ranking hinge term.
+            rank_within_neg_iou: float, matched-GT IoU below which a query is a wrong-region negative.
+            rank_within_pos_iou: float, minimum matched-pair IoU required to supervise ranking for that pair.
+            rank_within_warmup_epoch: int, epoch before which the within-group ranking term is zero.
         """
         super().__init__()
         self.matcher = matcher
@@ -947,6 +953,12 @@ class SetCriterion(nn.Module):
         self.stage2_quality_loss_coef = stage2_quality_loss_coef
         self.stage2_positive_iou = stage2_positive_iou
         self.stage2_start_epoch = stage2_start_epoch
+
+        # Within-group hard-negative margin on the deployed ranking logits (pred_logits)
+        self.rank_within_margin = rank_within_margin
+        self.rank_within_neg_iou = rank_within_neg_iou
+        self.rank_within_pos_iou = rank_within_pos_iou
+        self.rank_within_warmup_epoch = rank_within_warmup_epoch
 
         # Binary foreground classification.
         self.foreground_label = 0
@@ -1616,6 +1628,51 @@ class SetCriterion(nn.Module):
         # loss_saliency = loss_rank_contrastive
         return {"loss_saliency": loss_saliency}
 
+    def loss_rank_within(self, outputs, targets, indices, log=True):
+        """Within-group hard-negative margin on the deployed ranking logits.
+
+        Pushes each Hungarian-matched query's foreground logit above the wrong-region
+        queries (low IoU with the matched GT), so the deployed score ranks the correct
+        region over text-plausible distractors. Grads flow only through the logits
+        (class_embed -> hs -> decoder); IoU is detached and used only for selection.
+        """
+        fg_logits = self._foreground_logits(outputs)  # (bs, nq), raw logits, NOT detached
+        zero = fg_logits.sum() * 0.0
+        if indices is None or self.current_epoch < self.rank_within_warmup_epoch:
+            return {"loss_rank_within": zero}
+
+        span_targets = targets["span_labels"]
+        with torch.no_grad():
+            pred_xx = span_cxw_to_xx(outputs["pred_spans"].detach()).clamp(0, 1)  # (bs, nq, 2)
+
+        total = zero
+        n = 0
+        for b, (src_idx, tgt_idx) in enumerate(indices):
+            if len(src_idx) == 0:
+                continue
+            src_idx = src_idx.to(fg_logits.device)
+            tgt_idx = tgt_idx.to(fg_logits.device)
+            gt_spans = span_targets[b]["spans"].to(fg_logits.device)
+            if gt_spans.numel() == 0:
+                continue
+            gt_xx = span_cxw_to_xx(gt_spans).clamp(0, 1)  # (n_gt, 2)
+            with torch.no_grad():
+                ious = temporal_iou(pred_xx[b], gt_xx)[0].clamp(0, 1)  # (nq, n_gt)
+            positives = src_idx.tolist()
+            for q_star, t_star in zip(positives, tgt_idx.tolist()):
+                if ious[q_star, t_star] < self.rank_within_pos_iou:
+                    continue
+                neg_mask = ious[:, t_star] < self.rank_within_neg_iou  # (nq,) bool
+                neg_mask[positives] = False  # never penalize any matched (positive) query
+                if neg_mask.sum() == 0:
+                    continue
+                s_pos = fg_logits[b, q_star]
+                s_neg = fg_logits[b, neg_mask]
+                viol = (self.rank_within_margin + s_neg - s_pos).clamp(min=0)
+                total = total + viol.mean()
+                n += 1
+        return {"loss_rank_within": total / max(n, 1)}
+
     def loss_contrastive_align(self, outputs, targets, indices, log=True):
         """encourage higher scores between matched query span and input text"""
         normalized_text_embed = outputs["proj_txt_mem"]  # (bsz, #tokens, d) text tokens
@@ -1694,6 +1751,7 @@ class SetCriterion(nn.Module):
             "contrastive_align": self.loss_contrastive_align,
             "saliency": self.loss_saliency,
             "stage2": self.loss_stage2,
+            "rank_within": self.loss_rank_within,
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
         return loss_map[loss](outputs, targets, indices, **kwargs)
@@ -1750,7 +1808,7 @@ class SetCriterion(nn.Module):
                     losses_target = ["saliency"]    
                 # for loss in self.losses:
                 for loss in losses_target:
-                    if loss in ("saliency", "contrastive_align", "stage2"):  # final layer only
+                    if loss in ("saliency", "contrastive_align", "stage2", "rank_within"):  # final layer only
                         continue
                     kwargs = {}
                     if loss == "labels":
@@ -1987,6 +2045,7 @@ def build_model(args):
         weight_dict["loss_golsd"] = go_lsd_loss_coef
     if args.contrastive_align_loss:
         weight_dict["loss_contrastive_align"] = args.contrastive_align_loss_coef
+    weight_dict["loss_rank_within"] = getattr(args, "rank_within_loss_coef", 0.0)
     stage2_boundary_loss_coef = getattr(args, "stage2_boundary_loss_coef", 0.0)
     stage2_giou_loss_coef = getattr(args, "stage2_giou_loss_coef", 0.0)
     stage2_quality_loss_coef = getattr(args, "stage2_quality_loss_coef", 0.0)
@@ -2027,7 +2086,10 @@ def build_model(args):
         if not use_stage2:
             raise ValueError("Stage 2 loss coefficients require --use_stage2.")
         losses += ["stage2"]
-        
+
+    if getattr(args, "rank_within_loss_coef", 0.0) > 0:
+        losses += ["rank_within"]
+
     # For tvsum dataset
     use_matcher = not (args.dset_name == 'tvsum')
         
@@ -2071,6 +2133,10 @@ def build_model(args):
         stage2_quality_loss_coef=stage2_quality_loss_coef,
         stage2_positive_iou=getattr(args, "stage2_positive_iou", 0.2),
         stage2_start_epoch=getattr(args, "stage2_start_epoch", 10),
+        rank_within_margin=getattr(args, "rank_within_margin", 0.2),
+        rank_within_neg_iou=getattr(args, "rank_within_neg_iou", 0.3),
+        rank_within_pos_iou=getattr(args, "rank_within_pos_iou", 0.5),
+        rank_within_warmup_epoch=getattr(args, "rank_within_warmup_epoch", 0),
     )
     criterion.to(device)
     return model, criterion
