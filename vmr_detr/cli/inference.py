@@ -17,7 +17,6 @@ from vmr_detr.ops.span_utils import span_cxw_to_xx
 from vmr_detr.data.start_end_dataset import StartEndDataset, start_end_collate, prepare_batch_inputs
 from vmr_detr.data.start_end_dataset_audio import \
     StartEndDataset_audio, start_end_collate_audio, prepare_batch_inputs_audio
-from vmr_detr.cli.train_utils import ensure_stage2_option_defaults
 from vmr_detr.evaluation.postprocessing_vmr_detr import PostProcessorDETR
 from standalone_eval.eval import eval_submission
 from utils.basic_utils import save_jsonl, save_json
@@ -211,17 +210,9 @@ def compute_mr_results(model, eval_loader, opt, epoch_i=None, criterion=None, tb
         else:
             model_inputs, targets = prepare_batch_inputs_audio(batch[1], opt.device, non_blocking=opt.pin_memory)
         outputs = model(**model_inputs)
-        use_stage2 = (
-            getattr(opt, "stage2_at_inference", False)
-            and "refined_scores" in outputs
-            and "refined_spans" in outputs
-        )
-        if use_stage2:
-            scores = outputs["refined_scores"]
-        else:
-            scores = outputs["pred_logits"].squeeze(-1).sigmoid()  # (batch_size, #queries)
+        scores = outputs["pred_logits"].squeeze(-1).sigmoid()  # (batch_size, #queries)
         if opt.span_loss_type in ("l1", "dfl", "fdr"):
-            pred_spans = outputs["refined_spans"] if use_stage2 else outputs["pred_spans"]
+            pred_spans = outputs["pred_spans"]
             _saliency_scores = outputs["saliency_scores"].half()  # (bsz, L)
             saliency_scores = []
             valid_vid_lengths = model_inputs["src_vid_mask"].sum(1).cpu().tolist()
@@ -249,6 +240,7 @@ def compute_mr_results(model, eval_loader, opt, epoch_i=None, criterion=None, tb
                 qid=meta["qid"],
                 query=meta["query"],
                 vid=meta["vid"],
+                _clamp_max_ts=meta.get("duration"),
                 pred_relevant_windows=cur_ranked_preds,
                 pred_saliency_scores=saliency_scores[idx]
             )
@@ -338,7 +330,6 @@ def eval_epoch(model, eval_dataset, opt, save_submission_filename, epoch_i=None,
 def setup_model(opt):
     """setup model/optimizer/scheduler and load checkpoints when needed"""
     logger.info("setup model/optimizer/scheduler")
-    ensure_stage2_option_defaults(opt)
     model, criterion = build_model(opt)
     if opt.device.type == "cuda":
         logger.info("CUDA enabled.")

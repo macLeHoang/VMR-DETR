@@ -60,6 +60,29 @@ def _make_dataset(prob=1.0, use_tef=False):
     return dataset
 
 
+def _make_qv_dataset(prob=0.0, use_tef=False):
+    dataset = _make_dataset(prob=prob, use_tef=use_tef)
+    dataset.dset_name = "hl"
+    dataset.data = [{
+        "qid": 1,
+        "vid": "video",
+        "duration": 20.0,
+        "relevant_windows": [[6.0, 12.0]],
+        "relevant_clip_ids": [1, 3, 4, 6, 8],
+        "saliency_scores": [
+            [1, 1, 1],
+            [4, 4, 4],
+            [3, 3, 3],
+            [2, 2, 2],
+            [0, 0, 0],
+        ],
+    }]
+    dataset.intra_video_hard_neg_ratio = 0.0
+    dataset.emit_hardneg_labels = False
+    dataset.vid2windows = {"video": [[[6.0, 12.0]]]}
+    return dataset
+
+
 def _crop(dataset, video_feat=None):
     if video_feat is None:
         video_feat = torch.arange(30).reshape(10, 3).float()
@@ -357,6 +380,176 @@ class TestTemporalAug(unittest.TestCase):
 
         self.assertEqual(len(dataset), 1)
         self.assertEqual(dict(dataset.vid2windows), {})
+
+
+class TestQVHighlightsAug(unittest.TestCase):
+    def test_qv_prob_zero_is_byte_identical(self):
+        dataset = _make_qv_dataset(prob=0.0)
+        baseline = _make_qv_dataset(prob=0.0)
+        baseline._temporal_crop = lambda feat, windows, duration, ctx_l: (
+            feat, windows, duration, ctx_l, False, 0.0)
+
+        random.seed(7)
+        expected = baseline[0]
+        random.seed(7)
+        actual = dataset[0]
+
+        self.assertEqual(actual["meta"], expected["meta"])
+        self.assertEqual(actual["model_inputs"].keys(), expected["model_inputs"].keys())
+        for key, expected_value in expected["model_inputs"].items():
+            actual_value = actual["model_inputs"][key]
+            if torch.is_tensor(expected_value):
+                self.assertEqual(actual_value.numpy().tobytes(), expected_value.numpy().tobytes())
+            elif hasattr(expected_value, "tobytes"):
+                self.assertEqual(actual_value.tobytes(), expected_value.tobytes())
+            else:
+                self.assertEqual(actual_value, expected_value)
+
+    def test_qv_crop_remaps_saliency_clip_ids_and_scores(self):
+        dataset = _make_qv_dataset(prob=1.0)
+
+        with patch("vmr_detr.data.start_end_dataset.random.random", return_value=0.0), \
+                patch("vmr_detr.data.start_end_dataset.random.randint", side_effect=[2, 8]):
+            output = dataset[0]
+
+        video_feat = output["model_inputs"]["video_feat"]
+        score_array = output["model_inputs"]["saliency_all_labels"]
+        spans = output["model_inputs"]["span_labels"]
+
+        self.assertEqual(len(video_feat), 6)
+        self.assertTrue(torch.equal(video_feat, torch.arange(6, 24).reshape(6, 3).float()))
+        self.assertEqual(len(score_array), 6)
+        self.assertEqual(score_array.tolist(), [0.0, 12.0, 9.0, 0.0, 6.0, 0.0])
+        self.assertTrue(torch.allclose(spans, torch.tensor([[(2.0 + 8.0) / 24.0, 6.0 / 12.0]])))
+        self.assertEqual(dataset.data[0]["relevant_clip_ids"], [1, 3, 4, 6, 8])
+
+    def test_qv_crop_skips_when_no_saliency_labels_remain(self):
+        dataset = _make_qv_dataset(prob=1.0)
+        dataset.data[0]["relevant_clip_ids"] = [0, 1, 8, 9]
+        dataset.data[0]["saliency_scores"] = [
+            [1, 1, 1],
+            [2, 2, 2],
+            [3, 3, 3],
+            [4, 4, 4],
+        ]
+
+        with patch("vmr_detr.data.start_end_dataset.random.random", return_value=0.0), \
+                patch("vmr_detr.data.start_end_dataset.random.randint", side_effect=[2, 8]):
+            output = dataset[0]
+
+        self.assertEqual(output["model_inputs"]["video_feat"].shape, (10, 3))
+        self.assertEqual(len(output["model_inputs"]["saliency_all_labels"]), 10)
+        self.assertEqual(
+            output["model_inputs"]["saliency_all_labels"].tolist(),
+            [3.0, 6.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 9.0, 12.0],
+        )
+
+    def test_qv_context_extend_shifts_saliency_clip_ids(self):
+        dataset = _make_qv_dataset(prob=0.0)
+        dataset.context_extend_prob = 1.0
+        dataset.max_v_l = 12
+        dataset.data.append({
+            "qid": 2,
+            "vid": "other",
+            "duration": 8.0,
+            "relevant_windows": [[0.0, 2.0]],
+            "relevant_clip_ids": [0],
+            "saliency_scores": [[1, 1, 1]],
+        })
+
+        def get_video_feat(vid, duration):
+            if vid == "other":
+                return torch.full((4, 3), 100.0)
+            return torch.arange(30).reshape(10, 3).float()
+
+        dataset._get_video_feat_by_vid = get_video_feat
+        with patch("vmr_detr.data.start_end_dataset.random.random", return_value=0.0), \
+                patch("vmr_detr.data.start_end_dataset.random.randint", side_effect=[2, 1]), \
+                patch("vmr_detr.data.start_end_dataset.random.choice", return_value=1):
+            output = dataset[0]
+
+        score_array = output["model_inputs"]["saliency_all_labels"]
+        self.assertEqual(output["model_inputs"]["video_feat"].shape, (12, 3))
+        self.assertEqual(score_array.tolist(), [0.0, 0.0, 3.0, 0.0, 12.0, 9.0, 0.0, 6.0, 0.0, 0.0, 0.0, 0.0])
+
+    def test_qv_multi_moment_paste_shifts_saliency_clip_ids(self):
+        dataset = _make_qv_dataset(prob=0.0)
+        dataset.multi_moment_prob = 1.0
+        dataset.max_v_l = 12
+        dataset.data.append({
+            "qid": 2,
+            "vid": "other",
+            "duration": 8.0,
+            "relevant_windows": [[2.0, 8.0]],
+            "relevant_clip_ids": [1],
+            "saliency_scores": [[1, 1, 1]],
+        })
+        video_feat = torch.arange(30).reshape(10, 3).float()
+        other_feat = torch.arange(100, 124).reshape(8, 3).float()
+
+        def get_video_feat(vid, duration):
+            if vid == "other":
+                return other_feat
+            return video_feat
+
+        dataset._get_video_feat_by_vid = get_video_feat
+        with patch("vmr_detr.data.start_end_dataset.random.random", return_value=0.0), \
+                patch("vmr_detr.data.start_end_dataset.random.choice", return_value=1), \
+                patch("vmr_detr.data.start_end_dataset.random.randint", return_value=1):
+            output = dataset[0]
+
+        video_out = output["model_inputs"]["video_feat"]
+        score_array = output["model_inputs"]["saliency_all_labels"]
+        self.assertEqual(video_out.shape, (12, 3))
+        self.assertTrue(torch.equal(video_out[0], other_feat[2]))
+        self.assertTrue(torch.equal(video_out[1:11], video_feat))
+        self.assertEqual(score_array.tolist(), [0.0, 0.0, 3.0, 0.0, 12.0, 9.0, 0.0, 6.0, 0.0, 0.0, 0.0, 0.0])
+
+    def test_qv_position_jitter_remaps_saliency_clip_ids(self):
+        dataset = _make_qv_dataset(prob=0.0)
+        dataset.position_jitter_prob = 1.0
+        dataset.position_jitter_context_sec = 0.0
+
+        with patch("vmr_detr.data.start_end_dataset.random.random", return_value=0.0), \
+                patch("vmr_detr.data.start_end_dataset.random.randint", return_value=7):
+            output = dataset[0]
+
+        video_feat = output["model_inputs"]["video_feat"]
+        score_array = output["model_inputs"]["saliency_all_labels"]
+        self.assertTrue(torch.equal(video_feat[7:10], torch.arange(9, 18).reshape(3, 3).float()))
+        self.assertEqual(score_array.tolist(), [0.0, 3.0, 0.0, 6.0, 0.0, 0.0, 0.0, 12.0, 9.0, 0.0])
+
+    def test_qv_temporal_mask_protects_saliency_labeled_clips(self):
+        dataset = _make_qv_dataset(prob=0.0)
+        dataset.temporal_mask_prob = 1.0
+        dataset.temporal_mask_n = 1
+        dataset.temporal_mask_max_len = 2
+
+        def choose_span(valid_spans):
+            self.assertNotIn((0, 2), valid_spans)
+            self.assertNotIn((6, 7), valid_spans)
+            self.assertNotIn((8, 10), valid_spans)
+            self.assertIn((7, 8), valid_spans)
+            return (7, 8)
+
+        with patch("vmr_detr.data.start_end_dataset.random.random", return_value=0.0), \
+                patch("vmr_detr.data.start_end_dataset.random.choice", side_effect=choose_span):
+            output = dataset[0]
+
+        video_feat = output["model_inputs"]["video_feat"]
+        self.assertTrue(torch.equal(video_feat[1], torch.tensor([3.0, 4.0, 5.0])))
+        self.assertTrue(torch.equal(video_feat[3:6], torch.arange(9, 18).reshape(3, 3).float()))
+        self.assertTrue(torch.equal(video_feat[7], torch.zeros_like(video_feat[7])))
+
+    def test_qv_val_path_rejects_nonzero_augmentation(self):
+        with self.assertRaises(AssertionError):
+            StartEndDataset(
+                dset_name="hl",
+                data_path="highlight_val_release.jsonl",
+                v_feat_dirs=[],
+                q_feat_dir=[],
+                temporal_aug_prob=0.1,
+            )
 
 
 class TestAugStopEpoch(unittest.TestCase):
@@ -761,7 +954,7 @@ class TestPositionJitter(unittest.TestCase):
         self.assertEqual(new_windows, [[0.0, 6.0], [8.0, 12.0]])
 
     def test_noop_aug_disabled(self):
-        """_aug_enabled=False (post-cutoff) causes position jitter to skip."""
+        """_aug_enabled=False remains the manual global augmentation gate."""
         ds = self._make_jitter_dataset()
         ds._aug_enabled = False
         video_feat = torch.arange(30).reshape(10, 3).float()

@@ -1,38 +1,38 @@
 #!/usr/bin/env bash
 
 # Run identity
-dset_name=charades_sta
+dset_name=hl
 ctx_mode=video_tef
 results_root=results
-exp_id=exp_fdr_quality_s05
+exp_id=exp_qv_highlight
 
 # Data paths
-train_path=/content/drive/MyDrive/Master/Thesis/QD-DETR-Old/data/charades-sta/train.jsonl
-eval_path=/content/drive/MyDrive/Master/Thesis/QD-DETR-Old/data/charades-sta/test.jsonl
+train_path=/content/drive/MyDrive/Master/Thesis/QD-DETR-Old/data/highlight_trainfull_release.jsonl
+eval_path=/content/drive/MyDrive/Master/Thesis/QD-DETR-Old/data/highlight_test_with_gt.jsonl
 eval_split_name=val
 
 # Feature selection
-feat_root=/content/charades
+feat_root=/content/qvhighlight
 v_feat_types=slowfast_clip
 t_feat_types=clip
 v_feat_len_mode=min
 
 # Data augmentation
-txt_drop_ratio=0.1
-temporal_aug_prob=0.7
+txt_drop_ratio=0.0
+temporal_aug_prob=0.0
 temporal_aug_min_keep=0.3
-context_extend_prob=0.7
+context_extend_prob=0.0
 context_extend_max_frac=1.0
 temporal_mask_prob=0.0
 temporal_mask_n=1
 temporal_mask_max_len=3
 feat_noise_prob=0.01
 feat_noise_std=0.02
-multi_moment_prob=0.5
-position_jitter_prob=0.01
+multi_moment_prob=0.0
+position_jitter_prob=0.0
 position_jitter_context_sec=2.0
-position_jitter_max_shift_frac=0
-aug_stop_epoch=40
+position_jitter_max_shift_frac=0.0
+aug_stop_epoch=0
 
 # Video features
 v_feat_dim=0
@@ -67,15 +67,17 @@ input_dropout=0.5
 video_input_proj=linear
 enc_layers=3
 dec_layers=3
-clip_length=1
+num_queries=10
+clip_length=2
 span_loss_type=fdr
 fdr_num_bins=32
 fdr_reg_scale=1.5
 fdr_min_ref_width=0.0
-fdr_decoder_refine_flag=--fdr_decoder_refine
+fdr_decoder_refine_flag=
+# --fdr_decoder_refine
 fdr_guide_start_epoch=0
 fdr_guide_ramp_epochs=0
-query_anchor_widths=0.08,0.22,0.48
+query_anchor_widths=0.0400,0.1067,0.2400
 # Pooled-text decoder query content initialization: none | mean | last
 query_text_init=mean
 matching_type=hungarian
@@ -98,29 +100,33 @@ label_loss_coef=12.0
 label_loss_type=vfl
 
 # Losses: GO-LSD self-distillation, disabled by default here
-go_lsd_loss_coef=1.0
-go_lsd_temperature=4.0
-go_lsd_start_epoch=0
+go_lsd_loss_coef=0.0
+go_lsd_temperature=3.0
+go_lsd_start_epoch=10
 
 # Losses: contrastive query/text alignment
 contrastive_align_loss_flag=
 # --contrastive_align_loss
 contrastive_align_loss_coef=0.3
 contrastive_start_epoch=0
-contrastive_decay_epoch=30
-contrastive_decay_coef=0.3
+contrastive_decay_epoch=-1
+contrastive_decay_coef=0.0
 
 # Losses: saliency
 lw_saliency=1.0
 saliency_margin=0.2
 
 # Losses: intra-video hard negatives (Level A + B)
-intra_video_hard_neg_ratio=0.3
+intra_video_hard_neg_ratio=0.0
 intra_video_hardneg_iou_thd=0.1
 saliency_hardneg_margin=0.4
-hardneg_loss_coef=0.5
+hardneg_loss_coef=0.0
 hardneg_warmup_epoch=5
 hardneg_ramp_epoch=20
+
+# Losses: region/ranking, disabled by default here
+rank_within_loss_coef=0.0
+region_contrast_loss_coef=0.0
 
 # Optimization and evaluation
 bsz=32
@@ -191,6 +197,7 @@ PYTHONPATH="${PYTHONPATH}:." python vmr_detr/cli/train.py \
   --exp_id "${exp_id}" \
   --input_dropout "${input_dropout}" \
   --video_input_proj "${video_input_proj}" \
+  --num_queries "${num_queries}" \
   --query_init temporal_anchors \
   "${query_anchor_widths_args[@]}" \
   "${query_text_init_args[@]}" \
@@ -238,8 +245,8 @@ PYTHONPATH="${PYTHONPATH}:." python vmr_detr/cli/train.py \
   --contrastive_decay_epoch "${contrastive_decay_epoch}" \
   --contrastive_decay_coef "${contrastive_decay_coef}" \
   --decoder_text_xattn \
-  --rank_within_loss_coef 0 \
-  --region_contrast_loss_coef 1.0 \
+  --rank_within_loss_coef "${rank_within_loss_coef}" \
+  --region_contrast_loss_coef "${region_contrast_loss_coef}" \
   --lr "${lr}" \
   --lr_drop "${lr_drop}" \
   --lr_scheduler "${lr_scheduler}" \

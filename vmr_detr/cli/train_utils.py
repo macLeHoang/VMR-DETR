@@ -112,17 +112,6 @@ def should_run_eval(opt, epoch_i):
     return after_threshold or interval_hit
 
 
-def ensure_stage2_option_defaults(opt):
-    defaults = {
-        "stage2_exp_width": False,
-        "stage2_width_beta": 0.7,
-    }
-    for name, value in defaults.items():
-        if not hasattr(opt, name):
-            setattr(opt, name, value)
-    return opt
-
-
 class ModelEMA(object):
     def __init__(self, model, decay):
         self.decay = float(decay)

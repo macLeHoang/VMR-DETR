@@ -182,6 +182,17 @@ class StartEndDataset(Dataset):
         windows = [list(w) for w in meta["relevant_windows"]] if self.load_labels else None
         duration = meta.get("duration")
         timeline_offset_sec = 0.0
+        is_qvhighlight = (
+            self.load_labels
+            and self.dset_name == 'hl'
+            and windows is not None
+            and 'subs_train' not in str(getattr(self, 'data_path', ''))
+        )
+        qv_rel_clip_ids = None
+        qv_saliency_scores = None
+        if is_qvhighlight:
+            qv_rel_clip_ids = [int(c) for c in meta["relevant_clip_ids"]]
+            qv_saliency_scores = [list(s) for s in meta["saliency_scores"]]
 
         _cropped = False   # FIX 1: always defined before conditional block
         _extended = False  # FIX 1: always defined before conditional block
@@ -199,28 +210,87 @@ class StartEndDataset(Dataset):
             # that derive saliency supervision from remapped relevant_windows.
             aug_label_safe = (
                 self.dset_name in ('charades_sta', 'tacos', 'activitynet', 'nlq')
+                or is_qvhighlight
                 or 'subs_train' in str(getattr(self, 'data_path', ''))
             )
             if self.load_labels and windows is not None and self.dset_name != 'tvsum' and aug_label_safe:
+                old_video_feat, old_windows, old_duration, old_ctx_l = (
+                    video_feat, [list(w) for w in windows], duration, ctx_l)
+                old_qv_rel_clip_ids, old_qv_saliency_scores = qv_rel_clip_ids, qv_saliency_scores
                 video_feat, windows, duration, ctx_l, _cropped, crop_offset_delta = self._temporal_crop(
                     video_feat, windows, duration, ctx_l)
+                if is_qvhighlight and _cropped:
+                    crop_start = int(round(crop_offset_delta / (old_duration / old_ctx_l)))
+                    crop_end = crop_start + ctx_l
+                    remapped = self._remap_qv_saliency_for_crop(
+                        old_qv_rel_clip_ids, old_qv_saliency_scores, crop_start, crop_end)
+                    if remapped is None:
+                        video_feat, windows, duration, ctx_l = (
+                            old_video_feat, old_windows, old_duration, old_ctx_l)
+                        qv_rel_clip_ids, qv_saliency_scores = old_qv_rel_clip_ids, old_qv_saliency_scores
+                        _cropped, crop_offset_delta = False, 0.0
+                    else:
+                        qv_rel_clip_ids, qv_saliency_scores = remapped
                 timeline_offset_sec += crop_offset_delta
+                old_video_feat, old_windows, old_duration, old_ctx_l = (
+                    video_feat, [list(w) for w in windows], duration, ctx_l)
+                old_qv_rel_clip_ids, old_qv_saliency_scores = qv_rel_clip_ids, qv_saliency_scores
                 video_feat, windows, duration, ctx_l, _composed, compose_offset_delta = self._multi_moment_paste(
                     video_feat, windows, duration, ctx_l, index, meta["vid"])
+                if is_qvhighlight and _composed:
+                    left_extra = int(round((-compose_offset_delta) / (old_duration / old_ctx_l)))
+                    remapped = self._shift_qv_saliency_clip_ids(
+                        old_qv_rel_clip_ids, old_qv_saliency_scores, left_extra, ctx_l)
+                    if remapped is None:
+                        video_feat, windows, duration, ctx_l = (
+                            old_video_feat, old_windows, old_duration, old_ctx_l)
+                        qv_rel_clip_ids, qv_saliency_scores = old_qv_rel_clip_ids, old_qv_saliency_scores
+                        _composed, compose_offset_delta = False, 0.0
+                    else:
+                        qv_rel_clip_ids, qv_saliency_scores = remapped
                 timeline_offset_sec += compose_offset_delta
                 if not _composed:
+                    old_video_feat, old_windows, old_duration, old_ctx_l = (
+                        video_feat, [list(w) for w in windows], duration, ctx_l)
+                    old_qv_rel_clip_ids, old_qv_saliency_scores = qv_rel_clip_ids, qv_saliency_scores
                     video_feat, windows, duration, ctx_l, _extended, extend_offset_delta = self._context_extend(
                         video_feat, windows, duration, ctx_l, index, meta["vid"])
+                    if is_qvhighlight and _extended:
+                        left_extra = int(round((-extend_offset_delta) / (old_duration / old_ctx_l)))
+                        remapped = self._shift_qv_saliency_clip_ids(
+                            old_qv_rel_clip_ids, old_qv_saliency_scores, left_extra, ctx_l)
+                        if remapped is None:
+                            video_feat, windows, duration, ctx_l = (
+                                old_video_feat, old_windows, old_duration, old_ctx_l)
+                            qv_rel_clip_ids, qv_saliency_scores = old_qv_rel_clip_ids, old_qv_saliency_scores
+                            _extended, extend_offset_delta = False, 0.0
+                        else:
+                            qv_rel_clip_ids, qv_saliency_scores = remapped
                     timeline_offset_sec += extend_offset_delta
                 sal_windows = [list(w) for w in windows]
                 sal_offset = timeline_offset_sec
                 if 'subs_train' not in str(getattr(self, 'data_path', '')):
+                    old_video_feat, old_windows = video_feat, [list(w) for w in windows]
+                    old_qv_rel_clip_ids, old_qv_saliency_scores = qv_rel_clip_ids, qv_saliency_scores
                     video_feat, windows, _jitter_perm, _jittered = self._position_jitter(
                         video_feat, windows, duration, ctx_l)
+                    if is_qvhighlight and _jittered:
+                        remapped = self._remap_qv_saliency_for_permutation(
+                            old_qv_rel_clip_ids, old_qv_saliency_scores, _jitter_perm)
+                        if remapped is None:
+                            video_feat, windows = old_video_feat, old_windows
+                            qv_rel_clip_ids, qv_saliency_scores = (
+                                old_qv_rel_clip_ids, old_qv_saliency_scores)
+                            _jitter_perm, _jittered = None, False
+                        else:
+                            qv_rel_clip_ids, qv_saliency_scores = remapped
 
             video_feat = self._feature_noise(video_feat)
             if self.load_labels and windows is not None and self.dset_name != 'tvsum':
-                video_feat = self._temporal_mask(video_feat, windows, duration, ctx_l)
+                protected_clip_ids = qv_rel_clip_ids if is_qvhighlight else None
+                video_feat = self._temporal_mask(
+                    video_feat, windows, duration, ctx_l,
+                    protected_clip_ids=protected_clip_ids)
 
             model_inputs["video_feat"] = video_feat
         else:
@@ -285,7 +355,10 @@ class StartEndDataset(Dataset):
                         model_inputs["saliency_hardneg_labels"] = hardneg
                 elif "subs_train" not in self.data_path:
                     model_inputs["saliency_pos_labels"], model_inputs["saliency_neg_labels"], model_inputs["saliency_all_labels"] = \
-                        self.get_saliency_labels_all(meta["relevant_clip_ids"], meta["saliency_scores"], ctx_l)
+                        self.get_saliency_labels_all(
+                            qv_rel_clip_ids if is_qvhighlight else meta["relevant_clip_ids"],
+                            qv_saliency_scores if is_qvhighlight else meta["saliency_scores"],
+                            ctx_l)
                 else:
                     model_inputs["saliency_pos_labels"], model_inputs["saliency_neg_labels"], model_inputs[
                         "saliency_all_labels"], hardneg = \
@@ -303,8 +376,8 @@ class StartEndDataset(Dataset):
 
     def set_epoch(self, epoch):
         """One-way-style switch re-derived from the epoch each call: disable
-        temporal augmentation once we pass aug_stop_epoch (1-indexed,
-        inclusive), and keep it at the configured strength otherwise.
+        train-time augmentations once we pass aug_stop_epoch (1-indexed,
+        inclusive), and keep them at the configured strength otherwise.
         aug_stop_epoch <= 0 means augmentation stays on for the whole run."""
         self._aug_enabled = (self.aug_stop_epoch <= 0) or (epoch <= self.aug_stop_epoch)
         if self.aug_stop_epoch > 0 and epoch > self.aug_stop_epoch:
@@ -325,7 +398,51 @@ class StartEndDataset(Dataset):
             return feat
         return feat + torch.randn_like(feat) * feat_noise_std
 
-    def _temporal_mask(self, feat, windows, duration, ctx_l):
+    @staticmethod
+    def _remap_qv_saliency_for_crop(rel_clip_ids, saliency_scores, crop_start, crop_end):
+        new_rel_clip_ids = []
+        new_saliency_scores = []
+        for clip_id, score in zip(rel_clip_ids, saliency_scores):
+            clip_id = int(clip_id)
+            if crop_start <= clip_id < crop_end:
+                new_rel_clip_ids.append(clip_id - crop_start)
+                new_saliency_scores.append(list(score))
+        if not new_rel_clip_ids:
+            return None
+        return new_rel_clip_ids, new_saliency_scores
+
+    @staticmethod
+    def _shift_qv_saliency_clip_ids(rel_clip_ids, saliency_scores, offset, ctx_l):
+        new_rel_clip_ids = []
+        new_saliency_scores = []
+        for clip_id, score in zip(rel_clip_ids, saliency_scores):
+            new_clip_id = int(clip_id) + int(offset)
+            if 0 <= new_clip_id < ctx_l:
+                new_rel_clip_ids.append(new_clip_id)
+                new_saliency_scores.append(list(score))
+        if not new_rel_clip_ids:
+            return None
+        return new_rel_clip_ids, new_saliency_scores
+
+    @staticmethod
+    def _remap_qv_saliency_for_permutation(rel_clip_ids, saliency_scores, perm):
+        inv = [-1] * len(perm)
+        for new_idx, old_idx in enumerate(perm):
+            if 0 <= old_idx < len(inv):
+                inv[old_idx] = new_idx
+
+        new_rel_clip_ids = []
+        new_saliency_scores = []
+        for clip_id, score in zip(rel_clip_ids, saliency_scores):
+            clip_id = int(clip_id)
+            if 0 <= clip_id < len(inv) and inv[clip_id] >= 0:
+                new_rel_clip_ids.append(inv[clip_id])
+                new_saliency_scores.append(list(score))
+        if not new_rel_clip_ids:
+            return None
+        return new_rel_clip_ids, new_saliency_scores
+
+    def _temporal_mask(self, feat, windows, duration, ctx_l, protected_clip_ids=None):
         """Zero random non-GT clip spans without changing geometry."""
         temporal_mask_prob = getattr(self, 'temporal_mask_prob', 0.0)
         temporal_mask_n = int(getattr(self, 'temporal_mask_n', 0))
@@ -345,12 +462,18 @@ class StartEndDataset(Dataset):
 
         gt_st = max(0, int(floor(min(w[0] for w in windows) / clip_len)))
         gt_ed = min(ctx_l, int(ceil(max(w[1] for w in windows) / clip_len)))
+        protected = set(range(gt_st, gt_ed))
+        if protected_clip_ids is not None:
+            protected.update(
+                int(clip_id) for clip_id in protected_clip_ids
+                if 0 <= int(clip_id) < ctx_l
+            )
         max_len = min(temporal_mask_max_len, ctx_l)
         valid_spans = [
             (start, start + span_len)
             for span_len in range(1, max_len + 1)
             for start in range(0, ctx_l - span_len + 1)
-            if start + span_len <= gt_st or start >= gt_ed
+            if all(clip_id not in protected for clip_id in range(start, start + span_len))
         ]
         if not valid_spans:
             return feat

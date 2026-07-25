@@ -1,3 +1,5 @@
+import math
+
 import torch
 from tqdm import tqdm
 
@@ -22,10 +24,14 @@ class PostProcessorDETR:
     def __call__(self, lines):
         processed_lines = []
         for line in tqdm(lines, desc="post-process temporal windows"):
-            windows_and_scores = torch.tensor(line["pred_relevant_windows"])
+            max_ts_val = self._resolve_max_ts(line.pop("_clamp_max_ts", None))
+            windows_and_scores = torch.tensor(line["pred_relevant_windows"], dtype=torch.float32)
             windows = windows_and_scores[:, :2]
             for func_name in self.process_func_names:
-                windows = self.name2func[func_name](windows)
+                if func_name == "clip_ts":
+                    windows = self.clip_min_max_timestamps(windows, max_ts_val=max_ts_val)
+                else:
+                    windows = self.name2func[func_name](windows)
             line["pred_relevant_windows"] = torch.cat(
                 [windows, windows_and_scores[:, 2:3]], dim=1).tolist()
             line["pred_relevant_windows"] = [
@@ -35,12 +41,25 @@ class PostProcessorDETR:
             processed_lines.append(line)
         return processed_lines
 
-    def clip_min_max_timestamps(self, windows):
+    def _resolve_max_ts(self, max_ts_val):
+        if max_ts_val is None:
+            return self.max_ts_val
+        try:
+            max_ts_val = float(max_ts_val)
+        except (TypeError, ValueError):
+            return self.max_ts_val
+        if not math.isfinite(max_ts_val) or max_ts_val <= self.min_ts_val:
+            return self.max_ts_val
+        return max_ts_val
+
+    def clip_min_max_timestamps(self, windows, max_ts_val=None):
         """
         windows: (#windows, 2)  torch.Tensor
         ensure timestamps for all windows is within [min_val, max_val], clip is out of boundaries.
         """
-        return torch.clamp(windows, min=self.min_ts_val, max=self.max_ts_val)
+        if max_ts_val is None:
+            max_ts_val = self.max_ts_val
+        return torch.clamp(windows, min=self.min_ts_val, max=max_ts_val)
 
     def round_to_multiple_clip_lengths(self, windows):
         """
@@ -91,4 +110,3 @@ class PostProcessorDETR:
             windows[row_selector, 0] = center - new_length / 2.
             windows[row_selector, 1] = center + new_length / 2.
         return windows
-

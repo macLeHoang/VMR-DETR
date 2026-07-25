@@ -39,7 +39,7 @@ class BaseOptions(object):
     def initialize(self):
         self.initialized = True
         parser = argparse.ArgumentParser()
-        parser.add_argument("--dset_name", type=str, choices=["hl", 'tvsum', "charades_sta"])
+        parser.add_argument("--dset_name", type=str, choices=["hl", 'tvsum', "charades_sta", "tacos"])
         parser.add_argument("--dset_domain", type=str, choices=["BK", "BT", "DS", "FM", "GA", "MS", "PK", "PR", "VT", "VU"], 
                             help="Domain to train for tvsum dataset. (Only used for tvsum)")
         
@@ -222,42 +222,6 @@ class BaseOptions(object):
                             help="Epoch before which the hard-negative loss term is zero.")
         parser.add_argument("--hardneg_ramp_epoch", type=int, default=-1,
                             help="Epoch at which the hard-negative loss reaches full strength. <=0 means instant after warmup.")
-        # Unified proposal refinement and localization-quality stage
-        parser.add_argument("--use_stage2", action="store_true",
-                            help="Enable joint proposal localization and quality refinement.")
-        parser.add_argument("--stage2_dim", type=int, default=128,
-                            help="Hidden dimension for Stage 2 localization and quality heads.")
-        parser.add_argument("--stage2_inner_bins", type=int, default=8,
-                            help="Number of interval-pooled bins inside each proposal.")
-        parser.add_argument("--stage2_samples_per_bin", type=int, default=4,
-                            help="Number of temporal samples averaged inside each Stage-2 interior bin.")
-        parser.add_argument("--stage2_boundary_samples", type=int, default=2,
-                            help="Number of samples pooled on each side of each boundary.")
-        parser.add_argument("--stage2_num_heads", type=int, default=4,
-                            help="Number of attention heads in the Stage-2 proposal encoder.")
-        parser.add_argument("--stage2_encoder_layers", type=int, default=1,
-                            help="Number of Transformer layers in the Stage-2 proposal encoder.")
-        parser.add_argument("--stage2_offset_bins", type=int, default=9,
-                            help="Odd number of local offset classes per refined boundary.")
-        parser.add_argument("--stage2_max_shift_clips", type=float, default=1.0,
-                            help="Maximum start/end correction measured in valid video clips.")
-        parser.add_argument("--stage2_shift_frac", type=float, default=0.0,
-                            help="Width-proportional boundary shift fraction for Stage-2 refinement (0 disables).")
-        parser.add_argument("--stage2_exp_width", action="store_true",
-                            help="Decode Stage 2 as bounded center shift plus multiplicative-exp width refinement.")
-        parser.add_argument("--stage2_width_beta", type=float, default=0.7,
-                            help="Scale for bounded multiplicative-exp Stage 2 width refinement.")
-        parser.add_argument("--stage2_positive_iou", type=float, default=0.2,
-                            help="Minimum base-proposal IoU for Stage 2 localization supervision.")
-        parser.add_argument("--stage2_start_epoch", type=int, default=10,
-                            help="Last epoch trained with Stage 1 losses only.")
-        parser.add_argument("--stage2_joint_epoch", type=int, default=30,
-                            help="Last epoch where Stage 2 inputs are detached from Stage 1.")
-        parser.add_argument("--stage2_boundary_loss_coef", type=float, default=0.0)
-        parser.add_argument("--stage2_giou_loss_coef", type=float, default=0.0)
-        parser.add_argument("--stage2_quality_loss_coef", type=float, default=0.0)
-        parser.add_argument("--stage2_at_inference", action="store_true",
-                            help="Use refined spans and class-times-quality scores at inference.")
         parser.add_argument('--no_aux_loss', dest='aux_loss', action='store_false',
                             help="Disables auxiliary decoding losses (loss at each layer)")
         parser.add_argument("--span_loss_type", default="l1", type=str, choices=['l1', 'ce', 'dfl', 'fdr'],
@@ -365,6 +329,26 @@ class BaseOptions(object):
                                  "for that pair with the rank_within loss.")
         parser.add_argument("--rank_within_warmup_epoch", type=int, default=0,
                             help="Epoch before which the rank_within loss is zero.")
+        parser.add_argument("--region_contrast_loss_coef", type=float, default=0.0,
+                            help="Coefficient for the text<->window-pooled-video InfoNCE loss "
+                                 "(region-contrast V1). 0 disables (projections are not built and "
+                                 "the loss is not added to criterion.losses).")
+        parser.add_argument("--region_contrast_dim", type=int, default=128,
+                            help="Projection dim for the region-contrast text/video embeddings.")
+        parser.add_argument("--region_contrast_temperature", type=float, default=0.1,
+                            help="InfoNCE temperature for the region-contrast loss.")
+        parser.add_argument("--region_contrast_jitter_iou", type=float, default=0.7,
+                            help="Minimum IoU (vs GT) for a jittered window to count as a positive.")
+        parser.add_argument("--region_contrast_neg_iou", type=float, default=0.3,
+                            help="Below this IoU (vs GT), a window counts as a wrong-region negative.")
+        parser.add_argument("--region_contrast_n_jitter", type=int, default=2,
+                            help="Number of jittered positive windows sampled per GT (plus GT itself).")
+        parser.add_argument("--region_contrast_n_shift", type=int, default=4,
+                            help="Number of same-width shifted negative windows sampled per GT.")
+        parser.add_argument("--region_contrast_n_adversarial", type=int, default=3,
+                            help="Number of self-adversarial (top-scoring wrong-region) negatives per GT.")
+        parser.add_argument("--region_contrast_warmup_epoch", type=int, default=0,
+                            help="Epoch before which the region_contrast loss is zero.")
         parser.add_argument("--best_metric", default="MR-full-mAP",
                             help="metric key from validation brief metrics used for best checkpoint/early stopping. "
                                  "Also supports MR-full-R1@0.5+0.7.")
@@ -423,7 +407,7 @@ class BaseOptions(object):
             self._validate_label_loss_options(opt)
             self._validate_fdr_options(opt)
             self._validate_tal_options(opt)
-            self._validate_stage2_options(opt)
+            self._validate_region_contrast_options(opt)
         else:
             self._restore_train_resume_data_options(opt)
             self._validate_aug_options(opt)
@@ -435,7 +419,7 @@ class BaseOptions(object):
             self._validate_label_loss_options(opt)
             self._validate_fdr_options(opt)
             self._validate_tal_options(opt)
-            self._validate_stage2_options(opt)
+            self._validate_region_contrast_options(opt)
             if opt.exp_id is None:
                 raise ValueError("--exp_id is required for at a training option!")
 
@@ -568,73 +552,44 @@ class BaseOptions(object):
             raise ValueError("--matching_type tal requires --span_loss_type l1, dfl, or fdr.")
 
     @staticmethod
-    def _validate_stage2_options(opt):
+    def _validate_region_contrast_options(opt):
         defaults = {
-            "use_stage2": False,
-            "stage2_dim": 128,
-            "stage2_inner_bins": 8,
-            "stage2_samples_per_bin": 4,
-            "stage2_boundary_samples": 2,
-            "stage2_num_heads": 4,
-            "stage2_encoder_layers": 1,
-            "stage2_offset_bins": 9,
-            "stage2_max_shift_clips": 1.0,
-            "stage2_shift_frac": 0.0,
-            "stage2_exp_width": False,
-            "stage2_width_beta": 0.7,
-            "stage2_positive_iou": 0.2,
-            "stage2_start_epoch": 10,
-            "stage2_joint_epoch": 30,
-            "stage2_boundary_loss_coef": 0.0,
-            "stage2_giou_loss_coef": 0.0,
-            "stage2_quality_loss_coef": 0.0,
-            "stage2_at_inference": False,
+            "region_contrast_loss_coef": 0.0,
+            "region_contrast_dim": 128,
+            "region_contrast_temperature": 0.1,
+            "region_contrast_jitter_iou": 0.7,
+            "region_contrast_neg_iou": 0.3,
+            "region_contrast_n_jitter": 2,
+            "region_contrast_n_shift": 4,
+            "region_contrast_n_adversarial": 3,
+            "region_contrast_warmup_epoch": 0,
         }
         for name, value in defaults.items():
             if not hasattr(opt, name):
                 setattr(opt, name, value)
 
-        if opt.stage2_dim < 1:
-            raise ValueError("--stage2_dim must be >= 1.")
-        if opt.stage2_inner_bins < 1:
-            raise ValueError("--stage2_inner_bins must be >= 1.")
-        if opt.stage2_samples_per_bin < 1:
-            raise ValueError("--stage2_samples_per_bin must be >= 1.")
-        if opt.stage2_boundary_samples < 1:
-            raise ValueError("--stage2_boundary_samples must be >= 1.")
-        if opt.stage2_num_heads < 1 or opt.stage2_dim % opt.stage2_num_heads != 0:
-            raise ValueError("--stage2_num_heads must divide --stage2_dim.")
-        if opt.stage2_encoder_layers < 1:
-            raise ValueError("--stage2_encoder_layers must be >= 1.")
-        if opt.stage2_offset_bins < 3 or opt.stage2_offset_bins % 2 == 0:
-            raise ValueError("--stage2_offset_bins must be an odd integer >= 3.")
-        if opt.stage2_max_shift_clips <= 0:
-            raise ValueError("--stage2_max_shift_clips must be > 0.")
-        if opt.stage2_shift_frac < 0:
-            raise ValueError("--stage2_shift_frac must be >= 0.")
-        if opt.stage2_width_beta < 0:
-            raise ValueError("--stage2_width_beta must be >= 0.")
-        if not 0 <= opt.stage2_positive_iou <= 1:
-            raise ValueError("--stage2_positive_iou must be in [0, 1].")
-        if opt.stage2_start_epoch < 0:
-            raise ValueError("--stage2_start_epoch must be >= 0.")
-        if opt.stage2_joint_epoch < opt.stage2_start_epoch:
-            raise ValueError("--stage2_joint_epoch must be >= --stage2_start_epoch.")
-        coefficients = (
-            opt.stage2_boundary_loss_coef,
-            opt.stage2_giou_loss_coef,
-            opt.stage2_quality_loss_coef,
-        )
-        if min(coefficients) < 0:
-            raise ValueError("Stage 2 loss coefficients must be >= 0.")
-        if opt.use_stage2 and opt.span_loss_type not in ("l1", "dfl", "fdr"):
-            raise ValueError("--use_stage2 requires --span_loss_type l1, dfl, or fdr.")
-        if opt.use_stage2 and opt.dset_name == "tvsum":
-            raise ValueError("--use_stage2 is only supported for matcher-based VMR training.")
-        if any(coef > 0 for coef in coefficients) and not opt.use_stage2:
-            raise ValueError("Stage 2 loss coefficients require --use_stage2.")
-        if opt.stage2_at_inference and not opt.use_stage2:
-            raise ValueError("--stage2_at_inference requires --use_stage2.")
+        if opt.region_contrast_loss_coef < 0:
+            raise ValueError("--region_contrast_loss_coef must be >= 0.")
+        if opt.region_contrast_loss_coef == 0:
+            return
+        if opt.span_loss_type not in ("l1", "dfl", "fdr"):
+            raise ValueError("--region_contrast_loss_coef > 0 requires --span_loss_type l1, dfl, or fdr.")
+        if opt.region_contrast_dim < 1:
+            raise ValueError("--region_contrast_dim must be >= 1.")
+        if opt.region_contrast_temperature <= 0:
+            raise ValueError("--region_contrast_temperature must be > 0.")
+        if not 0 <= opt.region_contrast_jitter_iou <= 1:
+            raise ValueError("--region_contrast_jitter_iou must be in [0, 1].")
+        if not 0 <= opt.region_contrast_neg_iou <= 1:
+            raise ValueError("--region_contrast_neg_iou must be in [0, 1].")
+        if opt.region_contrast_n_jitter < 0:
+            raise ValueError("--region_contrast_n_jitter must be >= 0.")
+        if opt.region_contrast_n_shift < 0:
+            raise ValueError("--region_contrast_n_shift must be >= 0.")
+        if opt.region_contrast_n_adversarial < 0:
+            raise ValueError("--region_contrast_n_adversarial must be >= 0.")
+        if opt.region_contrast_warmup_epoch < 0:
+            raise ValueError("--region_contrast_warmup_epoch must be >= 0.")
 
     @staticmethod
     def _validate_fdr_options(opt):

@@ -1,23 +1,51 @@
 #!/usr/bin/env bash
 
+# TACoS moment-retrieval training.
+#
+# TACoS runs the SAME code path as Charades-STA: dset_name=tacos goes through the
+# matcher + span/decoder branch (use_matcher = not tvsum), single-window moments,
+# and sub-as-query saliency. So all of your moment-retrieval machinery is active
+# here — FDR refinement, decoder text cross-attention, region-contrast / rank-within
+# losses, temporal augmentations, intra-video hard negatives. This is basically
+# train.sh with dset_name/paths swapped.
+#
+# Requires "tacos" in the --dset_name choices (options.py) — already added.
+#
+# DATA FORMAT (differs from Charades in one place):
+#   * video features: ${feat_dir}/<vid>.npz  with key "features"          (same as Charades)
+#   * query features: ${t_feat_dir}/<qid>.npz  — BARE qid, NOT "qid<qid>.npz"
+#     (start_end_dataset.py:972 uses "{qid}.npz" for tacos, unlike Charades'
+#     "qid{qid}.npz"). Make sure your text-feature filenames match.
+#   * jsonl entries: qid, query, duration, vid, relevant_windows (single window).
+#
+# TACoS videos are long (~5 min cooking videos) with many queries per video, so
+# max_v_l is bumped and clip_length MUST match your feature extraction rate
+# (clip_length ≈ video_duration / num_feature_clips) — get this wrong and span
+# normalization is off. Hyperparameters below are inherited from the Charades
+# config as a starting point; expect to re-tune for TACoS.
+
 # Run identity
-dset_name=charades_sta
+dset_name=tacos
 ctx_mode=video_tef
 results_root=results
-exp_id=exp_fdr_quality_s05
+exp_id=exp_tacos
 
-# Data paths
-train_path=/content/drive/MyDrive/Master/Thesis/QD-DETR-Old/data/charades-sta/train.jsonl
-eval_path=/content/drive/MyDrive/Master/Thesis/QD-DETR-Old/data/charades-sta/test.jsonl
+# Data paths  <-- EDIT THESE
+train_path=/content/drive/MyDrive/Master/Thesis/QD-DETR-Old/data/tacos/train_tacos.jsonl
+eval_path=/content/drive/MyDrive/Master/Thesis/QD-DETR-Old/data/tacos/test_tacos.jsonl
 eval_split_name=val
 
-# Feature selection
-feat_root=/content/charades
+# Feature selection  <-- EDIT feat_root / feature types to match your TACoS features
+feat_root=/content/tacos
 v_feat_types=slowfast_clip
 t_feat_types=clip
 v_feat_len_mode=min
 
-# Data augmentation
+# Data / feature geometry  <-- set to match your extracted features
+clip_length=2            # seconds per feature clip: MUST equal duration / #clips
+max_v_l=400              # max clips kept; covers full-length TACoS videos at 2s/clip
+
+# Data augmentation (Charades-tuned starting point)
 txt_drop_ratio=0.1
 temporal_aug_prob=0.7
 temporal_aug_min_keep=0.3
@@ -26,10 +54,10 @@ context_extend_max_frac=1.0
 temporal_mask_prob=0.0
 temporal_mask_n=1
 temporal_mask_max_len=3
-feat_noise_prob=0.01
+feat_noise_prob=0.00
 feat_noise_std=0.02
 multi_moment_prob=0.5
-position_jitter_prob=0.01
+position_jitter_prob=0.00
 position_jitter_context_sec=2.0
 position_jitter_max_shift_frac=0
 aug_stop_epoch=40
@@ -67,7 +95,6 @@ input_dropout=0.5
 video_input_proj=linear
 enc_layers=3
 dec_layers=3
-clip_length=1
 span_loss_type=fdr
 fdr_num_bins=32
 fdr_reg_scale=1.5
@@ -75,7 +102,7 @@ fdr_min_ref_width=0.0
 fdr_decoder_refine_flag=--fdr_decoder_refine
 fdr_guide_start_epoch=0
 fdr_guide_ramp_epochs=0
-query_anchor_widths=0.08,0.22,0.48
+query_anchor_widths=0.0265,0.0619,0.1495
 # Pooled-text decoder query content initialization: none | mean | last
 query_text_init=mean
 matching_type=hungarian
@@ -103,8 +130,7 @@ go_lsd_temperature=4.0
 go_lsd_start_epoch=0
 
 # Losses: contrastive query/text alignment
-contrastive_align_loss_flag=
-# --contrastive_align_loss
+contrastive_align_loss_flag=--contrastive_align_loss
 contrastive_align_loss_coef=0.3
 contrastive_start_epoch=0
 contrastive_decay_epoch=30
@@ -115,6 +141,8 @@ lw_saliency=1.0
 saliency_margin=0.2
 
 # Losses: intra-video hard negatives (Level A + B)
+# TACoS is dense (many queries per video), so intra-video hard negatives are
+# well-populated here — arguably more useful than on Charades.
 intra_video_hard_neg_ratio=0.3
 intra_video_hardneg_iou_thd=0.1
 saliency_hardneg_margin=0.4
@@ -172,6 +200,8 @@ PYTHONPATH="${PYTHONPATH}:." python vmr_detr/cli/train.py \
   --t_feat_dir "${t_feat_dirs[@]}" \
   --t_feat_dim "${t_feat_dim}" \
   --v_feat_len_mode "${v_feat_len_mode}" \
+  --clip_length "${clip_length}" \
+  --max_v_l "${max_v_l}" \
   --temporal_aug_prob "${temporal_aug_prob}" \
   --temporal_aug_min_keep "${temporal_aug_min_keep}" \
   --context_extend_prob "${context_extend_prob}" \
@@ -199,7 +229,6 @@ PYTHONPATH="${PYTHONPATH}:." python vmr_detr/cli/train.py \
   --n_epoch "${n_epoch}" \
   --enc_layers "${enc_layers}" \
   --dec_layers "${dec_layers}" \
-  --clip_length "${clip_length}" \
   --span_loss_type "${span_loss_type}" \
   --fdr_num_bins "${fdr_num_bins}" \
   --fdr_reg_scale "${fdr_reg_scale}" \
